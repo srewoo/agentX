@@ -1,0 +1,33 @@
+{
+  "manifest_version": 3,
+  "name": "agentX",
+  "version": "0.1.0",
+  "description": "AI-powered trading copilot for Indian stock markets (NSE/BSE)",
+  "permissions": ["storage", "alarms", "activeTab", "scripting", "notifications"],
+  "host_permissions": ["http://localhost:8020/*", "http://127.0.0.1:8020/*"],
+  "background": {
+    "service_worker": "background/service-worker.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content/mount.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_popup": "popup/index.html",
+    "default_icon": {
+      "16": "assets/icon-16.png",
+      "48": "assets/icon-48.png",
+      "128": "assets/icon-128.png"
+    },
+    "default_title": "agentX"
+  },
+  "icons": {
+    "16": "assets/icon-16.png",
+    "48": "assets/icon-48.png",
+    "128": "assets/icon-128.png"
+  }
+}

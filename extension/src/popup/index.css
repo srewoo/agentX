@@ -1,0 +1,12 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+::-webkit-scrollbar { width: 4px; }
+::-webkit-scrollbar-track { background: #27272A; }
+::-webkit-scrollbar-thumb { background: #52525B; border-radius: 2px; }
+
+.signal-card { transition: all 0.15s ease; }
+.signal-card:hover { background: #2D2D33 !important; }
+
+.tab-btn { transition: color 0.15s ease, border-color 0.15s ease; }

@@ -1,0 +1,77 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+*.egg-info/
+*.egg
+dist/
+build/
+.pytest_cache/
+.coverage
+htmlcov/
+*.prof
+backend/.venv
+
+# Environment & Secrets
+.env
+.env.local
+.env.production
+*.key
+*.pem
+
+# SQLite
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
+*.sqlite3
+
+# Node
+node_modules/
+extension/node_modules/
+extension/dist/
+extension/.cache/
+.npm
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Build artifacts
+*.tsbuildinfo
+
+# IDE
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+
+# OS
+Thumbs.db
+Desktop.ini
+._*
+
+# Logs
+*.log
+logs/
+
+# ML Models (FinBERT downloads ~420MB)
+backend/.cache/
+backend/models/
+*.bin
+*.safetensors
+!requirements.txt
+.claude
+
+# Misc
+*.bak
+*.tmp
+*.orig
