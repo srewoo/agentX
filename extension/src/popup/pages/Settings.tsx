@@ -40,14 +40,18 @@ export default function Settings() {
             <div>
               <label className="text-xs text-zinc-400 block mb-1">Scan Interval</label>
               <select
-                value={settings.alert_interval_minutes || "30"}
+                value={settings.alert_interval_minutes ?? "30"}
                 onChange={(e) => set("alert_interval_minutes", e.target.value)}
                 className="w-full bg-zinc-800 border border-border rounded px-2 py-1.5 text-sm text-zinc-100"
               >
+                <option value="0">Manual only</option>
                 <option value="15">Every 15 minutes</option>
                 <option value="30">Every 30 minutes</option>
                 <option value="60">Every 60 minutes</option>
               </select>
+              {String(settings.alert_interval_minutes) !== "0" && (
+                <p className="text-[10px] text-zinc-600 mt-1">Auto-scan runs during market hours only (9:15 AM – 3:30 PM IST, Mon–Fri)</p>
+              )}
             </div>
 
             <div>

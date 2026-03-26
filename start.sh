@@ -27,5 +27,5 @@ if [ ! -f ".env" ]; then
 fi
 
 echo "Starting StockPilot backend at http://localhost:8000 ..."
-echo "API docs: http://localhost:8000/docs"
+echo "API docs: http://localhost:8020/docs"
 python run.py

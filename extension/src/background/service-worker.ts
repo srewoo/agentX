@@ -11,10 +11,29 @@ const ALARM_NAME = "stockpilot-scan";
 const DEFAULT_INTERVAL_MINUTES = 30;
 const MAX_SIGNALS = 100;
 
+// ── Market hours ─────────────────────────────────────────────────────────────
+
+/** Returns true if NSE/BSE is open: Mon–Fri, 9:15 AM – 3:30 PM IST. */
+function isMarketOpen(): boolean {
+  // Date.getTime() is UTC ms; add IST offset (UTC+5:30) to get IST wall-clock via UTC accessors
+  const IST_OFFSET_MS = (5 * 60 + 30) * 60 * 1000;
+  const ist = new Date(Date.now() + IST_OFFSET_MS);
+  const day = ist.getUTCDay(); // 0=Sun, 6=Sat
+  if (day === 0 || day === 6) return false;
+  const minutes = ist.getUTCHours() * 60 + ist.getUTCMinutes();
+  return minutes >= 9 * 60 + 15 && minutes <= 15 * 60 + 30;
+}
+
 // ── Alarm setup ──────────────────────────────────────────────────────────────
 
+/**
+ * Register the periodic alarm.
+ * If periodMinutes === 0 (manual-only mode), the existing alarm is cleared
+ * and no new alarm is created.
+ */
 async function registerAlarm(periodMinutes = DEFAULT_INTERVAL_MINUTES): Promise<void> {
   await chrome.alarms.clear(ALARM_NAME);
+  if (periodMinutes === 0) return; // Manual-only: no alarm
   chrome.alarms.create(ALARM_NAME, {
     delayInMinutes: 1, // First fire after 1 minute
     periodInMinutes: periodMinutes,
@@ -24,7 +43,9 @@ async function registerAlarm(periodMinutes = DEFAULT_INTERVAL_MINUTES): Promise<
 async function getIntervalFromSettings(): Promise<number> {
   try {
     const settings = await getSettings();
-    const interval = parseInt((settings as Record<string, string>).alert_interval_minutes || "30");
+    const raw = (settings as Record<string, string>).alert_interval_minutes;
+    if (raw === "0" || raw === 0 as unknown as string) return 0; // manual-only
+    const interval = parseInt(raw || "30");
     return isNaN(interval) ? DEFAULT_INTERVAL_MINUTES : interval;
   } catch {
     return DEFAULT_INTERVAL_MINUTES;
@@ -33,7 +54,12 @@ async function getIntervalFromSettings(): Promise<number> {
 
 // ── Signal fetching ───────────────────────────────────────────────────────────
 
-async function pollSignals(): Promise<void> {
+async function pollSignals(force = false): Promise<void> {
+  // Skip auto-polls outside market hours; manual triggers (force=true) always run
+  if (!force && !isMarketOpen()) {
+    console.log("[agentX SW] Market closed — skipping auto-poll");
+    return;
+  }
   try {
     const settings = await getSettings() as Record<string, string>;
     const backendUrl = settings.backend_url || "http://localhost:8020";
@@ -151,7 +177,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       }
       case "SETTINGS_CHANGED": {
         const interval = await getIntervalFromSettings();
-        await registerAlarm(interval);
+        await registerAlarm(interval); // passes 0 for manual-only → clears alarm
         return { ok: true };
       }
       case "OPEN_POPUP": {

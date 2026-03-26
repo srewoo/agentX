@@ -308,6 +308,16 @@ class SignalOrchestrator:
                 db_settings = await _get_settings()
                 interval_minutes = int(db_settings.get("alert_interval_minutes", app_settings.default_alert_interval_minutes))
 
+                # 0 = manual-only mode: idle without scanning
+                if interval_minutes == 0:
+                    await asyncio.sleep(60)
+                    continue
+
+                if not is_market_open():
+                    logger.info("Market closed — skipping auto-scan")
+                    await asyncio.sleep(interval_minutes * 60)
+                    continue
+
                 await run_scan_cycle()
 
                 # Wait for next cycle

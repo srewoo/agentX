@@ -43,7 +43,7 @@ VALID_SIGNAL_TYPES = [
 
 
 class UpdateSettingsRequest(BaseModel):
-    alert_interval_minutes: Optional[int] = Field(None, ge=5, le=1440)
+    alert_interval_minutes: Optional[int] = Field(None, ge=0, le=1440)  # 0 = manual only
     risk_mode: Optional[Literal["conservative", "balanced", "aggressive"]] = None
     signal_types: Optional[list[str]] = None
     llm_provider: Optional[Literal["gemini", "openai", "claude"]] = None
