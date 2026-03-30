@@ -103,7 +103,7 @@ _RATE_LIMITS = {
     "/api/stocks/{symbol}/ai-analysis": (15, 60),   # 15 req/min
     "/api/scan/trigger": (5, 60),                    # 5 req/min
     "/api/screener": (20, 60),                       # 20 req/min
-    "/api/backtest/": (5, 60),                       # 5 req/min (backtests are heavy)
+    "/api/backtest/": (60, 60),                       # 60 req/min (backtests are sequential, one per symbol)
     "default": (120, 60),                            # 120 req/min global
 }
 _request_counter = 0

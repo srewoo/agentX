@@ -114,8 +114,11 @@ for i in "${!SYMBOLS[@]}"; do
   SYM="${SYMBOLS[$i]}"
   NUM=$((i + 1))
 
+  # Small delay between symbols to avoid rate limits (NSE: 3 req/sec)
+  if [ "$i" -gt 0 ]; then sleep 2; fi
+
   # Call the backtest API (can take 10-60s per symbol)
-  RESPONSE=$(curl -s --max-time 120 -X POST \
+  RESPONSE=$(curl -s --max-time 180 -X POST \
     "${BACKEND_URL}/api/backtest/${SYM}?period=${PERIOD}&eval_days=${EVAL_DAYS}" \
     2>/dev/null)
 
