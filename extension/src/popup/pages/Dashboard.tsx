@@ -16,12 +16,13 @@ interface PerformanceSummary {
 }
 
 export default function Dashboard() {
-  const { signals, loading, error, unreadCount, markRead, markAllRead, dismiss } = useSignals();
+  const { signals, loading, error, unreadCount, markRead, markAllRead, dismiss, reload } = useSignals();
   const [scanning, setScanning] = useState(false);
   const [marketOpen, setMarketOpen] = useState<boolean | null>(null);
   const [perfSummary, setPerfSummary] = useState<PerformanceSummary | null>(null);
   const [actionFilter, setActionFilter] = useState<ActionFilter>("ALL");
   const [timeframeFilter, setTimeframeFilter] = useState<TimeframeFilter>("ALL");
+  const [cleared, setCleared] = useState(false);
 
   const filteredSignals = useMemo(() => {
     return signals.filter((s) => {
@@ -51,9 +52,16 @@ export default function Dashboard() {
     setScanning(true);
     try {
       await api.triggerScan();
+      setCleared(false);
+      await reload();
     } finally {
       setScanning(false);
     }
+  };
+
+  const handleMarkAllRead = () => {
+    markAllRead();
+    setCleared(true);
   };
 
   if (loading) {
@@ -86,7 +94,7 @@ export default function Dashboard() {
         <div className="flex gap-2">
           {unreadCount > 0 && (
             <button
-              onClick={markAllRead}
+              onClick={handleMarkAllRead}
               className="text-xs text-zinc-500 hover:text-zinc-300"
             >
               Mark all read
@@ -170,7 +178,25 @@ export default function Dashboard() {
           </div>
         )}
 
-        {filteredSignals.length === 0 ? (
+        {cleared ? (
+          /* Cleared state — prompt user to scan for fresh insights */
+          <div className="flex flex-col items-center justify-center h-full gap-4 text-zinc-500">
+            <span className="text-4xl">✓</span>
+            <div className="text-center">
+              <p className="text-sm font-medium text-zinc-300">All caught up!</p>
+              <p className="text-xs mt-1.5 text-zinc-500 max-w-[260px] leading-relaxed">
+                All signals have been marked as read. Run a fresh scan to discover new trading opportunities.
+              </p>
+            </div>
+            <button
+              onClick={triggerScan}
+              disabled={scanning}
+              className="bg-brand text-white text-sm font-medium px-5 py-2 rounded-lg hover:bg-brand/80 disabled:opacity-50 transition-colors"
+            >
+              {scanning ? "Scanning..." : "Scan Now"}
+            </button>
+          </div>
+        ) : filteredSignals.length === 0 ? (
           <div className="flex flex-col items-center justify-center h-full gap-3 text-zinc-500">
             <span className="text-4xl">📊</span>
             <div className="text-center">

@@ -76,3 +76,6 @@ backend/models/
 *.bak
 *.tmp
 *.orig
+backend/backtest_results/
+backend/.agentx.pid
+

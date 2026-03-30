@@ -7,7 +7,7 @@ from typing import Optional
 import yfinance as yf
 from fastapi import APIRouter, HTTPException
 
-from app.services.data_fetcher import MAJOR_STOCKS, async_fetch_history, get_stock_info, resilient_fetch_history
+from app.services.data_fetcher import MAJOR_STOCKS, async_fetch_history, get_stock_info
 from app.services.nse_fetcher import nse_fetch_quote
 from app.services.screener import get_all_indian_stocks
 from app.services.technicals import (

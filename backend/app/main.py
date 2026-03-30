@@ -74,6 +74,8 @@ async def lifespan(app: FastAPI):
     logger.info("StockPilot backend shutting down...")
     await orchestrator.stop()
     await cache_manager.disconnect()
+    from app.services.nse_fetcher import shutdown_nse
+    shutdown_nse()
 
 
 app = FastAPI(

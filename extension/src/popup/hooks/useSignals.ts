@@ -3,6 +3,8 @@ import type { Signal } from "../../shared/types";
 import { getStoredSignals, setStoredSignals } from "../../shared/storage";
 import { api } from "../../shared/api";
 
+const MAX_SIGNALS = 200;
+
 export function useSignals() {
   const [signals, setSignals] = useState<Signal[]>([]);
   const [loading, setLoading] = useState(true);
@@ -10,10 +12,34 @@ export function useSignals() {
 
   const load = useCallback(async () => {
     try {
-      // Load from storage first (instant)
+      // 1. Show stored signals immediately (instant UX)
       const stored = await getStoredSignals();
       setSignals(stored.filter((s) => !s.dismissed));
       setLoading(false);
+
+      // 2. Fetch fresh signals from backend API and merge
+      try {
+        const res = await api.getSignals(undefined, 50);
+        const fresh = res.signals || [];
+
+        if (fresh.length > 0) {
+          // Merge: fresh signals take priority, dedup by ID
+          const existingById = new Map(stored.map((s) => [s.id, s]));
+          for (const s of fresh) {
+            existingById.set(s.id, s);
+          }
+          const merged = Array.from(existingById.values())
+            .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
+            .slice(0, MAX_SIGNALS);
+
+          await setStoredSignals(merged);
+          setSignals(merged.filter((s) => !s.dismissed));
+        }
+        setError(null);
+      } catch (fetchErr) {
+        // Backend unreachable — stale storage is fine, just show warning
+        setError("Could not reach backend. Showing cached signals.");
+      }
     } catch (e) {
       setError(String(e));
       setLoading(false);

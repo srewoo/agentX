@@ -1,9 +1,13 @@
 from __future__ import annotations
 """
-Market data fetching via yfinance with NSE India fallback.
-Forked from FinSight/backend/server.py (resilient_fetch_history + stock list).
-Includes retry with exponential backoff and automatic failover to NSE
-when yfinance is repeatedly unavailable.
+Market data fetching — NseIndiaApi as PRIMARY, yfinance as FALLBACK.
+
+Data source priority:
+  1. NseIndiaApi (pip install nse[local]) — direct NSE endpoints, 3 req/sec, free
+  2. yfinance — unofficial Yahoo Finance scraper, rate-limited, 15min delay
+
+Architecture: All public functions are async. Sync NSE/yfinance calls run in
+thread executors. The orchestrator and routers call these functions.
 """
 import asyncio
 import logging
@@ -12,7 +16,12 @@ from typing import Any
 import pandas as pd
 import yfinance as yf
 
-from app.services.nse_fetcher import nse_fetch_quote, nse_fetch_ohlcv
+from app.services.nse_fetcher import (
+    nse_fetch_quote,
+    nse_fetch_history,
+    nse_fetch_ohlcv,
+    nse_fetch_indices,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -36,105 +45,108 @@ async def _retry_async(fn, *args, max_retries: int = 2, base_delay: float = 1.0,
     raise last_exc  # type: ignore[misc]
 
 
-# ── yfinance failure tracking ─────────────────────────────────
+# ── Period string → days mapping ──────────────────────────────
 
-_yfinance_failures: int = 0
-_YFINANCE_FAILURE_THRESHOLD: int = 3
+_PERIOD_TO_DAYS = {
+    "5d": 7,
+    "1mo": 35,
+    "3mo": 100,
+    "6mo": 200,
+    "1y": 370,
+    "2y": 740,
+    "5y": 1850,
+}
 
 
-def resilient_fetch_history(symbol: str, period: str = "6mo", interval: str = "1d") -> pd.DataFrame:
-    """
-    Fetch OHLCV history for a symbol from yfinance.
-    Handles .NS/.BO suffix, short-period fallback, and empty DataFrame gracefully.
-    Tries NSE first, then BSE if NSE returns empty.
-    """
+# ── yfinance (fallback) ──────────────────────────────────────
+
+def _yfinance_fetch_sync(symbol: str, period: str = "6mo", interval: str = "1d") -> pd.DataFrame:
+    """Sync yfinance fetch. Tries .NS then .BO suffix."""
     if symbol.startswith("^") or symbol.endswith(".NS") or symbol.endswith(".BO") or "=" in symbol:
         candidates = [symbol]
     else:
         candidates = [f"{symbol}.NS", f"{symbol}.BO"]
 
-    hist = pd.DataFrame()
-
     for yf_sym in candidates:
         try:
             hist = yf.Ticker(yf_sym).history(period=period, interval=interval)
             if not hist.empty:
-                break
+                return hist
         except Exception as e:
             logger.debug("yfinance attempt for %s: %s", yf_sym, e)
-
-    # Short-period fallback: "5d" sometimes returns empty for Indian stocks on weekends/holidays
-    if hist.empty and period == "5d" and interval == "1d":
-        for yf_sym in candidates:
-            try:
-                hist_1mo = yf.Ticker(yf_sym).history(period="1mo", interval="1d")
-                if not hist_1mo.empty:
-                    hist = hist_1mo.tail(5)
-                    break
-            except Exception as e:
-                logger.debug("yfinance 1mo fallback for %s: %s", yf_sym, e)
-
-    return hist
-
-
-async def _yfinance_fetch(symbol: str, period: str, interval: str) -> pd.DataFrame:
-    """Async wrapper that calls resilient_fetch_history in an executor."""
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, resilient_fetch_history, symbol, period, interval)
-
-
-async def async_fetch_history(symbol: str, period: str = "6mo", interval: str = "1d") -> pd.DataFrame:
-    """
-    Fetch OHLCV history with retry + NSE fallback.
-
-    1. Try yfinance with up to 2 retries (exponential backoff).
-    2. If yfinance fails repeatedly (>= threshold), try NSE intraday data.
-    3. Reset failure counter on success.
-    """
-    global _yfinance_failures
-
-    # If yfinance has been failing a lot, try NSE first
-    if _yfinance_failures >= _YFINANCE_FAILURE_THRESHOLD:
-        logger.info(
-            "yfinance failure count (%d) >= threshold, trying NSE fallback first for %s",
-            _yfinance_failures, symbol,
-        )
-        clean_symbol = symbol.replace(".NS", "").replace(".BO", "")
-        nse_df = await nse_fetch_ohlcv(clean_symbol)
-        if nse_df is not None and not nse_df.empty:
-            logger.info("NSE fallback returned data for %s", symbol)
-            return nse_df
-
-    # Try yfinance with retries
-    try:
-        hist = await _retry_async(_yfinance_fetch, symbol, period, interval, max_retries=2)
-        if not hist.empty:
-            _yfinance_failures = max(0, _yfinance_failures - 1)  # decay on success
-            return hist
-    except Exception as e:
-        _yfinance_failures += 1
-        logger.warning(
-            "yfinance failed after retries for %s (failure count: %d): %s",
-            symbol, _yfinance_failures, e,
-        )
-
-    # Final NSE fallback (if we didn't try it above)
-    if _yfinance_failures < _YFINANCE_FAILURE_THRESHOLD:
-        clean_symbol = symbol.replace(".NS", "").replace(".BO", "")
-        nse_df = await nse_fetch_ohlcv(clean_symbol)
-        if nse_df is not None and not nse_df.empty:
-            logger.info("NSE fallback returned data for %s", symbol)
-            return nse_df
 
     return pd.DataFrame()
 
 
+async def _yfinance_fetch(symbol: str, period: str, interval: str) -> pd.DataFrame:
+    """Async wrapper for yfinance."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _yfinance_fetch_sync, symbol, period, interval)
+
+
+# ── Main fetch function: NSE first, yfinance fallback ─────────
+
+async def async_fetch_history(symbol: str, period: str = "6mo", interval: str = "1d") -> pd.DataFrame:
+    """
+    Fetch OHLCV history. NSE primary, yfinance fallback.
+
+    For daily data: tries NseIndiaApi historical endpoint first.
+    For intraday data: goes straight to yfinance (NSE doesn't provide intraday OHLCV).
+    """
+    clean_symbol = symbol.replace(".NS", "").replace(".BO", "")
+    is_index = symbol.startswith("^")
+    is_intraday = interval not in ("1d", "1wk", "1mo")
+
+    # Intraday or index data — yfinance is better for these
+    if is_intraday or is_index:
+        try:
+            hist = await _retry_async(_yfinance_fetch, symbol, period, interval, max_retries=1)
+            if not hist.empty:
+                return hist
+        except Exception as e:
+            logger.debug("yfinance failed for %s: %s", symbol, e)
+        return pd.DataFrame()
+
+    # Daily data — try NSE first (faster, no rate limit issues)
+    days = _PERIOD_TO_DAYS.get(period, 370)
+    try:
+        nse_df = await nse_fetch_history(clean_symbol, days=days)
+        if nse_df is not None and not nse_df.empty and len(nse_df) >= 5:
+            return nse_df
+    except Exception as e:
+        logger.debug("NSE historical failed for %s: %s", clean_symbol, e)
+
+    # Fallback to yfinance
+    try:
+        hist = await _retry_async(_yfinance_fetch, symbol, period, interval, max_retries=1)
+        if not hist.empty:
+            return hist
+    except Exception as e:
+        logger.debug("yfinance fallback failed for %s: %s", symbol, e)
+
+    return pd.DataFrame()
+
+
+# ── Stock info ────────────────────────────────────────────────
+
 def get_stock_info(symbol: str) -> dict[str, Any]:
-    """Fetch stock metadata (name, sector, PE, market cap) via yfinance."""
+    """Fetch stock metadata. Tries NSE quote first, yfinance fallback."""
+    # Check MAJOR_STOCKS index first (free, instant)
+    for s in MAJOR_STOCKS:
+        if s["symbol"] == symbol:
+            return {
+                "name": s["name"],
+                "sector": s.get("sector", "N/A"),
+                "industry": "N/A",
+                "pe_ratio": None,
+                "market_cap": None,
+                "currency": "INR",
+            }
+
+    # yfinance fallback for unknown symbols
     try:
         yf_sym = symbol if (symbol.startswith("^") or "." in symbol) else f"{symbol}.NS"
-        ticker = yf.Ticker(yf_sym)
-        info = ticker.info
+        info = yf.Ticker(yf_sym).info
         return {
             "name": info.get("longName", symbol),
             "sector": info.get("sector", "N/A"),
@@ -144,46 +156,42 @@ def get_stock_info(symbol: str) -> dict[str, Any]:
             "currency": info.get("currency", "INR"),
         }
     except Exception as e:
-        logger.warning("Could not fetch info for %s via yfinance: %s", symbol, e)
+        logger.debug("Could not fetch info for %s: %s", symbol, e)
         return {"name": symbol, "sector": "N/A"}
 
 
 async def get_stock_quote(symbol: str) -> dict[str, Any]:
-    """
-    Fetch a live stock quote. Tries yfinance first, falls back to NSE.
-    Returns dict with price, change, volume, etc.
-    """
-    global _yfinance_failures
+    """Fetch a live stock quote. NSE first, yfinance fallback."""
+    clean_symbol = symbol.replace(".NS", "").replace(".BO", "")
 
-    # Try yfinance
+    # Try NSE (fast, reliable)
+    try:
+        nse_quote = await nse_fetch_quote(clean_symbol)
+        if nse_quote and nse_quote.get("lastPrice"):
+            return nse_quote
+    except Exception as e:
+        logger.debug("NSE quote failed for %s: %s", clean_symbol, e)
+
+    # yfinance fallback
     try:
         yf_sym = symbol if (symbol.startswith("^") or "." in symbol) else f"{symbol}.NS"
         loop = asyncio.get_event_loop()
-        ticker = await loop.run_in_executor(None, lambda: yf.Ticker(yf_sym).info)
-        if ticker and ticker.get("regularMarketPrice"):
-            _yfinance_failures = max(0, _yfinance_failures - 1)
+        info = await loop.run_in_executor(None, lambda: yf.Ticker(yf_sym).info)
+        if info and info.get("regularMarketPrice"):
             return {
                 "symbol": symbol,
-                "lastPrice": ticker.get("regularMarketPrice"),
-                "change": ticker.get("regularMarketChange"),
-                "pChange": ticker.get("regularMarketChangePercent"),
-                "open": ticker.get("regularMarketOpen"),
-                "previousClose": ticker.get("regularMarketPreviousClose"),
-                "high": ticker.get("regularMarketDayHigh"),
-                "low": ticker.get("regularMarketDayLow"),
-                "totalTradedVolume": ticker.get("regularMarketVolume"),
+                "lastPrice": info.get("regularMarketPrice"),
+                "change": info.get("regularMarketChange"),
+                "pChange": info.get("regularMarketChangePercent"),
+                "open": info.get("regularMarketOpen"),
+                "previousClose": info.get("regularMarketPreviousClose"),
+                "high": info.get("regularMarketDayHigh"),
+                "low": info.get("regularMarketDayLow"),
+                "totalTradedVolume": info.get("regularMarketVolume"),
                 "source": "yfinance",
             }
     except Exception as e:
-        _yfinance_failures += 1
-        logger.warning("yfinance quote failed for %s (failures: %d): %s", symbol, _yfinance_failures, e)
-
-    # NSE fallback
-    clean_symbol = symbol.replace(".NS", "").replace(".BO", "")
-    nse_quote = await nse_fetch_quote(clean_symbol)
-    if nse_quote:
-        logger.info("NSE fallback returned quote for %s", symbol)
-        return nse_quote
+        logger.debug("yfinance quote failed for %s: %s", symbol, e)
 
     return {"symbol": symbol, "lastPrice": None, "error": "All data sources failed"}
 
