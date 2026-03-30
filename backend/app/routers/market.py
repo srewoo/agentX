@@ -102,6 +102,66 @@ async def get_indices():
     return result
 
 
+@router.get("/market/actions")
+async def get_actions():
+    """Upcoming corporate actions (dividends, splits, bonuses) from NSE."""
+    cache_key = "market:actions"
+    cached = await cache_manager.get(cache_key)
+    if cached:
+        return cached
+
+    try:
+        from app.services.market_data import get_corporate_actions
+        actions = await get_corporate_actions()
+        result = {"actions": actions, "count": len(actions)}
+        await cache_manager.set(cache_key, result, ttl=timedelta(minutes=30))
+        return result
+    except Exception as e:
+        logger.error("Actions fetch error: %s", e)
+        return {"actions": [], "count": 0}
+
+
+@router.get("/market/block-deals")
+async def get_block_deals_endpoint():
+    """Today's block deals (institutional transactions) from NSE."""
+    cache_key = "market:block_deals"
+    cached = await cache_manager.get(cache_key)
+    if cached:
+        return cached
+
+    try:
+        from app.services.market_data import get_block_deals
+        deals = await get_block_deals()
+        result = {"deals": deals, "count": len(deals)}
+        await cache_manager.set(cache_key, result, ttl=timedelta(minutes=5))
+        return result
+    except Exception as e:
+        logger.error("Block deals fetch error: %s", e)
+        return {"deals": [], "count": 0}
+
+
+@router.get("/market/options/{symbol}")
+async def get_options_analysis(symbol: str):
+    """Options chain analysis (PCR, max pain, unusual OI) from NSE."""
+    from app.utils import sanitize_symbol
+    symbol = sanitize_symbol(symbol)
+    cache_key = make_cache_key("market:options", symbol)
+    cached = await cache_manager.get(cache_key)
+    if cached:
+        return cached
+
+    try:
+        from app.services.market_data import get_option_chain_analysis
+        analysis = await get_option_chain_analysis(symbol)
+        if not analysis:
+            return {"error": f"No options data for {symbol}. May not be FnO-eligible."}
+        await cache_manager.set(cache_key, analysis, ttl=timedelta(minutes=5))
+        return analysis
+    except Exception as e:
+        logger.error("Options analysis error for %s: %s", symbol, e)
+        return {"error": str(e)}
+
+
 @router.get("/market/news")
 async def get_news(limit: int = 20):
     """Fetch market news with sentiment scores."""

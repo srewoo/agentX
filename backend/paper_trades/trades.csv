@@ -1,0 +1,9 @@
+trade_id,symbol,direction,signal_type,strength,entry_price,entry_date,stop_loss,target,position_size,shares,status,exit_price,exit_date,pnl_pct,pnl_amount,exit_reason
+da27cb08,ETERNAL,bearish,gap_down,7,228.98,2026-03-30,235.85,217.53,29996.38,131,open,,,,,
+e56e6aea,HILTON,bullish,gap_up,9,24.84,2026-03-30,24.09,26.08,29981.88,1207,open,,,,,
+fde5cba5,SAIL,bullish,bullish_engulfing,7,151.42,2026-03-30,146.88,158.99,29981.16,198,open,,,,,
+b57780b8,IDFCFIRSTB,bearish,double_top,6,58.85,2026-03-30,60.62,55.91,29954.65,509,open,,,,,
+836f06af,BPCL,bearish,gap_down,7,281.0,2026-03-30,289.43,266.95,29786.0,106,open,,,,,
+b7a7b404,GTLINFRA,bearish,double_top,6,0.97,2026-03-30,1.0,0.92,29999.19,30927,open,,,,,
+7ebb41c2,ARROWGREEN,bullish,bullish_engulfing,7,459.0,2026-03-30,445.23,481.95,29835.0,65,open,,,,,
+fe42ff45,RENUKA,bullish,double_bottom,8,27.5,2026-03-30,26.68,28.88,29975.0,1090,open,,,,,

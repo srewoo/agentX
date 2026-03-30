@@ -1,0 +1,530 @@
+#!/bin/bash
+# ─────────────────────────────────────────────────────────────
+# agentX Paper Trader
+#
+# Scans for signals, simulates trades with position sizing + stop losses,
+# tracks P&L in a CSV file. Runs on demand or scheduled at 11 AM daily.
+#
+# Usage:
+#   ./paper_trade.sh                Run now (scan + open paper trades)
+#   ./paper_trade.sh evaluate       Evaluate open trades against current prices
+#   ./paper_trade.sh report         Show P&L summary
+#   ./paper_trade.sh schedule       Install daily 11 AM cron job
+#   ./paper_trade.sh unschedule     Remove the cron job
+#   ./paper_trade.sh full           Scan + evaluate + report (daily routine)
+# ─────────────────────────────────────────────────────────────
+
+set -e
+
+BACKEND_URL="${BACKEND_URL:-http://localhost:8020}"
+DATA_DIR="backend/paper_trades"
+TRADES_FILE="${DATA_DIR}/trades.csv"
+DAILY_LOG="${DATA_DIR}/daily_log.csv"
+SUMMARY_FILE="${DATA_DIR}/summary.txt"
+
+# ── Risk parameters ──────────────────────────────────────────
+CAPITAL=1000000            # 10 lakh paper capital
+MAX_POSITION_PCT=3         # Max 3% of capital per trade
+STOP_LOSS_PCT=3            # 3% stop loss
+TARGET_PCT=5               # 5% target (risk:reward ~1:1.7)
+MIN_SIGNAL_STRENGTH=6      # Only trade strength >= 6
+MAX_OPEN_TRADES=15         # Max concurrent positions
+HOLD_LIMIT_DAYS=10         # Auto-exit after 10 days
+
+# ── Colors ───────────────────────────────────────────────────
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'
+CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+log()  { echo -e "${CYAN}[paper]${NC} $*"; }
+ok()   { echo -e "${GREEN}[paper]${NC} $*"; }
+warn() { echo -e "${YELLOW}[paper]${NC} $*"; }
+err()  { echo -e "${RED}[paper]${NC} $*" >&2; }
+
+# ── Setup ────────────────────────────────────────────────────
+mkdir -p "$DATA_DIR"
+
+# Create CSV headers if files don't exist
+if [ ! -f "$TRADES_FILE" ]; then
+  echo "trade_id,symbol,direction,signal_type,strength,entry_price,entry_date,stop_loss,target,position_size,shares,status,exit_price,exit_date,pnl_pct,pnl_amount,exit_reason" > "$TRADES_FILE"
+  log "Created trades file: $TRADES_FILE"
+fi
+if [ ! -f "$DAILY_LOG" ]; then
+  echo "date,open_trades,closed_today,total_closed,win_rate,total_pnl,capital" > "$DAILY_LOG"
+fi
+
+# ── Check backend ────────────────────────────────────────────
+check_backend() {
+  if ! curl -s --max-time 5 "${BACKEND_URL}/api/health" > /dev/null 2>&1; then
+    err "Backend not reachable at ${BACKEND_URL}. Start it with: ./start.sh"
+    exit 1
+  fi
+}
+
+# ── Scan & Open Trades ───────────────────────────────────────
+do_scan() {
+  check_backend
+  log "Triggering market scan..."
+
+  SCAN_RESULT=$(curl -s --max-time 120 -X POST "${BACKEND_URL}/api/scan/trigger" 2>/dev/null)
+  SIGNALS_FOUND=$(echo "$SCAN_RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('signals_found',0))" 2>/dev/null || echo 0)
+  log "Scan complete: ${SIGNALS_FOUND} signals detected"
+
+  # Fetch top signals (unread, undismissed)
+  SIGNALS_JSON=$(curl -s --max-time 30 "${BACKEND_URL}/api/signals/latest?limit=30" 2>/dev/null)
+
+  # Count current open trades
+  OPEN_COUNT=$(awk -F',' '$12=="open" {count++} END {print count+0}' "$TRADES_FILE")
+
+  if [ "$OPEN_COUNT" -ge "$MAX_OPEN_TRADES" ]; then
+    warn "Already at max open trades ($MAX_OPEN_TRADES). Skipping new entries."
+    return
+  fi
+
+  SLOTS=$((MAX_OPEN_TRADES - OPEN_COUNT))
+  POSITION_SIZE=$(( CAPITAL * MAX_POSITION_PCT / 100 ))
+  TODAY=$(date +%Y-%m-%d)
+  NEW_TRADES=0
+
+  # Process signals and open paper trades
+  echo "$SIGNALS_JSON" | python3 -c "
+import sys, json, csv, uuid, os
+
+data = json.load(sys.stdin)
+signals = data.get('signals', [])
+trades_file = '${TRADES_FILE}'
+min_strength = ${MIN_SIGNAL_STRENGTH}
+stop_pct = ${STOP_LOSS_PCT}
+target_pct = ${TARGET_PCT}
+position_size = ${POSITION_SIZE}
+slots = ${SLOTS}
+today = '${TODAY}'
+
+# Load existing open symbols to avoid duplicates
+open_symbols = set()
+if os.path.exists(trades_file):
+    with open(trades_file, 'r') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if row.get('status') == 'open':
+                open_symbols.add(row['symbol'])
+
+new_count = 0
+with open(trades_file, 'a', newline='') as f:
+    writer = csv.writer(f)
+    for sig in signals:
+        if new_count >= slots:
+            break
+
+        strength = sig.get('strength', 0)
+        if strength < min_strength:
+            continue
+
+        symbol = sig['symbol']
+        if symbol in open_symbols:
+            continue
+
+        direction = sig.get('direction', 'neutral')
+        if direction == 'neutral':
+            continue  # Only trade directional signals
+
+        price = sig.get('current_price')
+        if not price or price <= 0:
+            continue
+
+        signal_type = sig.get('signal_type', 'unknown')
+        trade_id = str(uuid.uuid4())[:8]
+
+        # Calculate stop loss and target
+        if direction == 'bullish':
+            stop = round(price * (1 - stop_pct/100), 2)
+            target = round(price * (1 + target_pct/100), 2)
+        else:
+            stop = round(price * (1 + stop_pct/100), 2)
+            target = round(price * (1 - target_pct/100), 2)
+
+        shares = int(position_size / price)
+        if shares <= 0:
+            continue
+
+        actual_position = round(shares * price, 2)
+
+        writer.writerow([
+            trade_id, symbol, direction, signal_type, strength,
+            price, today, stop, target, actual_position, shares,
+            'open', '', '', '', '', ''
+        ])
+
+        open_symbols.add(symbol)
+        new_count += 1
+        print(f'  OPEN {direction.upper():7s} {symbol:14s} @ {price:>10.2f}  SL={stop:>10.2f}  TGT={target:>10.2f}  Qty={shares}  [{signal_type}]')
+
+print(f'TOTAL:{new_count}')
+" 2>/dev/null | while IFS= read -r line; do
+    if [[ "$line" == TOTAL:* ]]; then
+      NEW_TRADES="${line#TOTAL:}"
+    else
+      echo -e "  ${GREEN}$line${NC}"
+    fi
+  done
+
+  ok "Opened paper trades for today"
+}
+
+# ── Evaluate Open Trades ─────────────────────────────────────
+do_evaluate() {
+  check_backend
+  log "Evaluating open trades..."
+
+  OPEN_COUNT=$(awk -F',' '$12=="open" {count++} END {print count+0}' "$TRADES_FILE")
+  if [ "$OPEN_COUNT" -eq 0 ]; then
+    log "No open trades to evaluate"
+    return
+  fi
+
+  log "Checking ${OPEN_COUNT} open positions..."
+
+  python3 -c "
+import csv, json, sys, os
+import urllib.request
+
+backend = '${BACKEND_URL}'
+trades_file = '${TRADES_FILE}'
+stop_pct = ${STOP_LOSS_PCT}
+target_pct = ${TARGET_PCT}
+hold_limit = ${HOLD_LIMIT_DAYS}
+today = '$(date +%Y-%m-%d)'
+
+# Read all trades
+rows = []
+with open(trades_file, 'r') as f:
+    reader = csv.DictReader(f)
+    fieldnames = reader.fieldnames
+    for row in reader:
+        rows.append(row)
+
+closed_today = 0
+total_pnl = 0.0
+
+for row in rows:
+    if row['status'] != 'open':
+        continue
+
+    symbol = row['symbol']
+    entry_price = float(row['entry_price'])
+    direction = row['direction']
+    stop_loss = float(row['stop_loss'])
+    target = float(row['target'])
+    shares = int(row['shares'])
+    entry_date = row['entry_date']
+
+    # Calculate hold days
+    from datetime import datetime
+    try:
+        entry_dt = datetime.strptime(entry_date, '%Y-%m-%d')
+        today_dt = datetime.strptime(today, '%Y-%m-%d')
+        hold_days = (today_dt - entry_dt).days
+    except:
+        hold_days = 0
+
+    # Fetch current price
+    try:
+        req = urllib.request.Request(f'{backend}/api/stocks/{symbol}/quote')
+        req.add_header('Content-Type', 'application/json')
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
+        current_price = data.get('price')
+        if not current_price:
+            continue
+    except:
+        print(f'  SKIP {symbol:14s} — could not fetch price')
+        continue
+
+    # Check exit conditions
+    exit_reason = None
+    exit_price = current_price
+
+    if direction == 'bullish':
+        pnl_pct = (current_price - entry_price) / entry_price * 100
+        if current_price <= stop_loss:
+            exit_reason = 'stop_loss'
+        elif current_price >= target:
+            exit_reason = 'target_hit'
+    else:
+        pnl_pct = (entry_price - current_price) / entry_price * 100
+        if current_price >= stop_loss:
+            exit_reason = 'stop_loss'
+        elif current_price <= target:
+            exit_reason = 'target_hit'
+
+    if hold_days >= hold_limit:
+        exit_reason = 'time_exit'
+
+    pnl_pct = round(pnl_pct, 2)
+    pnl_amount = round(pnl_pct / 100 * float(row['position_size']), 2)
+
+    if exit_reason:
+        row['status'] = 'closed'
+        row['exit_price'] = str(exit_price)
+        row['exit_date'] = today
+        row['pnl_pct'] = str(pnl_pct)
+        row['pnl_amount'] = str(pnl_amount)
+        row['exit_reason'] = exit_reason
+        closed_today += 1
+        total_pnl += pnl_amount
+
+        color = '\033[0;32m' if pnl_pct > 0 else '\033[0;31m'
+        reset = '\033[0m'
+        print(f'  CLOSE {symbol:14s} {direction:7s}  Entry={entry_price:>8.2f}  Exit={exit_price:>8.2f}  {color}PnL={pnl_pct:+.2f}% (Rs.{pnl_amount:+.0f}){reset}  [{exit_reason}] ({hold_days}d)')
+    else:
+        color = '\033[0;32m' if pnl_pct > 0 else '\033[0;31m'
+        reset = '\033[0m'
+        print(f'  HOLD  {symbol:14s} {direction:7s}  Entry={entry_price:>8.2f}  Now={current_price:>8.2f}  {color}PnL={pnl_pct:+.2f}%{reset}  (day {hold_days}/{hold_limit})')
+
+# Write back
+with open(trades_file, 'w', newline='') as f:
+    writer = csv.DictWriter(f, fieldnames=fieldnames)
+    writer.writeheader()
+    writer.writerows(rows)
+
+print(f'---')
+print(f'Closed today: {closed_today}, PnL today: Rs.{total_pnl:+.0f}')
+" 2>&1 | while IFS= read -r line; do
+    echo -e "  $line"
+  done
+
+  ok "Evaluation complete"
+}
+
+# ── Report ───────────────────────────────────────────────────
+do_report() {
+  if [ ! -f "$TRADES_FILE" ]; then
+    warn "No trades file found. Run './paper_trade.sh' first."
+    return
+  fi
+
+  python3 -c "
+import csv, sys
+
+trades_file = '${TRADES_FILE}'
+capital = ${CAPITAL}
+
+open_trades = []
+closed_trades = []
+
+with open(trades_file, 'r') as f:
+    reader = csv.DictReader(f)
+    for row in reader:
+        if row['status'] == 'open':
+            open_trades.append(row)
+        elif row['status'] == 'closed':
+            closed_trades.append(row)
+
+total_closed = len(closed_trades)
+wins = sum(1 for t in closed_trades if float(t.get('pnl_pct',0)) > 0)
+losses = total_closed - wins
+win_rate = (wins / total_closed * 100) if total_closed > 0 else 0
+
+total_pnl = sum(float(t.get('pnl_amount',0)) for t in closed_trades)
+total_pnl_pct = total_pnl / capital * 100
+
+avg_win = 0
+avg_loss = 0
+if wins > 0:
+    avg_win = sum(float(t['pnl_pct']) for t in closed_trades if float(t.get('pnl_pct',0)) > 0) / wins
+if losses > 0:
+    avg_loss = sum(float(t['pnl_pct']) for t in closed_trades if float(t.get('pnl_pct',0)) <= 0) / losses
+
+# By exit reason
+by_reason = {}
+for t in closed_trades:
+    reason = t.get('exit_reason', 'unknown')
+    by_reason.setdefault(reason, {'count': 0, 'pnl': 0})
+    by_reason[reason]['count'] += 1
+    by_reason[reason]['pnl'] += float(t.get('pnl_amount', 0))
+
+# By signal type
+by_type = {}
+for t in closed_trades:
+    stype = t.get('signal_type', 'unknown')
+    by_type.setdefault(stype, {'count': 0, 'wins': 0, 'pnl': 0})
+    by_type[stype]['count'] += 1
+    if float(t.get('pnl_pct',0)) > 0:
+        by_type[stype]['wins'] += 1
+    by_type[stype]['pnl'] += float(t.get('pnl_amount', 0))
+
+# Max drawdown (sequential losses)
+running_pnl = 0
+peak = 0
+max_dd = 0
+for t in closed_trades:
+    running_pnl += float(t.get('pnl_amount', 0))
+    if running_pnl > peak:
+        peak = running_pnl
+    dd = peak - running_pnl
+    if dd > max_dd:
+        max_dd = dd
+
+print()
+print('\033[1m' + '=' * 55)
+print('  PAPER TRADING REPORT')
+print('=' * 55 + '\033[0m')
+print()
+print(f'  Starting Capital:     Rs.{capital:>12,}')
+print(f'  Current P&L:          Rs.{total_pnl:>+12,.0f}  ({total_pnl_pct:+.2f}%)')
+print(f'  Max Drawdown:         Rs.{max_dd:>12,.0f}')
+print()
+print(f'  Open Positions:       {len(open_trades):>5}')
+print(f'  Closed Trades:        {total_closed:>5}')
+print(f'  Wins / Losses:        {wins} / {losses}')
+
+wr_color = '\033[0;32m' if win_rate >= 50 else '\033[0;31m'
+print(f'  Win Rate:             {wr_color}{win_rate:.1f}%\033[0m')
+print(f'  Avg Win:              {avg_win:+.2f}%')
+print(f'  Avg Loss:             {avg_loss:+.2f}%')
+
+if by_reason:
+    print()
+    print('  \033[1mBy Exit Reason:\033[0m')
+    for reason, data in sorted(by_reason.items(), key=lambda x: -x[1]['count']):
+        print(f'    {reason:15s}  {data[\"count\"]:>3} trades  Rs.{data[\"pnl\"]:>+10,.0f}')
+
+if by_type:
+    print()
+    print('  \033[1mBy Signal Type (top 10):\033[0m')
+    sorted_types = sorted(by_type.items(), key=lambda x: -x[1]['count'])[:10]
+    for stype, data in sorted_types:
+        wr = data['wins'] / data['count'] * 100 if data['count'] > 0 else 0
+        print(f'    {stype:22s}  {data[\"count\"]:>3} trades  WR={wr:>5.1f}%  Rs.{data[\"pnl\"]:>+10,.0f}')
+
+if open_trades:
+    print()
+    print('  \033[1mOpen Positions:\033[0m')
+    for t in open_trades:
+        print(f'    {t[\"symbol\"]:14s}  {t[\"direction\"]:7s}  Entry={float(t[\"entry_price\"]):>8.2f}  SL={float(t[\"stop_loss\"]):>8.2f}  TGT={float(t[\"target\"]):>8.2f}  Qty={t[\"shares\"]}')
+
+print()
+print('=' * 55)
+" 2>&1
+}
+
+# ── Full daily routine ───────────────────────────────────────
+do_full() {
+  log "${BOLD}Running daily paper trading routine${NC}"
+  echo ""
+  do_evaluate
+  echo ""
+  do_scan
+  echo ""
+  do_report
+
+  # Append to daily log
+  python3 -c "
+import csv, os
+from datetime import date
+
+trades_file = '${TRADES_FILE}'
+daily_log = '${DAILY_LOG}'
+capital = ${CAPITAL}
+today = str(date.today())
+
+open_count = 0
+closed_total = 0
+closed_today_count = 0
+total_pnl = 0.0
+wins = 0
+
+with open(trades_file, 'r') as f:
+    reader = csv.DictReader(f)
+    for row in reader:
+        if row['status'] == 'open':
+            open_count += 1
+        elif row['status'] == 'closed':
+            closed_total += 1
+            total_pnl += float(row.get('pnl_amount', 0))
+            if float(row.get('pnl_pct', 0)) > 0:
+                wins += 1
+            if row.get('exit_date') == today:
+                closed_today_count += 1
+
+win_rate = (wins / closed_total * 100) if closed_total > 0 else 0
+
+with open(daily_log, 'a', newline='') as f:
+    writer = csv.writer(f)
+    writer.writerow([today, open_count, closed_today_count, closed_total,
+                     f'{win_rate:.1f}', f'{total_pnl:.0f}', capital])
+" 2>/dev/null
+  log "Daily log updated: ${DAILY_LOG}"
+}
+
+# ── Schedule / Unschedule cron ───────────────────────────────
+do_schedule() {
+  SCRIPT_PATH="$(cd "$(dirname "$0")" && pwd)/paper_trade.sh"
+  LOG_PATH="$(cd "$(dirname "$0")" && pwd)/backend/paper_trades/cron.log"
+
+  # Cron: Mon-Fri at 11:00 AM IST
+  CRON_LINE="0 11 * * 1-5 cd $(cd "$(dirname "$0")" && pwd) && ${SCRIPT_PATH} full >> ${LOG_PATH} 2>&1"
+
+  # Check if already scheduled
+  if crontab -l 2>/dev/null | grep -q "paper_trade.sh"; then
+    warn "Cron job already exists. Use 'unschedule' to remove first."
+    crontab -l 2>/dev/null | grep "paper_trade.sh"
+    return
+  fi
+
+  (crontab -l 2>/dev/null; echo "$CRON_LINE") | crontab -
+  ok "Cron job installed: Mon-Fri at 11:00 AM"
+  ok "Logs: ${LOG_PATH}"
+  echo ""
+  echo "  Current crontab:"
+  crontab -l 2>/dev/null | grep "paper_trade" || echo "  (none)"
+}
+
+do_unschedule() {
+  if ! crontab -l 2>/dev/null | grep -q "paper_trade.sh"; then
+    log "No paper_trade cron job found"
+    return
+  fi
+
+  crontab -l 2>/dev/null | grep -v "paper_trade.sh" | crontab -
+  ok "Cron job removed"
+}
+
+# ── Main ─────────────────────────────────────────────────────
+CMD="${1:-scan}"
+
+case "$CMD" in
+  scan|open)     do_scan ;;
+  evaluate|eval) do_evaluate ;;
+  report)        do_report ;;
+  full|daily)    do_full ;;
+  schedule)      do_schedule ;;
+  unschedule)    do_unschedule ;;
+  -h|--help|help)
+    echo "Usage: $0 {scan|evaluate|report|full|schedule|unschedule}"
+    echo ""
+    echo "Commands:"
+    echo "  scan         Trigger scan & open paper trades for new signals"
+    echo "  evaluate     Check open trades against current prices, close if SL/TGT/time hit"
+    echo "  report       Show full P&L report"
+    echo "  full         Run evaluate + scan + report (daily routine)"
+    echo "  schedule     Install daily 11 AM cron (Mon-Fri)"
+    echo "  unschedule   Remove the cron job"
+    echo ""
+    echo "Risk Parameters (edit in script):"
+    echo "  Capital:           Rs.${CAPITAL}"
+    echo "  Max per trade:     ${MAX_POSITION_PCT}% (Rs.$((CAPITAL * MAX_POSITION_PCT / 100)))"
+    echo "  Stop loss:         ${STOP_LOSS_PCT}%"
+    echo "  Target:            ${TARGET_PCT}%"
+    echo "  Min strength:      ${MIN_SIGNAL_STRENGTH}/10"
+    echo "  Max open trades:   ${MAX_OPEN_TRADES}"
+    echo "  Hold limit:        ${HOLD_LIMIT_DAYS} days"
+    echo ""
+    echo "Files:"
+    echo "  Trades:      ${TRADES_FILE}"
+    echo "  Daily log:   ${DAILY_LOG}"
+    ;;
+  *)
+    err "Unknown command: $CMD"
+    echo "Usage: $0 {scan|evaluate|report|full|schedule|unschedule}"
+    exit 1
+    ;;
+esac

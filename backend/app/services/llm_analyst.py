@@ -15,6 +15,7 @@ from typing import Any, Optional
 from app.utils import parse_llm_json, safe_float
 from app.services.llm_client import call_llm, SUPPORTED_MODELS
 from app.services.fundamentals import get_fundamentals
+from app.services.market_data import get_market_context
 
 logger = logging.getLogger(__name__)
 
@@ -171,6 +172,59 @@ def _build_fallback_chain(
 
 
 # ─────────────────────────────────────────────
+# Market context formatting for prompts
+# ─────────────────────────────────────────────
+
+def _format_market_context(ctx: dict) -> str:
+    """Format market context dict into a prompt-ready string."""
+    lines = []
+
+    # Market breadth
+    breadth = ctx.get("market_breadth")
+    if breadth and breadth.get("last"):
+        lines.append(f"- NIFTY 50: {breadth['last']} ({breadth.get('percent_change', 'N/A')}%) — {breadth.get('market_status', 'N/A')}")
+
+    # Corporate actions for this symbol
+    actions = ctx.get("symbol_actions", [])
+    if actions:
+        for a in actions[:2]:
+            lines.append(f"- Upcoming: {_sanitize_for_prompt(a.get('action', ''), 80)} (Ex-date: {a.get('ex_date', 'N/A')})")
+
+    # Block deals for this symbol
+    block = ctx.get("symbol_block_deals", [])
+    if block:
+        for b in block[:2]:
+            val = b.get("value")
+            val_str = f"Rs.{val/1e7:.0f}Cr" if val and val > 0 else "N/A"
+            lines.append(f"- Block deal: {_sanitize_for_prompt(b.get('symbol',''))} — value {val_str}")
+
+    # Options analysis
+    opts = ctx.get("options_analysis")
+    if opts and opts.get("pcr_oi"):
+        lines.append(f"- Options PCR (OI): {opts['pcr_oi']} — {_sanitize_for_prompt(opts.get('pcr_signal', ''), 20)} ({_sanitize_for_prompt(opts.get('pcr_description', ''), 80)})")
+        if opts.get("max_pain"):
+            lines.append(f"- Max Pain: {opts['max_pain']}")
+        unusual_ce = opts.get("unusual_ce_activity", [])
+        unusual_pe = opts.get("unusual_pe_activity", [])
+        if unusual_ce:
+            strikes = ", ".join(str(s.get("strike", "")) for s in unusual_ce[:2])
+            lines.append(f"- Unusual CE OI buildup at strikes: {strikes}")
+        if unusual_pe:
+            strikes = ", ".join(str(s.get("strike", "")) for s in unusual_pe[:2])
+            lines.append(f"- Unusual PE OI buildup at strikes: {strikes}")
+
+    # Announcements
+    anns = ctx.get("announcements", [])
+    if anns:
+        for a in anns[:2]:
+            lines.append(f"- Announcement: {_sanitize_for_prompt(a.get('description', ''), 100)}")
+
+    if not lines:
+        return "No additional market context available."
+    return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────
 # Signal enrichment (called by orchestrator — max 1/cycle)
 # ─────────────────────────────────────────────
 
@@ -203,6 +257,14 @@ async def enrich_signal(signal: dict[str, Any], technicals: dict, settings: dict
         (technicals.get("market_regime") or {}).get("regime", "N/A"), max_len=30
     )
 
+    # Fetch market context (best-effort, non-blocking)
+    market_ctx_str = "No additional market context available."
+    try:
+        ctx = await get_market_context(signal["symbol"])
+        market_ctx_str = _format_market_context(ctx)
+    except Exception:
+        pass
+
     prompt = f"""A technical signal was detected for {symbol}. Provide a brief 2-3 sentence analysis.
 
 Signal: {signal_type.replace('_', ' ').title()} ({direction})
@@ -215,9 +277,13 @@ Technical Context:
 - MACD: {macd_sig}
 - Market Regime: {regime}
 
+Market Context:
+{market_ctx_str}
+
 Instructions:
 - Explain WHY this signal matters in simple terms
 - Mention 1 supporting factor and 1 risk factor
+- Consider the market context (options data, institutional activity, corporate actions) if available
 - Do NOT predict prices or give buy/sell recommendations
 - Keep it factual and grounded in the data above
 
@@ -322,6 +388,14 @@ async def run_analysis(
 
     fallback_chain = _build_fallback_chain(settings, provider)
 
+    # Fetch market context (options, block deals, actions, breadth)
+    market_ctx_str = "No additional market context available."
+    try:
+        ctx = await get_market_context(symbol)
+        market_ctx_str = _format_market_context(ctx)
+    except Exception:
+        pass
+
     prompt = f"""You are a senior Indian stock market analyst AI. Analyze this stock and provide insights for {timeframe_desc}.
 
 STOCK: {stock_name} ({sym})
@@ -348,10 +422,14 @@ FUNDAMENTALS:
 - Dividend Yield: {_sanitize_for_prompt(_pct_display((fundamentals.get("dividends") or {}).get("yield")))}%
 - Fundamental Score: {fundamentals.get("fundamental_score", "N/A")}/10 ({_sanitize_for_prompt(fundamentals.get("fundamental_signal", "N/A"))})
 
+MARKET CONTEXT:
+{market_ctx_str}
+
 Analysis timeframe: {timeframe_desc}
 
 Instructions:
 - Summarize the technical picture objectively
+- Factor in market context (options PCR, institutional activity, corporate actions) when available
 - Identify 2-3 key reasons supporting your view
 - Identify 2 key risks
 - Give a BUY/SELL/HOLD stance for the specified timeframe
