@@ -16,6 +16,9 @@ ALLOWED_KEYS = {
     "alert_interval_minutes", "risk_mode", "signal_types",
     "llm_provider", "llm_model", "llm_api_key",
     "openai_api_key", "gemini_api_key", "claude_api_key",
+    # Configurable signal thresholds
+    "rsi_overbought", "rsi_oversold", "price_spike_pct",
+    "volume_spike_ratio", "breakout_min_score",
 }
 
 

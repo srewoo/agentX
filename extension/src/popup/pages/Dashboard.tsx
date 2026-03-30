@@ -1,8 +1,9 @@
 import { useEffect, useState, useMemo } from "react";
 import SignalCard from "../components/SignalCard";
+import { Disclaimer } from "../components/Disclaimer";
 import { useSignals } from "../hooks/useSignals";
 import { api } from "../../shared/api";
-import { DIRECTION_ACTION, SIGNAL_TIMEFRAME } from "../../shared/constants";
+import { DIRECTION_ACTION, getSignalTimeframe } from "../../shared/constants";
 
 type ActionFilter = "ALL" | "BUY" | "SELL" | "HOLD";
 type TimeframeFilter = "ALL" | "Intraday" | "Swing" | "Long-term";
@@ -29,10 +30,7 @@ export default function Dashboard() {
         if (action !== actionFilter) return false;
       }
       if (timeframeFilter !== "ALL") {
-        const tf = SIGNAL_TIMEFRAME[s.signal_type] ?? "Swing";
-        // breakout with strength >= 7 is Long-term
-        const resolved = s.signal_type === "breakout" && s.strength >= 7 ? "Long-term" : tf;
-        if (resolved !== timeframeFilter) return false;
+        if (getSignalTimeframe(s.signal_type, s.strength) !== timeframeFilter) return false;
       }
       return true;
     });
@@ -165,7 +163,7 @@ export default function Dashboard() {
       </div>
 
       {/* Signal list */}
-      <div className="flex-1 overflow-y-auto px-3 py-2">
+      <div className="flex-1 overflow-y-auto px-3 py-2 flex flex-col">
         {error && (
           <div className="text-xs text-loss bg-loss/10 border border-loss/30 rounded p-2 mb-2">
             Backend error: {error}. Is the backend running?
@@ -196,6 +194,9 @@ export default function Dashboard() {
             />
           ))
         )}
+        <div className="mt-auto pt-2 px-1">
+          <Disclaimer />
+        </div>
       </div>
     </div>
   );

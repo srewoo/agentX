@@ -8,6 +8,7 @@ import yfinance as yf
 from fastapi import APIRouter, HTTPException
 
 from app.services.data_fetcher import MAJOR_STOCKS, async_fetch_history, get_stock_info, resilient_fetch_history
+from app.services.nse_fetcher import nse_fetch_quote
 from app.services.screener import get_all_indian_stocks
 from app.services.technicals import (
     compute_fibonacci_levels,
@@ -72,7 +73,10 @@ async def search_stocks(q: str = ""):
 
 @router.get("/{symbol}/quote")
 async def get_quote(symbol: str):
-    """Get current price quote for a stock."""
+    """
+    Get current price quote for a stock.
+    Tries NSE free API first (fast, no rate limit), falls back to yfinance.
+    """
     symbol = sanitize_symbol(symbol)
     cache_key = make_cache_key("stock:quote", symbol)
 
@@ -80,9 +84,37 @@ async def get_quote(symbol: str):
     if cached:
         return cached
 
+    # --- Strategy 1: NSE quote (fast, free, no rate limit) ---
     try:
-        yf_sym = symbol if ("." in symbol or symbol.startswith("^")) else f"{symbol}.NS"
-        ticker = yf.Ticker(yf_sym)
+        nse_data = await nse_fetch_quote(symbol)
+        if nse_data and nse_data.get("lastPrice"):
+            # Look up friendly name from our index
+            name = symbol
+            for s in _SEARCH_INDEX:
+                if s["symbol"] == symbol:
+                    name = s["name"]
+                    break
+
+            result = {
+                "symbol": symbol,
+                "price": safe_float(nse_data["lastPrice"]),
+                "change": safe_float(nse_data.get("change")),
+                "change_pct": safe_float(nse_data.get("pChange")),
+                "volume": safe_float(nse_data.get("totalTradedVolume")),
+                "high": safe_float(nse_data.get("high")),
+                "low": safe_float(nse_data.get("low")),
+                "open": safe_float(nse_data.get("open")),
+                "prev_close": safe_float(nse_data.get("previousClose")),
+                "name": name,
+                "market_cap": None,
+            }
+            await cache_manager.set(cache_key, result, ttl=timedelta(minutes=2))
+            return result
+    except Exception as e:
+        logger.debug("NSE quote failed for %s, trying yfinance: %s", symbol, e)
+
+    # --- Strategy 2: yfinance fallback ---
+    try:
         hist = await async_fetch_history(symbol, period="5d", interval="1d")
 
         if hist is None or hist.empty:
@@ -93,7 +125,13 @@ async def get_quote(symbol: str):
         change = round(current - prev_close, 2) if current and prev_close else None
         change_pct = round((change / prev_close) * 100, 2) if change and prev_close else None
 
-        info = ticker.info
+        # Get stock name from MAJOR_STOCKS index (avoid slow yfinance .info call)
+        name = symbol
+        for s in _SEARCH_INDEX:
+            if s["symbol"] == symbol:
+                name = s["name"]
+                break
+
         result = {
             "symbol": symbol,
             "price": current,
@@ -104,8 +142,8 @@ async def get_quote(symbol: str):
             "low": safe_float(hist["Low"].iloc[-1]),
             "open": safe_float(hist["Open"].iloc[-1]),
             "prev_close": prev_close,
-            "name": info.get("longName", symbol),
-            "market_cap": info.get("marketCap"),
+            "name": name,
+            "market_cap": None,
         }
 
         await cache_manager.set(cache_key, result, ttl=timedelta(minutes=2))
@@ -113,7 +151,7 @@ async def get_quote(symbol: str):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Quote error for {symbol}: {e}")
+        logger.error("Quote error for %s: %s", symbol, e)
         raise HTTPException(status_code=500, detail=str(e))
 
 

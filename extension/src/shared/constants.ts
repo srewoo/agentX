@@ -82,8 +82,17 @@ export const DIRECTION_COLORS: Record<string, string> = {
   neutral: "#F59E0B",
 };
 
+/**
+ * Resolve the display timeframe for a signal.
+ * Centralised here to avoid duplicating the breakout-strength override in multiple components.
+ */
+export function getSignalTimeframe(signalType: string, strength: number): "Intraday" | "Swing" | "Long-term" {
+  if (signalType === "breakout" && strength >= 7) return "Long-term";
+  return SIGNAL_TIMEFRAME[signalType] ?? "Swing";
+}
+
 export const LLM_MODELS: Record<string, string[]> = {
-  gemini: ["gemini-2.0-flash", "gemini-1.5-pro", "gemini-1.5-flash"],
-  openai: ["gpt-4o-mini", "gpt-4o", "gpt-4-turbo"],
-  claude: ["claude-3-5-sonnet-20241022", "claude-3-5-haiku-20241022", "claude-3-opus-20240229"],
+  gemini: ["gemini-2.0-flash", "gemini-2.5-flash", "gemini-2.5-pro", "gemini-1.5-pro"],
+  openai: ["gpt-4.1-mini", "gpt-4.1", "gpt-4o", "gpt-4o-mini", "o4-mini", "o3"],
+  claude: ["claude-sonnet-4-6", "claude-haiku-4-5-20251001", "claude-opus-4-6", "claude-3-5-sonnet-20241022"],
 };

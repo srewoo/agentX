@@ -110,7 +110,16 @@ DEFAULT_SETTINGS = {
     "openai_api_key": settings.openai_api_key,
     "gemini_api_key": settings.gemini_api_key,
     "claude_api_key": settings.claude_api_key,
+    # Configurable signal thresholds (can be tuned per user's strategy)
+    "rsi_overbought": "70",
+    "rsi_oversold": "30",
+    "price_spike_pct": "3.0",
+    "volume_spike_ratio": "2.0",
+    "breakout_min_score": "4",
 }
+
+# Max age for signals before archival
+_SIGNAL_MAX_AGE_DAYS = 7
 
 
 async def init_db():
@@ -141,6 +150,29 @@ async def init_db():
 
         await db.commit()
     logger.info(f"Database initialized at {DB_PATH}")
+
+
+async def cleanup_old_signals() -> int:
+    """
+    Archive signals older than _SIGNAL_MAX_AGE_DAYS.
+    Deletes read+dismissed signals; keeps unread ones regardless of age.
+    Returns number of rows deleted.
+    """
+    from datetime import datetime, timezone, timedelta
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=_SIGNAL_MAX_AGE_DAYS)).isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "DELETE FROM signals WHERE created_at < ? AND read = 1 AND dismissed = 1",
+            (cutoff,),
+        )
+        deleted = cursor.rowcount
+        # Also vacuum periodically to reclaim space
+        if deleted > 50:
+            await db.execute("PRAGMA incremental_vacuum(50);")
+        await db.commit()
+    if deleted > 0:
+        logger.info("Signal cleanup: removed %d old signals (older than %d days)", deleted, _SIGNAL_MAX_AGE_DAYS)
+    return deleted
 
 
 async def get_db() -> aiosqlite.Connection:

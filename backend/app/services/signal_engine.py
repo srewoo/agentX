@@ -303,17 +303,25 @@ def scan_symbol(
     sr: dict,
     previous_price: Optional[float] = None,
     sentiment_score: Optional[float] = None,
+    thresholds: Optional[dict] = None,
 ) -> list[dict[str, Any]]:
     """
     Run all detectors on a symbol's data. Returns list of signals found.
     Deterministic — no LLM calls.
+
+    thresholds: optional dict from settings to override default detector params:
+        rsi_overbought, rsi_oversold, price_spike_pct, volume_spike_ratio, breakout_min_score
     """
     signals = []
     current_price = safe_float(df["Close"].iloc[-1]) if not df.empty else None
+    t = thresholds or {}
 
     # Price spike since last scan
     if previous_price:
-        sig = detect_price_spike(symbol, current_price, previous_price)
+        sig = detect_price_spike(
+            symbol, current_price, previous_price,
+            threshold_pct=float(t.get("price_spike_pct", 3.0)),
+        )
         if sig:
             signals.append(sig)
 
@@ -321,13 +329,20 @@ def scan_symbol(
     vol_current = technicals.get("volume_current")
     vol_avg = technicals.get("volume_avg_20")
     if vol_current and vol_avg:
-        sig = detect_volume_spike(symbol, current_price, vol_current, vol_avg)
+        sig = detect_volume_spike(
+            symbol, current_price, vol_current, vol_avg,
+            threshold_ratio=float(t.get("volume_spike_ratio", 2.0)),
+        )
         if sig:
             signals.append(sig)
 
     # RSI extreme
     rsi = technicals.get("rsi")
-    sig = detect_rsi_extreme(symbol, current_price, rsi)
+    sig = detect_rsi_extreme(
+        symbol, current_price, rsi,
+        overbought=float(t.get("rsi_overbought", 70.0)),
+        oversold=float(t.get("rsi_oversold", 30.0)),
+    )
     if sig:
         signals.append(sig)
 

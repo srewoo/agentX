@@ -1,7 +1,9 @@
 import { getBackendUrl, getSettings } from "./storage";
 import type { Signal, StockQuote, TechnicalsResponse, AIAnalysisResponse, WatchlistItem, AppSettings, HealthResponse } from "./types";
 
-async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
+const DEFAULT_TIMEOUT_MS = 30_000; // 30 seconds
+
+async function request<T>(path: string, options: RequestInit = {}, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<T> {
   const baseUrl = await getBackendUrl();
   const settings = await getSettings() as Record<string, string>;
   const apiKey = settings.api_key || "";
@@ -11,17 +13,31 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
     ...(apiKey ? { "X-API-Key": apiKey } : {}),
   };
 
-  const res = await fetch(`${baseUrl}${path}`, {
-    ...options,
-    headers: { ...headers, ...(options.headers as Record<string, string> || {}) },
-  });
+  // AbortController for request timeout
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
 
-  if (!res.ok) {
-    const error = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new Error(error.detail || `HTTP ${res.status}`);
+  try {
+    const res = await fetch(`${baseUrl}${path}`, {
+      ...options,
+      headers: { ...headers, ...(options.headers as Record<string, string> || {}) },
+      signal: controller.signal,
+    });
+
+    if (!res.ok) {
+      const error = await res.json().catch(() => ({ detail: res.statusText }));
+      throw new Error(error.detail || `HTTP ${res.status}`);
+    }
+
+    return res.json() as Promise<T>;
+  } catch (err) {
+    if (err instanceof DOMException && err.name === "AbortError") {
+      throw new Error(`Request timed out after ${timeoutMs / 1000}s: ${path}`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
   }
-
-  return res.json() as Promise<T>;
 }
 
 export const api = {
@@ -49,7 +65,7 @@ export const api = {
     request<AIAnalysisResponse>(`/api/stocks/${symbol}/ai-analysis`, {
       method: "POST",
       body: JSON.stringify({ timeframe }),
-    }),
+    }, 60_000),  // AI analysis can take 10-30s
 
   // Watchlist
   getWatchlist: () => request<{ watchlist: WatchlistItem[] }>("/api/watchlist"),

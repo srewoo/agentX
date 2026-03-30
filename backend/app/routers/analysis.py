@@ -13,6 +13,7 @@ from app.services.technicals import (
     compute_volume_profile_poc,
 )
 from app.services.llm_analyst import run_analysis
+from app.services.fundamentals import get_fundamentals
 from app.services.cache import cache_manager, make_cache_key
 from app.database import DB_PATH
 from app.utils import sanitize_symbol
@@ -57,6 +58,12 @@ async def get_ai_analysis(symbol: str, body: AIAnalysisRequest):
     stock_info = get_stock_info(symbol)
     settings = await _get_settings()
 
+    try:
+        fundamentals = await get_fundamentals(symbol)
+    except Exception:
+        logger.warning("Fundamentals fetch failed for %s, continuing without", symbol)
+        fundamentals = {}
+
     analysis = await run_analysis(
         symbol=symbol,
         timeframe=body.timeframe,
@@ -66,6 +73,7 @@ async def get_ai_analysis(symbol: str, body: AIAnalysisRequest):
         poc=poc,
         stock_info=stock_info,
         settings=settings,
+        fundamentals=fundamentals,
     )
 
     result = {
@@ -74,6 +82,7 @@ async def get_ai_analysis(symbol: str, body: AIAnalysisRequest):
         "timeframe": body.timeframe,
         "current_price": technicals.get("current_price"),
         "analysis": analysis,
+        "fundamentals": fundamentals,
         "support_resistance": sr,
         "fibonacci": fib,
         "poc": poc,

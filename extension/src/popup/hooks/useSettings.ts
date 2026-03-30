@@ -42,8 +42,12 @@ export function useSettings() {
   const update = useCallback(async (updates: Partial<AppSettings>) => {
     setSaving(true);
     try {
-      const merged = { ...settings, ...updates };
-      setSettings(merged);
+      // Use functional setState to avoid stale closure over `settings`
+      let merged: Partial<AppSettings> = {};
+      setSettings((prev) => {
+        merged = { ...prev, ...updates };
+        return merged;
+      });
       await saveSettings(merged);
       await api.updateSettings(updates);
       // Notify service worker to reconfigure alarm if interval changed
@@ -53,7 +57,7 @@ export function useSettings() {
     } finally {
       setSaving(false);
     }
-  }, [settings]);
+  }, []);
 
   return { settings, loading, saving, update };
 }

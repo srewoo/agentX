@@ -1,6 +1,6 @@
 import { useState } from "react";
 import type { Signal } from "../../shared/types";
-import { SIGNAL_TYPE_LABELS, SIGNAL_TIMEFRAME, DIRECTION_ACTION, ACTION_COLORS } from "../../shared/constants";
+import { SIGNAL_TYPE_LABELS, DIRECTION_ACTION, ACTION_COLORS, getSignalTimeframe } from "../../shared/constants";
 import { api } from "../../shared/api";
 import MiniChart from "./MiniChart";
 
@@ -19,11 +19,7 @@ function timeAgo(isoDate: string): string {
   return `${Math.floor(hrs / 24)}d ago`;
 }
 
-// Breakout signals above strength 7 are long-term
-function getTimeframe(signal: Signal): "Intraday" | "Swing" | "Long-term" {
-  if (signal.signal_type === "breakout" && signal.strength >= 7) return "Long-term";
-  return SIGNAL_TIMEFRAME[signal.signal_type] ?? "Swing";
-}
+// Use shared getSignalTimeframe from constants to avoid duplication
 
 const TIMEFRAME_STYLE: Record<string, string> = {
   Intraday: "bg-blue-500/15 text-blue-400 border-blue-500/30",
@@ -36,7 +32,7 @@ export default function SignalCard({ signal, onRead, onDismiss }: Props) {
 
   const action = DIRECTION_ACTION[signal.direction] || "HOLD";
   const actionColor = ACTION_COLORS[action] || "#F59E0B";
-  const timeframe = getTimeframe(signal);
+  const timeframe = getSignalTimeframe(signal.signal_type, signal.strength);
   const label = SIGNAL_TYPE_LABELS[signal.signal_type] || signal.signal_type;
 
   const handleExpand = () => {
@@ -49,15 +45,20 @@ export default function SignalCard({ signal, onRead, onDismiss }: Props) {
 
   return (
     <div
+      role="button"
+      tabIndex={0}
+      aria-expanded={expanded}
+      aria-label={`${signal.symbol} ${action} signal, strength ${signal.strength} out of 10. ${label}. ${signal.read ? "Read" : "Unread"}`}
       className={`rounded-xl border cursor-pointer px-3.5 py-3 mb-2.5
         ${signal.read ? "border-border bg-panel" : "border-brand/40 bg-zinc-800/80"}`}
       onClick={handleExpand}
+      onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); handleExpand(); } }}
     >
       {/* Row 1: Symbol + BUY/SELL/HOLD badge + time */}
       <div className="flex items-center justify-between mb-2">
         <div className="flex items-center gap-2.5">
           {!signal.read && (
-            <span className="w-2 h-2 rounded-full bg-brand-light flex-shrink-0" />
+            <span className="w-2 h-2 rounded-full bg-brand-light flex-shrink-0" aria-hidden="true" />
           )}
           <span className="font-bold text-base text-zinc-100">{signal.symbol}</span>
 
@@ -133,6 +134,7 @@ export default function SignalCard({ signal, onRead, onDismiss }: Props) {
             <span className="text-xs text-zinc-500">Strength: {signal.strength}/10</span>
             <button
               className="text-xs text-zinc-500 hover:text-loss"
+              aria-label={`Dismiss ${signal.symbol} signal`}
               onClick={(e) => { e.stopPropagation(); onDismiss(signal.id); }}
             >
               Dismiss

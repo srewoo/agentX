@@ -5,6 +5,7 @@ import Screener from "./pages/Screener";
 import Watchlist from "./pages/Watchlist";
 import Alerts from "./pages/Alerts";
 import Settings from "./pages/Settings";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 
 type Tab = "dashboard" | "search" | "screener" | "watchlist" | "alerts" | "settings";
 
@@ -37,14 +38,16 @@ export default function App() {
         <span className="text-xs text-zinc-500">NSE/BSE Copilot</span>
       </div>
 
-      {/* Content */}
+      {/* Content — each tab wrapped in an ErrorBoundary; key resets on tab switch */}
       <div className="flex-1 overflow-hidden min-h-0">
-        {activeTab === "dashboard" && <Dashboard />}
-        {activeTab === "search" && <Search initialSymbol={searchSymbol} onSymbolConsumed={() => setSearchSymbol(null)} />}
-        {activeTab === "screener" && <Screener onSelectSymbol={handleScreenerSelect} />}
-        {activeTab === "watchlist" && <Watchlist />}
-        {activeTab === "alerts" && <Alerts />}
-        {activeTab === "settings" && <Settings />}
+        <ErrorBoundary key={activeTab}>
+          {activeTab === "dashboard" && <Dashboard />}
+          {activeTab === "search" && <Search initialSymbol={searchSymbol} onSymbolConsumed={() => setSearchSymbol(null)} />}
+          {activeTab === "screener" && <Screener onSelectSymbol={handleScreenerSelect} />}
+          {activeTab === "watchlist" && <Watchlist />}
+          {activeTab === "alerts" && <Alerts />}
+          {activeTab === "settings" && <Settings />}
+        </ErrorBoundary>
       </div>
 
       {/* Bottom Tab Bar */}

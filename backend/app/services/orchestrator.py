@@ -38,6 +38,11 @@ IST = timezone(timedelta(hours=5, minutes=30))
 last_scan_time: Optional[str] = None
 last_scan_signal_count: int = 0
 
+# Track symbols that consistently fail — skip them to avoid wasting time
+_bad_symbol_strikes: dict[str, int] = {}  # symbol → consecutive failure count
+_BAD_SYMBOL_THRESHOLD = 3  # skip after 3 consecutive failures
+_BAD_SYMBOL_MAX_CACHE = 500  # prevent unbounded growth
+
 
 def is_market_open() -> bool:
     """Check if NSE/BSE is currently open (9:15 AM - 3:30 PM IST, Mon-Fri)."""
@@ -128,6 +133,15 @@ async def run_scan_cycle() -> list[dict]:
     except Exception:
         signal_types = ["intraday", "swing", "long_term"]
 
+    # Load user-configurable thresholds for signal detectors
+    scan_thresholds = {
+        "rsi_overbought": db_settings.get("rsi_overbought", "70"),
+        "rsi_oversold": db_settings.get("rsi_oversold", "30"),
+        "price_spike_pct": db_settings.get("price_spike_pct", "3.0"),
+        "volume_spike_ratio": db_settings.get("volume_spike_ratio", "2.0"),
+        "breakout_min_score": db_settings.get("breakout_min_score", "4"),
+    }
+
     # Build scan list: watchlist + TradingView pre-screened stocks (momentum/volume/price extremes).
     # This replaces scanning ALL 160+ MAJOR_STOCKS — only scan watchlist + pre-screened.
     watchlist_symbols = await _get_watchlist_symbols()
@@ -169,15 +183,25 @@ async def run_scan_cycle() -> list[dict]:
     current_prices: dict[str, float] = {}
     all_signals: list[dict] = []
 
-    # Rate-limited concurrent fetching (max 5 concurrent yfinance calls)
-    semaphore = asyncio.Semaphore(5)
+    # Rate-limited concurrent fetching (max 3 concurrent to avoid yfinance rate limits)
+    semaphore = asyncio.Semaphore(3)
 
     async def process_symbol(sym: str) -> list[dict]:
         async with semaphore:
+            # Skip symbols that consistently fail (delisted, bad ticker, etc.)
+            if _bad_symbol_strikes.get(sym, 0) >= _BAD_SYMBOL_THRESHOLD:
+                return []
+
             try:
                 df = await async_fetch_history(sym, period="6mo", interval="1d")
                 if df is None or df.empty or len(df) < 20:
+                    _bad_symbol_strikes[sym] = _bad_symbol_strikes.get(sym, 0) + 1
+                    if _bad_symbol_strikes[sym] == _BAD_SYMBOL_THRESHOLD:
+                        logger.info("Skipping %s in future scans (%d consecutive failures)", sym, _BAD_SYMBOL_THRESHOLD)
                     return []
+
+                # Success — reset strike count
+                _bad_symbol_strikes.pop(sym, None)
 
                 technicals = compute_technicals(df)
                 if not technicals:
@@ -208,13 +232,15 @@ async def run_scan_cycle() -> list[dict]:
                     sr=sr,
                     previous_price=prev_price,
                     sentiment_score=sentiment_score,
+                    thresholds=scan_thresholds,
                 )
             except Exception as e:
-                logger.warning(f"Error scanning {sym}: {e}")
+                _bad_symbol_strikes[sym] = _bad_symbol_strikes.get(sym, 0) + 1
+                logger.debug("Error scanning %s (strike %d): %s", sym, _bad_symbol_strikes[sym], e)
                 return []
             finally:
-                # Slight delay to avoid hammering yfinance
-                await asyncio.sleep(0.3)
+                # Delay between symbols to avoid yfinance rate limits
+                await asyncio.sleep(0.5)
 
     # Run all symbols concurrently (semaphore limits actual parallelism)
     results = await asyncio.gather(*[process_symbol(sym) for sym in all_symbols])
@@ -263,9 +289,18 @@ async def run_scan_cycle() -> list[dict]:
     last_scan_time = datetime.now(timezone.utc).isoformat()
     last_scan_signal_count = len(filtered)
 
+    # Trim bad symbol cache to prevent unbounded growth
+    if len(_bad_symbol_strikes) > _BAD_SYMBOL_MAX_CACHE:
+        # Keep only the ones at threshold (confirmed bad); drop low-strike entries
+        to_remove = [s for s, n in _bad_symbol_strikes.items() if n < _BAD_SYMBOL_THRESHOLD]
+        for s in to_remove[:len(_bad_symbol_strikes) - _BAD_SYMBOL_MAX_CACHE // 2]:
+            del _bad_symbol_strikes[s]
+
+    skipped = sum(1 for n in _bad_symbol_strikes.values() if n >= _BAD_SYMBOL_THRESHOLD)
     logger.info(
-        f"Scan complete: {len(all_symbols)} symbols, {len(filtered)} signals, "
-        f"{elapsed:.1f}s elapsed. Market {'open' if is_market_open() else 'closed'}."
+        f"Scan complete: {len(all_symbols)} symbols scanned, {skipped} skipped (bad), "
+        f"{len(filtered)} signals, {elapsed:.1f}s elapsed. "
+        f"Market {'open' if is_market_open() else 'closed'}."
     )
 
     # Evaluate outcomes of older signals (non-blocking best-effort)
@@ -274,6 +309,15 @@ async def run_scan_cycle() -> list[dict]:
         logger.info(f"Signal evaluation after scan: {eval_result}")
     except Exception as e:
         logger.warning(f"Signal evaluation failed (non-critical): {e}")
+
+    # Cleanup old signals (non-blocking best-effort)
+    try:
+        from app.database import cleanup_old_signals
+        deleted = await cleanup_old_signals()
+        if deleted > 0:
+            logger.info(f"Cleaned up {deleted} old signals")
+    except Exception as e:
+        logger.warning(f"Signal cleanup failed (non-critical): {e}")
 
     return filtered
 

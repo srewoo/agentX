@@ -91,49 +91,58 @@ export default function Screener({ onSelectSymbol }: ScreenerProps) {
         )}
 
         {!loading && results.length > 0 && (
-          <div>
+          <table role="table" className="w-full" aria-label="Screener results">
             {/* Table header */}
-            <div className="grid grid-cols-[1fr_56px_56px_44px_56px_72px] gap-1 px-2 py-1.5 text-[10px] font-medium text-zinc-500 uppercase tracking-wider border-b border-border">
-              <span>Stock</span>
-              <span className="text-right">Price</span>
-              <span className="text-right">Chg%</span>
-              <span className="text-right">RSI</span>
-              <span className="text-right">{activePreset === "dividend" ? "Div %" : "Vol R"}</span>
-              <span className="text-right">Signal</span>
-            </div>
+            <thead>
+              <tr className="grid grid-cols-[1fr_56px_56px_44px_56px_72px] gap-1 px-2 py-1.5 text-[10px] font-medium text-zinc-500 uppercase tracking-wider border-b border-border">
+                <th scope="col" className="text-left font-medium">Stock</th>
+                <th scope="col" className="text-right font-medium">Price</th>
+                <th scope="col" className="text-right font-medium">Chg%</th>
+                <th scope="col" className="text-right font-medium">RSI</th>
+                <th scope="col" className="text-right font-medium">{activePreset === "dividend" ? "Div %" : "Vol R"}</th>
+                <th scope="col" className="text-right font-medium">Signal</th>
+              </tr>
+            </thead>
 
+            <tbody>
             {/* Table rows */}
             {results.map((row) => {
               const isPos = row.change_pct >= 0;
               return (
-                <button
+                <tr
                   key={row.symbol}
+                  role="row"
+                  tabIndex={0}
                   onClick={() => handleRowClick(row.symbol)}
-                  className="grid grid-cols-[1fr_56px_56px_44px_56px_72px] gap-1 w-full text-left px-2 py-2 border-b border-border/50 hover:bg-zinc-800/60 transition-colors"
+                  onKeyDown={(e) => { if (e.key === "Enter") handleRowClick(row.symbol); }}
+                  className="grid grid-cols-[1fr_56px_56px_44px_56px_72px] gap-1 w-full text-left px-2 py-2 border-b border-border/50 hover:bg-zinc-800/60 transition-colors cursor-pointer"
+                  aria-label={`${row.symbol} ${row.name}, price ${row.close.toFixed(1)}, change ${row.change_pct >= 0 ? "+" : ""}${row.change_pct.toFixed(2)}%`}
                 >
-                  <div className="min-w-0">
+                  <td className="min-w-0">
                     <div className="text-xs font-semibold text-zinc-100 truncate">{row.symbol}</div>
                     <div className="text-[10px] text-zinc-500 truncate">{row.name}</div>
-                  </div>
-                  <div className="text-xs text-zinc-200 text-right self-center font-medium">
+                  </td>
+                  <td className="text-xs text-zinc-200 text-right self-center font-medium">
                     {row.close.toFixed(1)}
-                  </div>
-                  <div className={`text-xs text-right self-center font-medium ${isPos ? "text-profit" : "text-loss"}`}>
-                    {isPos ? "+" : ""}{row.change_pct.toFixed(2)}%
-                  </div>
-                  <div className={`text-xs text-right self-center ${
+                  </td>
+                  <td className={`text-xs text-right self-center font-medium ${isPos ? "text-profit" : "text-loss"}`}>
+                    <span aria-label={`${isPos ? "up" : "down"} ${Math.abs(row.change_pct).toFixed(2)} percent`}>
+                      {isPos ? "+" : ""}{row.change_pct.toFixed(2)}%
+                    </span>
+                  </td>
+                  <td className={`text-xs text-right self-center ${
                     row.rsi != null
                       ? row.rsi < 30 ? "text-profit" : row.rsi > 70 ? "text-loss" : "text-zinc-400"
                       : "text-zinc-600"
                   }`}>
                     {row.rsi != null ? row.rsi.toFixed(0) : "—"}
-                  </div>
-                  <div className="text-xs text-zinc-400 text-right self-center">
+                  </td>
+                  <td className="text-xs text-zinc-400 text-right self-center">
                     {activePreset === "dividend"
                       ? (row.dividend_yield != null ? <span className="text-emerald-400">{row.dividend_yield.toFixed(1)}%</span> : "—")
                       : (row.volume_ratio != null ? `${row.volume_ratio.toFixed(1)}x` : "—")}
-                  </div>
-                  <div className="text-right self-center">
+                  </td>
+                  <td className="text-right self-center">
                     <span className={`text-[10px] px-1.5 py-0.5 rounded font-medium
                       ${row.recommendation === "BUY" || row.recommendation === "STRONG_BUY"
                         ? "bg-profit/15 text-profit"
@@ -143,11 +152,12 @@ export default function Screener({ onSelectSymbol }: ScreenerProps) {
                       }`}>
                       {row.recommendation ?? "—"}
                     </span>
-                  </div>
-                </button>
+                  </td>
+                </tr>
               );
             })}
-          </div>
+            </tbody>
+          </table>
         )}
 
         {!loading && !error && results.length === 0 && !activePreset && (

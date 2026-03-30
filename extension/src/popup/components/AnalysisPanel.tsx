@@ -1,4 +1,5 @@
 import type { AIAnalysisResponse } from "../../shared/types";
+import { Disclaimer } from "./Disclaimer";
 
 interface Props {
   result: AIAnalysisResponse;
@@ -41,8 +42,8 @@ export default function AnalysisPanel({ result }: Props) {
         </div>
         <div className="text-right">
           <div className="text-xs text-zinc-500 mb-1">Confidence</div>
-          <div className="relative w-12 h-12">
-            <svg className="w-12 h-12 -rotate-90" viewBox="0 0 36 36">
+          <div className="relative w-12 h-12" role="meter" aria-valuenow={analysis.confidence} aria-valuemin={0} aria-valuemax={100} aria-label={`Confidence: ${analysis.confidence}%`}>
+            <svg className="w-12 h-12 -rotate-90" viewBox="0 0 36 36" aria-hidden="true">
               <circle cx="18" cy="18" r="15" fill="none" stroke="#3F3F46" strokeWidth="3" />
               <circle
                 cx="18" cy="18" r="15" fill="none"
@@ -52,7 +53,7 @@ export default function AnalysisPanel({ result }: Props) {
                 strokeLinecap="round"
               />
             </svg>
-            <span className="absolute inset-0 flex items-center justify-center text-xs font-bold text-zinc-200">
+            <span className="absolute inset-0 flex items-center justify-center text-xs font-bold text-zinc-200" aria-hidden="true">
               {analysis.confidence}%
             </span>
           </div>
@@ -126,9 +127,7 @@ export default function AnalysisPanel({ result }: Props) {
         )}
       </div>
 
-      <p className="text-[10px] text-zinc-600 leading-tight">
-        For informational purposes only. Not financial advice.
-      </p>
+      <Disclaimer />
     </div>
   );
 }

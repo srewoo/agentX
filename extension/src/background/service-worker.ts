@@ -44,9 +44,11 @@ async function getIntervalFromSettings(): Promise<number> {
   try {
     const settings = await getSettings();
     const raw = (settings as Record<string, string>).alert_interval_minutes;
-    if (raw === "0" || raw === 0 as unknown as string) return 0; // manual-only
-    const interval = parseInt(raw || "30");
-    return isNaN(interval) ? DEFAULT_INTERVAL_MINUTES : interval;
+    // Handle both string ("30") and number (30) types safely
+    const parsed = Number(raw);
+    if (raw === undefined || raw === null || raw === "") return DEFAULT_INTERVAL_MINUTES;
+    if (parsed === 0) return 0; // manual-only
+    return isNaN(parsed) || parsed < 0 ? DEFAULT_INTERVAL_MINUTES : Math.round(parsed);
   } catch {
     return DEFAULT_INTERVAL_MINUTES;
   }
@@ -73,7 +75,15 @@ async function pollSignals(force = false): Promise<void> {
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     if (apiKey) headers["X-API-Key"] = apiKey;
 
-    const res = await fetch(url, { headers });
+    // 30s timeout to prevent hanging if backend is unresponsive
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 30_000);
+    let res: Response;
+    try {
+      res = await fetch(url, { headers, signal: controller.signal });
+    } finally {
+      clearTimeout(timer);
+    }
     if (!res.ok) return;
 
     const data = await res.json() as { signals: Signal[]; unread_count: number };

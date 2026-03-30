@@ -146,14 +146,18 @@ def pre_screen_stocks(
 
         symbols: set[str] = set()
 
+        # Limit per query — keep total candidates manageable for yfinance
+        _LIMIT = 25
+
         # --- RSI extremes ---
         try:
             _count, df_oversold = (
                 Query()
                 .set_markets("india")
-                .select("name", "close", "RSI", "volume", "change")
-                .where(Column("RSI") < 30)
-                .limit(100)
+                .select("name", "close", "RSI", "volume", "change", "type", "market_cap_basic")
+                .where(Column("RSI") < 30, Column("type") == "stock", Column("market_cap_basic") > 1e9)
+                .order_by("market_cap_basic", ascending=False)
+                .limit(_LIMIT)
                 .get_scanner_data()
             )
             if df_oversold is not None and not df_oversold.empty:
@@ -166,9 +170,10 @@ def pre_screen_stocks(
             _count, df_overbought = (
                 Query()
                 .set_markets("india")
-                .select("name", "close", "RSI", "volume", "change")
-                .where(Column("RSI") > 70)
-                .limit(100)
+                .select("name", "close", "RSI", "volume", "change", "type", "market_cap_basic")
+                .where(Column("RSI") > 70, Column("type") == "stock", Column("market_cap_basic") > 1e9)
+                .order_by("market_cap_basic", ascending=False)
+                .limit(_LIMIT)
                 .get_scanner_data()
             )
             if df_overbought is not None and not df_overbought.empty:
@@ -177,14 +182,21 @@ def pre_screen_stocks(
         except Exception as e:
             logger.warning(f"Screener RSI>70 query failed: {e}")
 
-        # --- Volume spikes (volume > 2x 10-day avg) ---
+        # --- Volume spikes (volume > 5M — proxy for high-volume days on large caps) ---
+        # NOTE: Column * int not supported by tradingview_screener, so we use an
+        # absolute volume threshold + large-cap filter instead of relative ratio.
         try:
             _count, df_vol = (
                 Query()
                 .set_markets("india")
-                .select("name", "close", "volume", "average_volume_10d_calc", "change")
-                .where(Column("volume") > Column("average_volume_10d_calc") * 2)
-                .limit(100)
+                .select("name", "close", "volume", "change", "type", "market_cap_basic")
+                .where(
+                    Column("volume") > 5_000_000,
+                    Column("type") == "stock",
+                    Column("market_cap_basic") > 1e9,
+                )
+                .order_by("volume", ascending=False)
+                .limit(_LIMIT)
                 .get_scanner_data()
             )
             if df_vol is not None and not df_vol.empty:
@@ -193,41 +205,62 @@ def pre_screen_stocks(
         except Exception as e:
             logger.warning(f"Screener volume spike query failed: {e}")
 
-        # --- Price spikes (change > 3% or < -3%) ---
+        # --- Price spikes (change > 4% or < -4%, tighter than before to reduce noise) ---
         try:
             _count, df_up = (
                 Query()
                 .set_markets("india")
-                .select("name", "close", "change")
-                .where(Column("change") > 3)
-                .limit(100)
+                .select("name", "close", "change", "type", "market_cap_basic")
+                .where(Column("change") > 4, Column("type") == "stock", Column("market_cap_basic") > 1e9)
+                .order_by("change", ascending=False)
+                .limit(_LIMIT)
                 .get_scanner_data()
             )
             if df_up is not None and not df_up.empty:
                 for _, row in df_up.iterrows():
                     symbols.add(_parse_symbol_from_ticker(str(row.get("ticker", ""))))
         except Exception as e:
-            logger.warning(f"Screener change>3 query failed: {e}")
+            logger.warning(f"Screener change>4 query failed: {e}")
 
         try:
             _count, df_down = (
                 Query()
                 .set_markets("india")
-                .select("name", "close", "change")
-                .where(Column("change") < -3)
-                .limit(100)
+                .select("name", "close", "change", "type", "market_cap_basic")
+                .where(Column("change") < -4, Column("type") == "stock", Column("market_cap_basic") > 1e9)
+                .order_by("change", ascending=True)
+                .limit(_LIMIT)
                 .get_scanner_data()
             )
             if df_down is not None and not df_down.empty:
                 for _, row in df_down.iterrows():
                     symbols.add(_parse_symbol_from_ticker(str(row.get("ticker", ""))))
         except Exception as e:
-            logger.warning(f"Screener change<-3 query failed: {e}")
+            logger.warning(f"Screener change<-4 query failed: {e}")
 
-        # Remove empty strings
+        # Remove empty strings and known-bad patterns
         symbols.discard("")
-        logger.info(f"Pre-screen: {len(symbols)} stocks matched filters")
-        return list(symbols)
+        # Filter out symbols that are unlikely to work with yfinance:
+        # - Must be uppercase alphanumeric (with optional & and -)
+        # - Skip very short symbols (< 2 chars) — often index artifacts
+        # - Skip symbols with digits only (e.g., BSE numeric codes)
+        valid_symbols = set()
+        for sym in symbols:
+            sym = sym.strip()
+            if len(sym) < 2:
+                continue
+            if sym.isdigit():
+                continue
+            # Only keep symbols that match NSE equity naming convention
+            import re
+            if re.match(r'^[A-Z][A-Z0-9&\-]{0,19}$', sym):
+                valid_symbols.add(sym)
+
+        logger.info(
+            "Pre-screen: %d stocks matched filters (%d after validation)",
+            len(symbols), len(valid_symbols),
+        )
+        return list(valid_symbols)
 
     except Exception as e:
         logger.error(f"TradingView pre-screen failed entirely: {e}")
