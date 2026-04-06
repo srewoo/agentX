@@ -15,11 +15,28 @@ interface PerformanceSummary {
   avg_pnl_pct: number;
 }
 
+interface MarketContext {
+  fii_dii: { fii_net: number | null; dii_net: number | null; sentiment: string } | null;
+  india_vix: number | null;
+  market_regime: { regime: string; confidence: number; description: string } | null;
+}
+
+const REGIME_STYLES: Record<string, string> = {
+  "Strong Bull": "bg-emerald-500/15 text-emerald-400 border-emerald-500/30",
+  "Weak Bull": "bg-emerald-500/10 text-emerald-300 border-emerald-500/20",
+  "Strong Bear": "bg-red-500/15 text-red-400 border-red-500/30",
+  "Weak Bear": "bg-red-500/10 text-red-300 border-red-500/20",
+  "Ranging": "bg-yellow-500/15 text-yellow-400 border-yellow-500/30",
+  "Volatile": "bg-orange-500/15 text-orange-400 border-orange-500/30",
+};
+
 export default function Dashboard() {
   const { signals, loading, error, unreadCount, markRead, markAllRead, dismiss, reload } = useSignals();
   const [scanning, setScanning] = useState(false);
   const [marketOpen, setMarketOpen] = useState<boolean | null>(null);
   const [perfSummary, setPerfSummary] = useState<PerformanceSummary | null>(null);
+  const [marketCtx, setMarketCtx] = useState<MarketContext | null>(null);
+  const [indices, setIndices] = useState<Record<string, { price: number; change: number; change_pct: number }> | null>(null);
   const [actionFilter, setActionFilter] = useState<ActionFilter>("ALL");
   const [timeframeFilter, setTimeframeFilter] = useState<TimeframeFilter>("ALL");
   const [cleared, setCleared] = useState(false);
@@ -46,6 +63,8 @@ export default function Dashboard() {
         }
       })
       .catch(() => {});
+    api.getMarketContext().then(setMarketCtx).catch(() => {});
+    api.getIndices().then(setIndices).catch(() => {});
   }, []);
 
   const triggerScan = async () => {
@@ -130,6 +149,75 @@ export default function Dashboard() {
           <span className="text-zinc-400">
             Evaluated: {perfSummary.total_evaluated}
           </span>
+        </div>
+      )}
+
+      {/* Market context bar: Indices + Regime + VIX + FII/DII */}
+      {(indices || (marketCtx && (marketCtx.market_regime || marketCtx.india_vix != null || marketCtx.fii_dii))) && (
+        <div className="flex items-center gap-2 px-3 py-1 border-b border-border bg-zinc-900/30 text-[10px] overflow-x-auto">
+          {/* NIFTY 50 */}
+          {indices?.["NIFTY 50"] && (
+            <span className={`font-medium px-1.5 py-0.5 rounded border whitespace-nowrap ${
+              (indices["NIFTY 50"].change_pct ?? 0) >= 0
+                ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/25"
+                : "bg-red-500/10 text-red-400 border-red-500/25"
+            }`}>
+              NIFTY {indices["NIFTY 50"].price?.toLocaleString("en-IN", { maximumFractionDigits: 0 })}{" "}
+              <span className="opacity-80">
+                {(indices["NIFTY 50"].change_pct ?? 0) >= 0 ? "+" : ""}{indices["NIFTY 50"].change_pct?.toFixed(1)}%
+              </span>
+            </span>
+          )}
+          {/* BSE SENSEX or NIFTY BANK (whichever is available) */}
+          {(() => {
+            const sensex = indices?.["BSE SENSEX"] || indices?.["NIFTY BANK"];
+            const label = indices?.["BSE SENSEX"] ? "SENSEX" : "BANK NIFTY";
+            if (!sensex) return null;
+            return (
+              <span className={`font-medium px-1.5 py-0.5 rounded border whitespace-nowrap ${
+                (sensex.change_pct ?? 0) >= 0
+                  ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/25"
+                  : "bg-red-500/10 text-red-400 border-red-500/25"
+              }`}>
+                {label} {sensex.price?.toLocaleString("en-IN", { maximumFractionDigits: 0 })}{" "}
+                <span className="opacity-80">
+                  {(sensex.change_pct ?? 0) >= 0 ? "+" : ""}{sensex.change_pct?.toFixed(1)}%
+                </span>
+              </span>
+            );
+          })()}
+          {marketCtx?.market_regime && (
+            <span className={`font-bold px-1.5 py-0.5 rounded border ${REGIME_STYLES[marketCtx.market_regime.regime] || "bg-zinc-700/50 text-zinc-400 border-zinc-600"}`}>
+              {marketCtx.market_regime.regime}
+            </span>
+          )}
+          {marketCtx?.india_vix != null && (
+            <span className={`font-medium px-1.5 py-0.5 rounded border ${
+              marketCtx.india_vix > 20 ? "bg-orange-500/10 text-orange-400 border-orange-500/25"
+                : marketCtx.india_vix < 14 ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/25"
+                : "bg-zinc-700/40 text-zinc-400 border-zinc-600/30"
+            }`}>
+              VIX {marketCtx.india_vix.toFixed(1)}
+            </span>
+          )}
+          {marketCtx?.fii_dii && marketCtx.fii_dii.fii_net != null && (
+            <span className={`font-medium px-1.5 py-0.5 rounded border ${
+              marketCtx.fii_dii.fii_net > 0
+                ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/25"
+                : "bg-red-500/10 text-red-400 border-red-500/25"
+            }`}>
+              FII {marketCtx.fii_dii.fii_net > 0 ? "+" : ""}{(marketCtx.fii_dii.fii_net / 100).toFixed(0)}Cr
+            </span>
+          )}
+          {marketCtx?.fii_dii && marketCtx.fii_dii.dii_net != null && (
+            <span className={`font-medium px-1.5 py-0.5 rounded border ${
+              marketCtx.fii_dii.dii_net > 0
+                ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/25"
+                : "bg-red-500/10 text-red-400 border-red-500/25"
+            }`}>
+              DII {marketCtx.fii_dii.dii_net > 0 ? "+" : ""}{(marketCtx.fii_dii.dii_net / 100).toFixed(0)}Cr
+            </span>
+          )}
         </div>
       )}
 

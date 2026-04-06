@@ -382,6 +382,106 @@ def compute_fibonacci_levels(df: pd.DataFrame, period: int = 120) -> dict[str, A
     }
 
 
+def detect_divergence(
+    price_series: pd.Series,
+    indicator_series: pd.Series,
+    lookback: int = 20,
+    pivot_bars: int = 5,
+) -> dict[str, Any]:
+    """Detect RSI/MACD divergences using swing-high/low pivots.
+
+    Pivot detection: a bar is a swing high if it's the max over [i-pivot_bars, i+pivot_bars].
+    A bar is a swing low if it's the min over the same window.
+
+    Returns:
+        {
+            "bullish": bool,   # price lower low + indicator higher low → reversal up
+            "bearish": bool,   # price higher high + indicator lower high → reversal down
+            "type": str,       # "bullish", "bearish", or "none"
+        }
+    """
+    result = {"bullish": False, "bearish": False, "type": "none"}
+
+    if price_series is None or indicator_series is None:
+        return result
+
+    price = price_series.dropna()
+    indicator = indicator_series.dropna()
+
+    # Align on common index
+    common_idx = price.index.intersection(indicator.index)
+    if len(common_idx) < lookback * 2:
+        return result
+
+    price = price.loc[common_idx].tail(lookback + pivot_bars * 2)
+    indicator = indicator.loc[common_idx].tail(lookback + pivot_bars * 2)
+
+    n = len(price)
+    if n < pivot_bars * 4:
+        return result
+
+    price_arr = price.values
+    ind_arr = indicator.values
+
+    # Find swing highs and lows (exclude last pivot_bars bars — incomplete pivots)
+    scan_range = range(pivot_bars, n - pivot_bars)
+
+    swing_lows_price: list[tuple[int, float]] = []
+    swing_highs_price: list[tuple[int, float]] = []
+    swing_lows_ind: list[tuple[int, float]] = []
+    swing_highs_ind: list[tuple[int, float]] = []
+
+    for i in scan_range:
+        window_p = price_arr[i - pivot_bars: i + pivot_bars + 1]
+        window_ind = ind_arr[i - pivot_bars: i + pivot_bars + 1]
+
+        if price_arr[i] == window_p.min():
+            swing_lows_price.append((i, price_arr[i]))
+        if price_arr[i] == window_p.max():
+            swing_highs_price.append((i, price_arr[i]))
+        if ind_arr[i] == window_ind.min():
+            swing_lows_ind.append((i, ind_arr[i]))
+        if ind_arr[i] == window_ind.max():
+            swing_highs_ind.append((i, ind_arr[i]))
+
+    # Need at least 2 swing lows/highs on each side for divergence check
+    if len(swing_lows_price) >= 2 and len(swing_lows_ind) >= 2:
+        # Compare most recent two swing lows
+        p_low1, p_low2 = swing_lows_price[-2], swing_lows_price[-1]
+        # Find closest indicator swing low to each price swing low
+        def closest_ind_low(bar_idx: int) -> Optional[tuple[int, float]]:
+            candidates = [sl for sl in swing_lows_ind if abs(sl[0] - bar_idx) <= pivot_bars * 3]
+            return min(candidates, key=lambda x: abs(x[0] - bar_idx)) if candidates else None
+
+        i1 = closest_ind_low(p_low1[0])
+        i2 = closest_ind_low(p_low2[0])
+
+        if i1 and i2 and p_low2[0] > p_low1[0]:
+            # Bullish divergence: price lower low, indicator higher low
+            if p_low2[1] < p_low1[1] and i2[1] > i1[1]:
+                result["bullish"] = True
+                result["type"] = "bullish"
+
+    if len(swing_highs_price) >= 2 and len(swing_highs_ind) >= 2:
+        p_high1, p_high2 = swing_highs_price[-2], swing_highs_price[-1]
+
+        def closest_ind_high(bar_idx: int) -> Optional[tuple[int, float]]:
+            candidates = [sh for sh in swing_highs_ind if abs(sh[0] - bar_idx) <= pivot_bars * 3]
+            return min(candidates, key=lambda x: abs(x[0] - bar_idx)) if candidates else None
+
+        i1 = closest_ind_high(p_high1[0])
+        i2 = closest_ind_high(p_high2[0])
+
+        if i1 and i2 and p_high2[0] > p_high1[0]:
+            # Bearish divergence: price higher high, indicator lower high
+            if p_high2[1] > p_high1[1] and i2[1] < i1[1]:
+                result["bearish"] = True
+                if not result["bullish"]:
+                    result["type"] = "bearish"
+
+    return result
+
+
 def compute_volume_profile_poc(df: pd.DataFrame, bins: int = 20) -> Optional[float]:
     """Approximate Volume Profile Point of Control (highest volume price)."""
     if df.empty or "Volume" not in df.columns or len(df) < 10:

@@ -5,7 +5,7 @@ fde5cba5,SAIL,bullish,bullish_engulfing,7,151.42,2026-03-30,146.88,158.99,29981.
 b57780b8,IDFCFIRSTB,bearish,double_top,6,58.85,2026-03-30,60.62,55.91,29954.65,509,open,,,,,
 836f06af,BPCL,bearish,gap_down,7,281.0,2026-03-30,289.43,266.95,29786.0,106,open,,,,,
 b7a7b404,GTLINFRA,bearish,double_top,6,0.97,2026-03-30,1.0,0.92,29999.19,30927,closed,1.03,2026-04-01,-6.19,-1856.95,stop_loss
-7ebb41c2,ARROWGREEN,bullish,bullish_engulfing,7,459.0,2026-03-30,445.23,481.95,29835.0,65,open,,,,,
+7ebb41c2,ARROWGREEN,bullish,bullish_engulfing,7,459.0,2026-03-30,445.23,481.95,29835.0,65,closed,515.0,2026-04-06,12.2,3639.87,target_hit
 fe42ff45,RENUKA,bullish,double_bottom,8,27.5,2026-03-30,26.68,28.88,29975.0,1090,open,,,,,
 53df1db9,KOTAKBANK,bullish,rsi_extreme,6,353.4,2026-03-31,342.8,371.07,29685.6,84,open,,,,,
 a8c3fb0a,SBIN,bullish,double_bottom,8,979.4,2026-03-31,950.02,1028.37,29382.0,30,open,,,,,
@@ -15,5 +15,13 @@ d97cb92d,OBCL,bullish,bullish_engulfing,7,57.24,2026-03-31,55.52,60.1,29993.76,5
 f1ee478b,ONGC,bullish,cup_and_handle,7,284.65,2026-03-31,276.11,298.88,29888.25,105,open,,,,,
 b4832ec1,IRFC,bearish,macd_crossover,6,87.23,2026-03-31,89.85,82.87,29919.89,343,closed,91.6,2026-04-01,-5.01,-1498.99,stop_loss
 a208219e,FILATFASH,bullish,rsi_extreme,8,0.14,2026-04-01,0.14,0.15,29999.9,214285,closed,0.15,2026-04-01,7.14,2141.99,target_hit
-f0fabd1d,MAWANASUG,bullish,ema_crossover,6,94.52,2026-04-01,91.68,99.25,29962.84,317,open,,,,,
+f0fabd1d,MAWANASUG,bullish,ema_crossover,6,94.52,2026-04-01,91.68,99.25,29962.84,317,closed,89.5,2026-04-02,-5.31,-1591.03,stop_loss
 2f34de57,IRFC,bearish,macd_crossover,6,87.23,2026-04-01,89.85,82.87,29919.89,343,closed,92.01,2026-04-01,-5.48,-1639.61,stop_loss
+1fa1bb6f,RACE,bearish,bearish_engulfing,7,86.05,2026-04-02,88.63,81.75,29945.4,348,closed,129.78,2026-04-06,-50.82,-15218.25,stop_loss
+8d8da53a,DABUR,bearish,double_top,6,410.45,2026-04-02,422.76,389.93,29962.85,73,open,,,,,
+433fb29f,HDBFS,bullish,rsi_extreme,7,559.95,2026-04-02,543.15,587.95,29677.35,53,open,,,,,
+e46ce225,FILATFASH,bullish,rsi_extreme,8,0.14,2026-04-02,0.14,0.15,29999.9,214285,closed,0.17,2026-04-06,21.43,6428.98,target_hit
+45aceb83,ICICIPRULI,bearish,head_and_shoulders,7,509.55,2026-04-02,524.84,484.07,29553.9,58,open,,,,,
+f1e83485,DRCSYSTEMS,bearish,double_top,6,15.18,2026-04-06,15.64,14.42,29995.68,1976,open,,,,,
+fc3b3118,ACUTAAS,bullish,gap_up,7,2332.1,2026-04-06,2262.14,2448.7,27985.2,12,closed,2137.0,2026-04-06,-8.37,-2342.36,stop_loss
+b77b31b4,ELDEHSG,bearish,shooting_star,6,785.2,2026-04-06,808.76,745.94,29837.6,38,open,,,,,

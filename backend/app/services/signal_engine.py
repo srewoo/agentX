@@ -12,6 +12,7 @@ import pandas as pd
 
 from app.utils import safe_float
 from app.services.patterns import scan_patterns
+from app.services.technicals import detect_divergence
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +23,23 @@ BREAKOUT = "breakout"
 RSI_EXTREME = "rsi_extreme"
 MACD_CROSSOVER = "macd_crossover"
 SENTIMENT_SHIFT = "sentiment_shift"
+RSI_DIVERGENCE = "rsi_divergence"
+MACD_DIVERGENCE = "macd_divergence"
+CONFLUENCE = "confluence"
+
+# Patterns that are directional and should be filtered against the prevailing trend
+_BULLISH_PATTERNS = {
+    "double_bottom", "cup_and_handle", "hammer", "morning_star",
+    "bullish_engulfing", "inverse_head_and_shoulders", "52_week_low",
+    "golden_cross", "three_white_soldiers",
+}
+_BEARISH_PATTERNS = {
+    "double_top", "head_and_shoulders", "evening_star", "bearish_engulfing",
+    "shooting_star", "52_week_high", "death_cross", "three_black_crows",
+}
+
+# Minimum sample size before dynamic weighting kicks in
+_MIN_SIGNAL_SAMPLE = 30
 
 
 def _make_signal(
@@ -84,8 +102,15 @@ def detect_volume_spike(
     current_vol: Optional[float],
     avg_vol: Optional[float],
     threshold_ratio: float = 2.0,
+    delivery_pct: Optional[float] = None,
 ) -> Optional[dict]:
-    """Detect unusually high trading volume."""
+    """Detect unusually high trading volume, modified by delivery %.
+
+    Delivery volume % tells you what fraction of volume was actual buying/selling
+    vs intraday speculation:
+    - delivery_pct > 60% → institutional accumulation, strength += 2
+    - delivery_pct < 30% → speculative noise, strength -= 2
+    """
     if not current_vol or not avg_vol or avg_vol == 0:
         return None
     ratio = current_vol / avg_vol
@@ -93,15 +118,27 @@ def detect_volume_spike(
         return None
 
     strength = min(10, int(ratio * 2) + 1)
+
+    # Delivery volume modifier
+    delivery_note = ""
+    if delivery_pct is not None:
+        if delivery_pct > 60:
+            strength = min(10, strength + 2)
+            delivery_note = f" High delivery {delivery_pct:.0f}% — institutional accumulation."
+        elif delivery_pct < 30:
+            strength = max(1, strength - 2)
+            delivery_note = f" Low delivery {delivery_pct:.0f}% — speculative activity."
+
     return _make_signal(
         symbol=symbol,
         signal_type=VOLUME_SPIKE,
         direction="neutral",
         strength=strength,
-        reason=f"Volume spike: {ratio:.1f}x the 20-day average ({int(current_vol):,} vs avg {int(avg_vol):,})",
+        reason=f"Volume spike: {ratio:.1f}x the 20-day average ({int(current_vol):,} vs avg {int(avg_vol):,}).{delivery_note}",
         risk="High volume can precede large moves in either direction. Watch price action for confirmation.",
         current_price=current_price,
-        metadata={"volume_ratio": round(ratio, 2), "current_vol": current_vol, "avg_vol": avg_vol},
+        metadata={"volume_ratio": round(ratio, 2), "current_vol": current_vol,
+                  "avg_vol": avg_vol, "delivery_pct": delivery_pct},
     )
 
 
@@ -296,6 +333,173 @@ def detect_sentiment_shift(
     )
 
 
+def detect_options_signal(
+    symbol: str,
+    current_price: Optional[float],
+    options_analysis: Optional[dict],
+) -> Optional[dict]:
+    """Generate signal from options chain data (PCR, max pain, unusual OI).
+
+    Only meaningful for F&O eligible stocks (NIFTY 50 + NIFTY Next 50).
+    PCR > 1.5 with unusual PE OI → strong bullish (put selling = downside protection)
+    PCR < 0.5 with unusual CE OI → strong bearish (call selling = upside capped)
+    Max pain divergence > 3% → pull toward max pain
+    """
+    if not options_analysis or not current_price:
+        return None
+
+    pcr = options_analysis.get("pcr")
+    max_pain = options_analysis.get("max_pain")
+    unusual_activity = options_analysis.get("unusual_oi_activity", [])
+
+    if pcr is None:
+        return None
+
+    # PCR extremes
+    if pcr > 1.5:
+        pe_unusual = any("unusual_put" in str(a.get("type", "")) or pcr > 2.0 for a in unusual_activity)
+        strength = 8 if pcr > 2.0 else 6
+        return _make_signal(
+            symbol=symbol,
+            signal_type="options_flow",
+            direction="bullish",
+            strength=strength,
+            reason=f"Put/Call Ratio {pcr:.2f} — heavy put selling indicates strong support. Smart money buying protection suggests floor.",
+            risk="Options signals can reverse quickly. PCR is a contrarian indicator — very high PCR can also indicate panic.",
+            current_price=current_price,
+            metadata={"pcr": pcr, "max_pain": max_pain, "signal_source": "high_pcr"},
+        )
+
+    if pcr < 0.5:
+        strength = 8 if pcr < 0.3 else 6
+        return _make_signal(
+            symbol=symbol,
+            signal_type="options_flow",
+            direction="bearish",
+            strength=strength,
+            reason=f"Put/Call Ratio {pcr:.2f} — heavy call selling indicates strong resistance. Smart money capping upside.",
+            risk="Very low PCR can also mean complacency before a quick bounce.",
+            current_price=current_price,
+            metadata={"pcr": pcr, "max_pain": max_pain, "signal_source": "low_pcr"},
+        )
+
+    # Max pain divergence
+    if max_pain and current_price:
+        divergence_pct = (current_price - max_pain) / max_pain * 100
+        if abs(divergence_pct) >= 3.0:
+            direction = "bearish" if current_price > max_pain else "bullish"
+            return _make_signal(
+                symbol=symbol,
+                signal_type="options_flow",
+                direction=direction,
+                strength=5,
+                reason=f"Price {divergence_pct:+.1f}% from max pain (Rs.{max_pain:.2f}). Options expiry gravity may pull price toward max pain.",
+                risk="Max pain effect is strongest near expiry. Less reliable mid-cycle.",
+                current_price=current_price,
+                metadata={"pcr": pcr, "max_pain": max_pain, "divergence_pct": round(divergence_pct, 2)},
+            )
+
+    return None
+
+
+def detect_rsi_divergence(
+    symbol: str,
+    df: pd.DataFrame,
+    technicals: dict,
+    current_price: Optional[float],
+) -> Optional[dict]:
+    """Detect bullish/bearish RSI divergence — reliable reversal signal."""
+    try:
+        import ta
+        close = df["Close"]
+        rsi_series = ta.momentum.RSIIndicator(close=close, window=14).rsi()
+        div = detect_divergence(close, rsi_series, lookback=25, pivot_bars=5)
+        if div["bullish"]:
+            return _make_signal(
+                symbol=symbol,
+                signal_type=RSI_DIVERGENCE,
+                direction="bullish",
+                strength=7,
+                reason="Bullish RSI divergence: price made lower low but RSI made higher low — potential reversal up",
+                risk="Divergences can take time to play out. Use as confirmation with price action.",
+                current_price=current_price,
+                metadata={"divergence_type": "bullish_rsi"},
+            )
+        if div["bearish"]:
+            return _make_signal(
+                symbol=symbol,
+                signal_type=RSI_DIVERGENCE,
+                direction="bearish",
+                strength=7,
+                reason="Bearish RSI divergence: price made higher high but RSI made lower high — potential reversal down",
+                risk="Divergences can take time to play out. Use as confirmation with price action.",
+                current_price=current_price,
+                metadata={"divergence_type": "bearish_rsi"},
+            )
+    except Exception as e:
+        logger.debug("RSI divergence detection failed for %s: %s", symbol, e)
+    return None
+
+
+def detect_macd_divergence(
+    symbol: str,
+    df: pd.DataFrame,
+    technicals: dict,
+    current_price: Optional[float],
+) -> Optional[dict]:
+    """Detect bullish/bearish MACD histogram divergence."""
+    try:
+        import ta
+        close = df["Close"]
+        macd_ind = ta.trend.MACD(close=close, window_slow=26, window_fast=12, window_sign=9)
+        hist = macd_ind.macd_diff()
+        div = detect_divergence(close, hist, lookback=25, pivot_bars=5)
+        if div["bullish"]:
+            return _make_signal(
+                symbol=symbol,
+                signal_type=MACD_DIVERGENCE,
+                direction="bullish",
+                strength=7,
+                reason="Bullish MACD histogram divergence: price lower low, MACD histogram higher low — momentum building",
+                risk="MACD divergences work best in trending markets with clear swing points.",
+                current_price=current_price,
+                metadata={"divergence_type": "bullish_macd"},
+            )
+        if div["bearish"]:
+            return _make_signal(
+                symbol=symbol,
+                signal_type=MACD_DIVERGENCE,
+                direction="bearish",
+                strength=7,
+                reason="Bearish MACD histogram divergence: price higher high, MACD histogram lower high — momentum waning",
+                risk="MACD divergences work best in trending markets with clear swing points.",
+                current_price=current_price,
+                metadata={"divergence_type": "bearish_macd"},
+            )
+    except Exception as e:
+        logger.debug("MACD divergence detection failed for %s: %s", symbol, e)
+    return None
+
+
+def _get_signal_weight(signal_type: str, direction: str) -> float:
+    """Return dynamic weight for a signal type based on historical win rate.
+
+    Weight = win_rate / 50.0, clamped to [0.5, 1.5].
+    Returns 1.0 (neutral) if insufficient data (< _MIN_SIGNAL_SAMPLE signals).
+    This is synchronous — reads from an in-memory cache updated by signal_tracker.
+    """
+    try:
+        from app.services.signal_tracker import _performance_cache  # type: ignore[attr-defined]
+        key = f"{signal_type}:{direction}"
+        perf = _performance_cache.get(key)
+        if perf and perf.get("total_signals", 0) >= _MIN_SIGNAL_SAMPLE:
+            weight = perf["win_rate"] / 50.0
+            return max(0.5, min(1.5, weight))
+    except Exception:
+        pass
+    return 1.0
+
+
 def scan_symbol(
     symbol: str,
     df: pd.DataFrame,
@@ -304,17 +508,39 @@ def scan_symbol(
     previous_price: Optional[float] = None,
     sentiment_score: Optional[float] = None,
     thresholds: Optional[dict] = None,
+    delivery_pct: Optional[float] = None,
 ) -> list[dict[str, Any]]:
     """
     Run all detectors on a symbol's data. Returns list of signals found.
     Deterministic — no LLM calls.
 
+    Includes:
+    - Trend filter: penalizes patterns that trade against the prevailing trend
+    - Divergence detection: RSI and MACD divergences
+    - Dynamic weighting: boosts/suppresses based on historical win rate
+    - Confluence scoring: promotes stocks where 2+ directional signals agree
+
     thresholds: optional dict from settings to override default detector params:
         rsi_overbought, rsi_oversold, price_spike_pct, volume_spike_ratio, breakout_min_score
+    delivery_pct: optional NSE delivery volume % (passed to volume_spike detector)
     """
     signals = []
     current_price = safe_float(df["Close"].iloc[-1]) if not df.empty else None
     t = thresholds or {}
+
+    # ── Prevailing trend context (SMA50 vs SMA200 for filtering patterns) ──
+    ma = technicals.get("moving_averages", {})
+    sma50 = ma.get("sma50")
+    sma200 = ma.get("sma200")
+    if sma50 and sma200:
+        trend = "up" if sma50 > sma200 else "down"
+    elif sma50 and current_price:
+        trend = "up" if current_price > sma50 else "down"
+    else:
+        trend = "sideways"
+
+    # RSI for trend-filter usage
+    rsi = technicals.get("rsi")
 
     # Price spike since last scan
     if previous_price:
@@ -325,25 +551,28 @@ def scan_symbol(
         if sig:
             signals.append(sig)
 
-    # Volume spike
+    # Volume spike (with delivery % if available)
     vol_current = technicals.get("volume_current")
     vol_avg = technicals.get("volume_avg_20")
     if vol_current and vol_avg:
         sig = detect_volume_spike(
             symbol, current_price, vol_current, vol_avg,
             threshold_ratio=float(t.get("volume_spike_ratio", 2.0)),
+            delivery_pct=delivery_pct,
         )
         if sig:
             signals.append(sig)
 
-    # RSI extreme
-    rsi = technicals.get("rsi")
+    # RSI extreme — only signal oversold if trend is not strongly down (avoid falling knives)
     sig = detect_rsi_extreme(
         symbol, current_price, rsi,
         overbought=float(t.get("rsi_overbought", 70.0)),
         oversold=float(t.get("rsi_oversold", 30.0)),
     )
     if sig:
+        if sig["direction"] == "bullish" and trend == "down":
+            sig["strength"] = max(1, sig["strength"] - 2)
+            sig["reason"] += " [caution: downtrend]"
         signals.append(sig)
 
     # MACD crossover
@@ -370,10 +599,94 @@ def scan_symbol(
         if sig:
             signals.append(sig)
 
-    # Chart patterns and India-specific scan patterns
+    # RSI divergence
+    if df is not None and len(df) >= 30:
+        sig = detect_rsi_divergence(symbol, df, technicals, current_price)
+        if sig:
+            signals.append(sig)
+
+    # MACD divergence
+    if df is not None and len(df) >= 30:
+        sig = detect_macd_divergence(symbol, df, technicals, current_price)
+        if sig:
+            signals.append(sig)
+
+    # Chart patterns with trend filter
     if df is not None and not df.empty:
         pattern_signals = scan_patterns(symbol, df)
-        signals.extend(pattern_signals)
+        adx = technicals.get("adx")
+        for psig in pattern_signals:
+            stype = psig.get("signal_type", "")
+            pdir = psig.get("direction", "neutral")
+
+            # Trend filter: penalize patterns that trade against prevailing trend
+            if stype in _BULLISH_PATTERNS and trend == "down":
+                psig["strength"] = max(1, psig["strength"] - 3)
+                psig["reason"] = psig.get("reason", "") + " [penalized: counter-trend]"
+            elif stype in _BEARISH_PATTERNS and trend == "up":
+                psig["strength"] = max(1, psig["strength"] - 3)
+                psig["reason"] = psig.get("reason", "") + " [penalized: counter-trend]"
+
+            # 52-week high: only strong if RSI < 80 AND ADX confirms trend
+            if stype == "52_week_high":
+                if not (rsi and rsi < 80 and adx and adx > 25):
+                    psig["strength"] = max(1, psig["strength"] - 2)
+
+            signals.append(psig)
+
+    # ── Dynamic signal weighting (boost proven signals, suppress poor ones) ─
+    for sig in signals:
+        stype = sig.get("signal_type", "")
+        sdir = sig.get("direction", "neutral")
+        if sdir != "neutral":
+            weight = _get_signal_weight(stype, sdir)
+            if weight != 1.0:
+                new_strength = max(1, min(10, round(sig["strength"] * weight)))
+                sig["strength"] = new_strength
+
+    # ── Multi-signal confluence detection ────────────────────────────────────
+    bullish_sigs = [s for s in signals if s.get("direction") == "bullish"]
+    bearish_sigs = [s for s in signals if s.get("direction") == "bearish"]
+
+    if len(bullish_sigs) >= 2:
+        max_bull_strength = max(s["strength"] for s in bullish_sigs)
+        confluence_strength = min(10, max_bull_strength + len(bullish_sigs) - 1)
+        contributing = [s["signal_type"] for s in bullish_sigs]
+        confluence_sig = _make_signal(
+            symbol=symbol,
+            signal_type=CONFLUENCE,
+            direction="bullish",
+            strength=confluence_strength,
+            reason=f"Multi-signal bullish confluence: {', '.join(contributing)}",
+            risk="Confluence increases probability but not certainty. Manage risk normally.",
+            current_price=current_price,
+            metadata={"contributing_signals": contributing, "signal_count": len(bullish_sigs)},
+        )
+        signals.append(confluence_sig)
+
+    if len(bearish_sigs) >= 2:
+        max_bear_strength = max(s["strength"] for s in bearish_sigs)
+        confluence_strength = min(10, max_bear_strength + len(bearish_sigs) - 1)
+        contributing = [s["signal_type"] for s in bearish_sigs]
+        confluence_sig = _make_signal(
+            symbol=symbol,
+            signal_type=CONFLUENCE,
+            direction="bearish",
+            strength=confluence_strength,
+            reason=f"Multi-signal bearish confluence: {', '.join(contributing)}",
+            risk="Confluence increases probability but not certainty. Manage risk normally.",
+            current_price=current_price,
+            metadata={"contributing_signals": contributing, "signal_count": len(bearish_sigs)},
+        )
+        signals.append(confluence_sig)
+
+    # Conflicting signals (both bullish and bearish fire) — reduce all strengths
+    if bullish_sigs and bearish_sigs:
+        for sig in signals:
+            if sig.get("signal_type") != CONFLUENCE:
+                sig["strength"] = max(1, sig["strength"] - 2)
+                sig["metadata"] = sig.get("metadata", {})
+                sig["metadata"]["conflicting_signals"] = True
 
     return signals
 

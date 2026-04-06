@@ -200,6 +200,9 @@ def _fetch_info_sync(yf_symbol: str) -> dict[str, Any]:
         return {}
 
 
+_YFINANCE_TIMEOUT = 30  # seconds — prevent yfinance from hanging indefinitely
+
+
 async def get_fundamentals(symbol: str) -> dict[str, Any]:
     """
     Extract fundamental data from yfinance for a stock.
@@ -208,7 +211,14 @@ async def get_fundamentals(symbol: str) -> dict[str, Any]:
     yf_symbol = _resolve_yf_symbol(symbol)
 
     loop = asyncio.get_event_loop()
-    info = await loop.run_in_executor(None, _fetch_info_sync, yf_symbol)
+    try:
+        info = await asyncio.wait_for(
+            loop.run_in_executor(None, _fetch_info_sync, yf_symbol),
+            timeout=_YFINANCE_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("yfinance info fetch timed out after %ds for %s", _YFINANCE_TIMEOUT, symbol)
+        return _empty_result(symbol)
 
     if not info:
         logger.warning("Empty info dict for %s, returning defaults", symbol)

@@ -180,6 +180,52 @@ async def get_news(limit: int = 20):
         return {"news": [], "count": 0}
 
 
+@router.get("/market/context")
+async def get_market_context_summary():
+    """Market context summary: FII/DII flows, India VIX, NIFTY regime. Used by the frontend dashboard."""
+    from app.services.fii_dii import get_fii_dii_data
+    from app.services.market_data import get_india_vix
+    from app.services.market_regime import detect_market_regime
+
+    cache_key = "market:context"
+    cached = await cache_manager.get(cache_key)
+    if cached:
+        return cached
+
+    result: dict = {
+        "fii_dii": None,
+        "india_vix": None,
+        "market_regime": None,
+    }
+
+    # FII/DII flows
+    try:
+        fii_data = await get_fii_dii_data()
+        result["fii_dii"] = fii_data
+    except Exception as e:
+        logger.debug("FII/DII fetch failed for context: %s", e)
+
+    # India VIX
+    try:
+        vix = await get_india_vix()
+        result["india_vix"] = vix
+    except Exception as e:
+        logger.debug("India VIX fetch failed for context: %s", e)
+
+    # Market regime (NIFTY 50)
+    try:
+        nifty_df = await async_fetch_history("^NSEI", period="1y", interval="1d")
+        if nifty_df is not None and not nifty_df.empty and len(nifty_df) >= 200:
+            regime = detect_market_regime(nifty_df)
+            result["market_regime"] = regime
+    except Exception as e:
+        logger.debug("Market regime detection failed: %s", e)
+
+    if any(v is not None for v in result.values()):
+        await cache_manager.set(cache_key, result, ttl=timedelta(minutes=10))
+    return result
+
+
 @router.post("/scan/trigger")
 async def trigger_scan():
     """Manually trigger a scan cycle. Returns signals found."""

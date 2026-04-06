@@ -65,6 +65,13 @@ async def lifespan(app: FastAPI):
     logger.info("StockPilot backend starting...")
     await init_db()
     await cache_manager.connect(settings.redis_url)
+
+    # Seed dynamic signal weighting cache from existing performance data
+    from app.services.signal_tracker import seed_performance_cache
+    seeded = await seed_performance_cache()
+    if seeded:
+        logger.info("Dynamic signal weighting active: %d signal types loaded", seeded)
+
     await orchestrator.start()
     logger.info("StockPilot backend ready")
 

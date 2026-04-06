@@ -80,6 +80,11 @@ export const api = {
   // Market
   getIndices: () => request<Record<string, { symbol: string; price: number; change: number; change_pct: number }>>("/api/market/indices"),
   getNews: (limit = 20) => request<{ news: unknown[]; count: number }>(`/api/market/news?limit=${limit}`),
+  getMarketContext: () => request<{
+    fii_dii: { fii_net: number | null; dii_net: number | null; sentiment: string; source: string } | null;
+    india_vix: number | null;
+    market_regime: { regime: string; confidence: number; description: string } | null;
+  }>("/api/market/context"),
 
   // Settings
   getSettings: () => request<{ settings: AppSettings }>("/api/settings"),
@@ -107,6 +112,6 @@ export const api = {
   getPerformanceSummary: () =>
     request<{ data: { total_evaluated: number; total_wins: number; win_rate: number; avg_pnl_pct: number } }>("/api/performance/summary"),
 
-  // Manual scan
-  triggerScan: () => request<{ signals_found: number; scan_duration_ms: number }>("/api/scan/trigger", { method: "POST" }),
+  // Manual scan (120s timeout — scan now fetches FII/DII, VIX, delivery volume, RS, etc.)
+  triggerScan: () => request<{ signals_found: number; scan_duration_ms: number }>("/api/scan/trigger", { method: "POST" }, 120_000),
 };

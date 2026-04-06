@@ -25,7 +25,11 @@ export type SignalType =
   | "52_week_low"
   | "gap_up"
   | "gap_down"
-  | "volume_dry_up";
+  | "volume_dry_up"
+  | "rsi_divergence"
+  | "macd_divergence"
+  | "confluence"
+  | "options_flow";
 
 export type Direction = "bullish" | "bearish" | "neutral";
 

@@ -98,11 +98,47 @@ export default function SignalCard({ signal, onRead, onDismiss }: Props) {
         </div>
       </div>
 
-      {/* Row 2: Signal type + price */}
+      {/* Row 2: Signal type + metadata badges + price */}
       <div className="flex items-center justify-between mb-1.5">
-        <span className="text-xs text-zinc-500 bg-zinc-800 px-2 py-0.5 rounded-md">
-          {label}
-        </span>
+        <div className="flex items-center gap-1.5 flex-wrap">
+          <span className="text-xs text-zinc-500 bg-zinc-800 px-2 py-0.5 rounded-md">
+            {label}
+          </span>
+          {/* Confluence badge */}
+          {signal.signal_type === "confluence" && (
+            <span className="text-[10px] font-bold px-1.5 py-0.5 rounded border bg-violet-500/15 text-violet-400 border-violet-500/30">
+              {(signal.metadata?.signal_count as number) || 2}x CONFLUENCE
+            </span>
+          )}
+          {/* FII flow indicator */}
+          {signal.metadata?.fii_modifier != null && (signal.metadata.fii_modifier as number) !== 0 && (
+            <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded border ${
+              (signal.metadata.fii_modifier as number) < 0
+                ? "bg-red-500/15 text-red-400 border-red-500/30"
+                : "bg-emerald-500/15 text-emerald-400 border-emerald-500/30"
+            }`}>
+              FII {(signal.metadata.fii_modifier as number) < 0 ? "SELLING" : "BUYING"}
+            </span>
+          )}
+          {/* Delivery % badge for volume spikes */}
+          {signal.signal_type === "volume_spike" && signal.metadata?.delivery_pct != null && (
+            <span className={`text-[10px] font-medium px-1.5 py-0.5 rounded border ${
+              (signal.metadata.delivery_pct as number) > 60
+                ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/25"
+                : (signal.metadata.delivery_pct as number) < 30
+                ? "bg-yellow-500/10 text-yellow-400 border-yellow-500/25"
+                : "bg-zinc-700/50 text-zinc-400 border-zinc-600/30"
+            }`}>
+              {(signal.metadata.delivery_pct as number).toFixed(0)}% Delivery
+            </span>
+          )}
+          {/* Counter-trend warning */}
+          {signal.metadata?.conflicting_signals && (
+            <span className="text-[10px] font-medium px-1.5 py-0.5 rounded border bg-yellow-500/10 text-yellow-400 border-yellow-500/25">
+              MIXED
+            </span>
+          )}
+        </div>
         {signal.current_price && (
           <span className="text-xs text-zinc-400 font-medium">
             ₹{signal.current_price.toLocaleString("en-IN")}

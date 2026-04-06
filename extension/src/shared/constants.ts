@@ -30,6 +30,10 @@ export const SIGNAL_TYPE_LABELS: Record<string, string> = {
   gap_up: "Gap Up",
   gap_down: "Gap Down",
   volume_dry_up: "Volume Dry-Up",
+  rsi_divergence: "RSI Divergence",
+  macd_divergence: "MACD Divergence",
+  confluence: "Multi-Signal Confluence",
+  options_flow: "Options Flow",
 };
 
 // Derived timeframe for each signal type
@@ -61,6 +65,10 @@ export const SIGNAL_TIMEFRAME: Record<string, "Intraday" | "Swing" | "Long-term"
   gap_up: "Intraday",
   gap_down: "Intraday",
   volume_dry_up: "Swing",
+  rsi_divergence: "Swing",
+  macd_divergence: "Swing",
+  confluence: "Swing",
+  options_flow: "Swing",
 };
 
 // Derive action label from direction

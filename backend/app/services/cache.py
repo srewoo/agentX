@@ -1,11 +1,15 @@
 from __future__ import annotations
 """Redis caching utility with graceful degradation when Redis is unavailable."""
+import asyncio
 import json
 import logging
 from typing import Any, Optional
 from datetime import timedelta
 
 logger = logging.getLogger(__name__)
+
+# Timeout for individual Redis operations (seconds)
+_REDIS_OP_TIMEOUT = 5
 
 try:
     import redis.asyncio as redis
@@ -34,6 +38,7 @@ class CacheManager:
                 encoding="utf-8",
                 decode_responses=True,
                 socket_connect_timeout=5,
+                socket_timeout=_REDIS_OP_TIMEOUT,
             )
             await self._client.ping()
             self._enabled = True
@@ -53,8 +58,13 @@ class CacheManager:
         if not self._enabled or not self._client:
             return None
         try:
-            value = await self._client.get(key)
+            value = await asyncio.wait_for(
+                self._client.get(key), timeout=_REDIS_OP_TIMEOUT
+            )
             return json.loads(value) if value is not None else None
+        except asyncio.TimeoutError:
+            logger.warning(f"Cache GET timed out for {key}")
+            return None
         except Exception as e:
             logger.error(f"Cache GET error for {key}: {e}")
             return None
@@ -64,8 +74,14 @@ class CacheManager:
             return False
         try:
             serialized = json.dumps(value, default=str)
-            await self._client.setex(key, int(ttl.total_seconds()), serialized)
+            await asyncio.wait_for(
+                self._client.setex(key, int(ttl.total_seconds()), serialized),
+                timeout=_REDIS_OP_TIMEOUT,
+            )
             return True
+        except asyncio.TimeoutError:
+            logger.warning(f"Cache SET timed out for {key}")
+            return False
         except Exception as e:
             logger.error(f"Cache SET error for {key}: {e}")
             return False
@@ -74,8 +90,13 @@ class CacheManager:
         if not self._enabled or not self._client:
             return False
         try:
-            await self._client.delete(key)
+            await asyncio.wait_for(
+                self._client.delete(key), timeout=_REDIS_OP_TIMEOUT
+            )
             return True
+        except asyncio.TimeoutError:
+            logger.warning(f"Cache DELETE timed out for {key}")
+            return False
         except Exception as e:
             logger.error(f"Cache DELETE error for {key}: {e}")
             return False

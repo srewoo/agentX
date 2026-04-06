@@ -27,28 +27,41 @@ MIN_LOOKBACK = 26
 BULLISH = "bullish"
 BEARISH = "bearish"
 
+# Indian market round-trip transaction costs (brokerage + STT + SEBI + stamp duty)
+# Brokerage ~0.03% + STT 0.1% sell + SEBI/stamp ~0.015% ≈ 0.20% round-trip
+TRANSACTION_COST_PCT = 0.20
+
 
 def _evaluate_outcome(
     direction: str,
     entry_price: float,
     future_price: float,
-) -> dict[str, float]:
-    """Return pnl_pct and whether it was a win for the given direction."""
+    transaction_cost_pct: float = TRANSACTION_COST_PCT,
+) -> dict[str, Any]:
+    """Return pnl_pct, win flag, and neutral flag for the given direction.
+
+    Neutral signals (breakout neutral, inside_day neutral, etc.) are NOT counted
+    as wins or losses — they are excluded from the directional win rate.
+    Transaction costs are subtracted from directional signals.
+    """
     if entry_price == 0:
-        return {"pnl_pct": 0.0, "win": False}
+        return {"pnl_pct": 0.0, "win": False, "neutral": False}
 
     raw_pnl = (future_price - entry_price) / entry_price * 100
 
     if direction == BULLISH:
-        pnl_pct = raw_pnl
+        pnl_pct = raw_pnl - transaction_cost_pct
+        win = pnl_pct > 0
+        return {"pnl_pct": round(pnl_pct, 4), "win": win, "neutral": False}
     elif direction == BEARISH:
-        pnl_pct = -raw_pnl
+        pnl_pct = -raw_pnl - transaction_cost_pct
+        win = pnl_pct > 0
+        return {"pnl_pct": round(pnl_pct, 4), "win": win, "neutral": False}
     else:
-        # Neutral signals: track absolute move but count as non-directional
+        # Neutral signals: record absolute move but mark as unrateable.
+        # Do NOT count as win or loss — excluded from directional win rate.
         pnl_pct = abs(raw_pnl)
-
-    win = pnl_pct > 0
-    return {"pnl_pct": round(pnl_pct, 4), "win": win}
+        return {"pnl_pct": round(pnl_pct, 4), "win": False, "neutral": True}
 
 
 async def run_backtest(
@@ -162,6 +175,7 @@ async def run_backtest(
                         result = _evaluate_outcome(direction, entry_price, future_price)
                         outcome[f"pnl_{w}d"] = result["pnl_pct"]
                         outcome[f"win_{w}d"] = result["win"]
+                        outcome[f"neutral_{w}d"] = result["neutral"]
 
             results_by_type[signal_type][direction].append(outcome)
 
@@ -185,34 +199,42 @@ def _aggregate_metrics(
     results_by_type: dict[str, dict[str, list[dict]]],
     eval_windows: list[int],
 ) -> dict[str, Any]:
-    """Aggregate per-signal-type, per-direction metrics."""
+    """Aggregate per-signal-type, per-direction metrics.
+
+    Neutral-direction outcomes are tracked separately and excluded from win_rate.
+    """
     aggregated: dict[str, Any] = {}
 
     for signal_type, directions in results_by_type.items():
         aggregated[signal_type] = {}
         for direction, outcomes in directions.items():
             total = len(outcomes)
-            metrics: dict[str, Any] = {"total": total}
+            is_neutral = direction not in (BULLISH, BEARISH)
+            metrics: dict[str, Any] = {"total": total, "is_neutral": is_neutral}
 
             for w in eval_windows:
                 pnl_key = f"pnl_{w}d"
                 win_key = f"win_{w}d"
+                neutral_key = f"neutral_{w}d"
 
                 pnl_values = [o[pnl_key] for o in outcomes if pnl_key in o]
                 win_values = [o[win_key] for o in outcomes if win_key in o]
+                neutral_flags = [o.get(neutral_key, is_neutral) for o in outcomes if win_key in o]
 
-                wins = sum(1 for v in win_values if v)
-                losses = len(win_values) - wins
-                evaluated = len(pnl_values)
+                # Only count directional outcomes in win rate
+                directional_wins = sum(1 for v, n in zip(win_values, neutral_flags) if v and not n)
+                directional_losses = sum(1 for v, n in zip(win_values, neutral_flags) if not v and not n)
+                directional_evaluated = directional_wins + directional_losses
 
                 avg_pnl = round(sum(pnl_values) / len(pnl_values), 4) if pnl_values else 0.0
-                win_rate = round(wins / evaluated * 100, 2) if evaluated > 0 else 0.0
+                win_rate = round(directional_wins / directional_evaluated * 100, 2) if directional_evaluated > 0 else None
                 max_dd = round(min(pnl_values), 4) if pnl_values else 0.0
 
-                metrics[f"wins_{w}d"] = wins
-                metrics[f"losses_{w}d"] = losses
-                metrics[f"win_rate_{w}d"] = win_rate
+                metrics[f"wins_{w}d"] = directional_wins
+                metrics[f"losses_{w}d"] = directional_losses
+                metrics[f"win_rate_{w}d"] = win_rate  # None for neutral signals
                 metrics[f"avg_pnl_{w}d"] = avg_pnl
+                metrics[f"avg_move_{w}d"] = avg_pnl  # for neutral: avg absolute move
                 metrics[f"max_drawdown_{w}d"] = max_dd
 
             aggregated[signal_type][direction] = metrics
@@ -225,7 +247,10 @@ def _compute_overall(
     eval_windows: list[int],
     total_signals: int,
 ) -> dict[str, Any]:
-    """Compute overall summary metrics across all signal types."""
+    """Compute overall summary metrics across all signal types.
+
+    Reports both raw_win_rate (all signals) and directional_win_rate (excludes neutral).
+    """
     if total_signals == 0:
         return {"total_signals": 0}
 
@@ -236,6 +261,8 @@ def _compute_overall(
         all_pnl: list[float] = []
         all_wins = 0
         all_evaluated = 0
+        dir_wins = 0
+        dir_evaluated = 0
 
         for signal_type, directions in by_signal_type.items():
             for direction, metrics in directions.items():
@@ -243,32 +270,41 @@ def _compute_overall(
                 losses_key = f"losses_{w}d"
                 avg_pnl_key = f"avg_pnl_{w}d"
                 count = metrics.get("total", 0)
+                is_neutral = metrics.get("is_neutral", False)
 
                 if wins_key in metrics and losses_key in metrics:
-                    all_wins += metrics[wins_key]
-                    all_evaluated += metrics[wins_key] + metrics[losses_key]
+                    w_count = metrics[wins_key]
+                    l_count = metrics[losses_key]
+                    all_wins += w_count
+                    all_evaluated += w_count + l_count
+                    if not is_neutral:
+                        dir_wins += w_count
+                        dir_evaluated += w_count + l_count
 
                 if avg_pnl_key in metrics and count > 0:
-                    # Weight by count for proper averaging
                     all_pnl.extend([metrics[avg_pnl_key]] * count)
 
-        overall_win_rate = round(all_wins / all_evaluated * 100, 2) if all_evaluated > 0 else 0.0
+        raw_win_rate = round(all_wins / all_evaluated * 100, 2) if all_evaluated > 0 else 0.0
+        directional_win_rate = round(dir_wins / dir_evaluated * 100, 2) if dir_evaluated > 0 else 0.0
         overall_avg_pnl = round(sum(all_pnl) / len(all_pnl), 4) if all_pnl else 0.0
 
-        # Find max drawdown across all signal types for this window
+        # Find max drawdown across directional signal types for this window
         all_drawdowns: list[float] = []
         for directions in by_signal_type.values():
             for metrics in directions.values():
-                dd_key = f"max_drawdown_{w}d"
-                if dd_key in metrics:
-                    all_drawdowns.append(metrics[dd_key])
+                if not metrics.get("is_neutral", False):
+                    dd_key = f"max_drawdown_{w}d"
+                    if dd_key in metrics:
+                        all_drawdowns.append(metrics[dd_key])
         max_dd = round(min(all_drawdowns), 4) if all_drawdowns else 0.0
 
-        overall[f"win_rate_{w}d"] = overall_win_rate
+        # raw_win_rate is kept for reference; directional_win_rate is the real metric
+        overall[f"win_rate_{w}d"] = raw_win_rate
+        overall[f"directional_win_rate_{w}d"] = directional_win_rate
         overall[f"avg_pnl_{w}d"] = overall_avg_pnl
         overall[f"max_drawdown_{w}d"] = max_dd
 
-    # Best and worst signal type by 5d avg_pnl (or first available window)
+    # Best and worst signal type by 5d avg_pnl among directional signals only
     reference_window = 5 if 5 in eval_windows else eval_windows[0]
     ref_key = f"avg_pnl_{reference_window}d"
 
@@ -277,6 +313,8 @@ def _compute_overall(
         pnl_sum = 0.0
         count = 0
         for direction, metrics in directions.items():
+            if metrics.get("is_neutral", False):
+                continue  # exclude neutral from ranking
             if ref_key in metrics:
                 pnl_sum += metrics[ref_key] * metrics.get("total", 1)
                 count += metrics.get("total", 1)

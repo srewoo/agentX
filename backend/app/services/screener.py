@@ -148,6 +148,8 @@ def pre_screen_stocks(
 
         # Limit per query — keep total candidates manageable for yfinance
         _LIMIT = 25
+        # Minimum price filter: skip penny stocks with wide bid-ask spreads
+        _MIN_PRICE = 10.0
 
         # --- RSI extremes ---
         try:
@@ -155,7 +157,7 @@ def pre_screen_stocks(
                 Query()
                 .set_markets("india")
                 .select("name", "close", "RSI", "volume", "change", "type", "market_cap_basic")
-                .where(Column("RSI") < 30, Column("type") == "stock", Column("market_cap_basic") > 1e9)
+                .where(Column("RSI") < 30, Column("type") == "stock", Column("market_cap_basic") > 1e9, Column("close") > _MIN_PRICE)
                 .order_by("market_cap_basic", ascending=False)
                 .limit(_LIMIT)
                 .get_scanner_data()
@@ -171,7 +173,7 @@ def pre_screen_stocks(
                 Query()
                 .set_markets("india")
                 .select("name", "close", "RSI", "volume", "change", "type", "market_cap_basic")
-                .where(Column("RSI") > 70, Column("type") == "stock", Column("market_cap_basic") > 1e9)
+                .where(Column("RSI") > 70, Column("type") == "stock", Column("market_cap_basic") > 1e9, Column("close") > _MIN_PRICE)
                 .order_by("market_cap_basic", ascending=False)
                 .limit(_LIMIT)
                 .get_scanner_data()
@@ -194,6 +196,7 @@ def pre_screen_stocks(
                     Column("volume") > 5_000_000,
                     Column("type") == "stock",
                     Column("market_cap_basic") > 1e9,
+                    Column("close") > _MIN_PRICE,
                 )
                 .order_by("volume", ascending=False)
                 .limit(_LIMIT)
@@ -211,7 +214,7 @@ def pre_screen_stocks(
                 Query()
                 .set_markets("india")
                 .select("name", "close", "change", "type", "market_cap_basic")
-                .where(Column("change") > 4, Column("type") == "stock", Column("market_cap_basic") > 1e9)
+                .where(Column("change") > 4, Column("type") == "stock", Column("market_cap_basic") > 1e9, Column("close") > _MIN_PRICE)
                 .order_by("change", ascending=False)
                 .limit(_LIMIT)
                 .get_scanner_data()
@@ -227,7 +230,7 @@ def pre_screen_stocks(
                 Query()
                 .set_markets("india")
                 .select("name", "close", "change", "type", "market_cap_basic")
-                .where(Column("change") < -4, Column("type") == "stock", Column("market_cap_basic") > 1e9)
+                .where(Column("change") < -4, Column("type") == "stock", Column("market_cap_basic") > 1e9, Column("close") > _MIN_PRICE)
                 .order_by("change", ascending=True)
                 .limit(_LIMIT)
                 .get_scanner_data()

@@ -30,6 +30,11 @@ TARGET_PCT=5               # 5% target (risk:reward ~1:1.7)
 MIN_SIGNAL_STRENGTH=6      # Only trade strength >= 6
 MAX_OPEN_TRADES=15         # Max concurrent positions
 HOLD_LIMIT_DAYS=10         # Auto-exit after 10 days
+MIN_PRICE=10               # Minimum stock price in Rs. — avoid penny stocks
+MAX_SECTOR_POSITIONS=2     # Max open positions per sector (prevent sector concentration risk)
+MAX_PORTFOLIO_HEAT_PCT=6   # Max total open risk as % of capital (portfolio heat limit)
+MAX_DRAWDOWN_PCT=10        # Circuit breaker: pause if equity drops 10% from peak
+COOLDOWN_DAYS=2            # Resume after N trading days post circuit breaker
 
 # ── Colors ───────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'
@@ -44,7 +49,7 @@ mkdir -p "$DATA_DIR"
 
 # Create CSV headers if files don't exist
 if [ ! -f "$TRADES_FILE" ]; then
-  echo "trade_id,symbol,direction,signal_type,strength,entry_price,entry_date,stop_loss,target,position_size,shares,status,exit_price,exit_date,pnl_pct,pnl_amount,exit_reason" > "$TRADES_FILE"
+  echo "trade_id,symbol,direction,signal_type,strength,entry_price,entry_date,stop_loss,target,position_size,shares,status,exit_price,exit_date,pnl_pct,pnl_amount,exit_reason,trailing_stop" > "$TRADES_FILE"
   log "Created trades file: $TRADES_FILE"
 fi
 if [ ! -f "$DAILY_LOG" ]; then
@@ -59,9 +64,100 @@ check_backend() {
   fi
 }
 
+# ── Drawdown Circuit Breaker Check ──────────────────────────
+check_circuit_breaker() {
+  python3 -c "
+import csv, sys, os
+from datetime import datetime, date, timedelta
+
+trades_file = '${TRADES_FILE}'
+daily_log = '${DAILY_LOG}'
+capital = ${CAPITAL}
+max_dd_pct = ${MAX_DRAWDOWN_PCT}
+cooldown_days = ${COOLDOWN_DAYS}
+
+if not os.path.exists(trades_file):
+    sys.exit(0)
+
+# Compute current equity from closed trades
+total_pnl = 0.0
+last_close_date = None
+with open(trades_file, 'r') as f:
+    reader = csv.DictReader(f)
+    for row in reader:
+        if row.get('status') == 'closed':
+            try:
+                total_pnl += float(row.get('pnl_amount', 0))
+                ed = row.get('exit_date', '')
+                if ed and (last_close_date is None or ed > last_close_date):
+                    last_close_date = ed
+            except ValueError:
+                pass
+
+current_equity = capital + total_pnl
+
+# Peak equity from daily log (or just capital if no history)
+peak_equity = capital
+if os.path.exists(daily_log):
+    with open(daily_log, 'r') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                cap = float(row.get('capital', capital))
+                pnl = float(row.get('total_pnl', 0))
+                eq = cap + pnl
+                if eq > peak_equity:
+                    peak_equity = eq
+            except (ValueError, KeyError):
+                pass
+
+drawdown_pct = (peak_equity - current_equity) / peak_equity * 100 if peak_equity > 0 else 0
+
+if drawdown_pct >= max_dd_pct:
+    # Check if cooldown has elapsed
+    if last_close_date:
+        try:
+            last_close = datetime.strptime(last_close_date, '%Y-%m-%d').date()
+            days_since = (date.today() - last_close).days
+            if days_since < cooldown_days:
+                print(f'CIRCUIT_BREAKER:Drawdown={drawdown_pct:.1f}%,Cooldown={cooldown_days - days_since}d remaining')
+                sys.exit(1)
+        except Exception:
+            pass
+    print(f'CIRCUIT_BREAKER:Drawdown={drawdown_pct:.1f}%')
+    sys.exit(1)
+
+sys.exit(0)
+" 2>/dev/null
+  return $?
+}
+
 # ── Scan & Open Trades ───────────────────────────────────────
 do_scan() {
   check_backend
+
+  # ── Drawdown circuit breaker ──────────────────────────────
+  CB_RESULT=$(check_circuit_breaker 2>/dev/null; echo $?)
+  if [ "${CB_RESULT}" = "1" ]; then
+    CB_INFO=$(python3 -c "
+import csv, os
+from datetime import datetime, date
+trades_file = '${TRADES_FILE}'
+capital = ${CAPITAL}
+total_pnl = 0.0
+if os.path.exists(trades_file):
+    with open(trades_file) as f:
+        for row in csv.DictReader(f):
+            if row.get('status') == 'closed':
+                try: total_pnl += float(row.get('pnl_amount', 0))
+                except: pass
+print(f'Equity: Rs.{capital + total_pnl:,.0f}  Loss: Rs.{total_pnl:+,.0f}')
+" 2>/dev/null)
+    warn "CIRCUIT BREAKER ACTIVE — drawdown exceeds ${MAX_DRAWDOWN_PCT}%. ${CB_INFO}"
+    warn "Pausing new trades for ${COOLDOWN_DAYS} trading days. Use 'evaluate' and 'report' to monitor."
+    return
+  fi
+
   log "Triggering market scan..."
 
   SCAN_RESULT=$(curl -s --max-time 120 -X POST "${BACKEND_URL}/api/scan/trigger" 2>/dev/null)
@@ -88,6 +184,29 @@ do_scan() {
   echo "$SIGNALS_JSON" | python3 -c "
 import sys, json, csv, uuid, os
 
+# Sector lookup for major Indian stocks (NSE)
+SECTOR_MAP = {
+    'RELIANCE': 'Energy', 'TCS': 'IT', 'HDFCBANK': 'Banking', 'INFY': 'IT',
+    'ICICIBANK': 'Banking', 'HINDUNILVR': 'FMCG', 'SBIN': 'Banking',
+    'BHARTIARTL': 'Telecom', 'ITC': 'FMCG', 'KOTAKBANK': 'Banking',
+    'LT': 'Infrastructure', 'AXISBANK': 'Banking', 'WIPRO': 'IT',
+    'ASIANPAINT': 'Consumer', 'MARUTI': 'Auto', 'TATAMOTORS': 'Auto',
+    'SUNPHARMA': 'Pharma', 'BAJFINANCE': 'Finance', 'TITAN': 'Consumer',
+    'NESTLEIND': 'FMCG', 'TECHM': 'IT', 'HCLTECH': 'IT',
+    'ULTRACEMCO': 'Cement', 'POWERGRID': 'Power', 'NTPC': 'Power',
+    'ONGC': 'Energy', 'TATASTEEL': 'Metals', 'JSWSTEEL': 'Metals',
+    'ADANIENT': 'Conglomerate', 'ADANIPORTS': 'Infrastructure',
+    'COALINDIA': 'Mining', 'DRREDDY': 'Pharma', 'CIPLA': 'Pharma',
+    'EICHERMOT': 'Auto', 'HEROMOTOCO': 'Auto', 'BAJAJFINSV': 'Finance',
+    'BRITANNIA': 'FMCG', 'DIVISLAB': 'Pharma', 'GRASIM': 'Cement',
+    'APOLLOHOSP': 'Healthcare', 'HDFCLIFE': 'Insurance', 'SBILIFE': 'Insurance',
+    'TATACONSUM': 'FMCG', 'INDUSINDBK': 'Banking', 'HINDALCO': 'Metals',
+    'BPCL': 'Energy', 'ZOMATO': 'Consumer', 'TRENT': 'Consumer',
+    'BEL': 'Defense', 'HAL': 'Defense', 'PNB': 'Banking', 'BANKBARODA': 'Banking',
+    'CANBK': 'Banking', 'UNIONBANK': 'Banking', 'YESBANK': 'Banking',
+    'FEDERALBNK': 'Banking', 'BANDHANBNK': 'Banking', 'IDFCFIRSTB': 'Banking',
+}
+
 data = json.load(sys.stdin)
 signals = data.get('signals', [])
 trades_file = '${TRADES_FILE}'
@@ -97,15 +216,30 @@ target_pct = ${TARGET_PCT}
 position_size = ${POSITION_SIZE}
 slots = ${SLOTS}
 today = '${TODAY}'
+min_price = ${MIN_PRICE}
+max_sector_positions = ${MAX_SECTOR_POSITIONS}
+capital = ${CAPITAL}
+max_heat_pct = ${MAX_PORTFOLIO_HEAT_PCT}
 
-# Load existing open symbols to avoid duplicates
+# Load existing open symbols and sector counts to avoid duplicates + sector concentration
 open_symbols = set()
+sector_counts = {}  # sector -> count of open positions
+current_heat = 0.0  # Rs. total open risk (portfolio heat)
 if os.path.exists(trades_file):
     with open(trades_file, 'r') as f:
         reader = csv.DictReader(f)
         for row in reader:
             if row.get('status') == 'open':
-                open_symbols.add(row['symbol'])
+                sym = row['symbol']
+                open_symbols.add(sym)
+                sector = SECTOR_MAP.get(sym, 'Unknown')
+                sector_counts[sector] = sector_counts.get(sector, 0) + 1
+                # Portfolio heat = shares × |entry - stop|
+                try:
+                    heat = int(row.get('shares', 0)) * abs(float(row.get('entry_price', 0)) - float(row.get('stop_loss', 0)))
+                    current_heat += heat
+                except (ValueError, TypeError):
+                    pass
 
 new_count = 0
 with open(trades_file, 'a', newline='') as f:
@@ -130,6 +264,17 @@ with open(trades_file, 'a', newline='') as f:
         if not price or price <= 0:
             continue
 
+        # ── Minimum price filter (avoid penny stocks) ──────────────────
+        if price < min_price:
+            print(f'  SKIP  {symbol:14s} — price Rs.{price:.2f} below minimum Rs.{min_price}')
+            continue
+
+        # ── Sector concentration limit ─────────────────────────────────
+        sector = SECTOR_MAP.get(symbol, 'Unknown')
+        if sector_counts.get(sector, 0) >= max_sector_positions:
+            print(f'  SKIP  {symbol:14s} — sector {sector} at max {max_sector_positions} positions')
+            continue
+
         signal_type = sig.get('signal_type', 'unknown')
         trade_id = str(uuid.uuid4())[:8]
 
@@ -145,17 +290,25 @@ with open(trades_file, 'a', newline='') as f:
         if shares <= 0:
             continue
 
+        # ── Portfolio heat limit ───────────────────────────────────────
+        trade_heat = shares * abs(price - stop)
+        if (current_heat + trade_heat) / capital * 100 > max_heat_pct:
+            print(f'  SKIP  {symbol:14s} — portfolio heat limit {max_heat_pct}% would be exceeded')
+            continue
+
         actual_position = round(shares * price, 2)
 
         writer.writerow([
             trade_id, symbol, direction, signal_type, strength,
             price, today, stop, target, actual_position, shares,
-            'open', '', '', '', '', ''
+            'open', '', '', '', '', '', stop  # trailing_stop = initial stop
         ])
 
         open_symbols.add(symbol)
+        sector_counts[sector] = sector_counts.get(sector, 0) + 1
+        current_heat += trade_heat
         new_count += 1
-        print(f'  OPEN {direction.upper():7s} {symbol:14s} @ {price:>10.2f}  SL={stop:>10.2f}  TGT={target:>10.2f}  Qty={shares}  [{signal_type}]')
+        print(f'  OPEN {direction.upper():7s} {symbol:14s} @ {price:>10.2f}  SL={stop:>10.2f}  TGT={target:>10.2f}  Qty={shares}  [{signal_type}] ({sector})')
 
 print(f'TOTAL:{new_count}')
 " 2>/dev/null | while IFS= read -r line; do
@@ -225,7 +378,7 @@ for row in rows:
     except:
         hold_days = 0
 
-    # Fetch current price
+    # Fetch current price + intraday high/low for accurate stop-loss detection
     try:
         req = urllib.request.Request(f'{backend}/api/stocks/{symbol}/quote')
         req.add_header('Content-Type', 'application/json')
@@ -234,24 +387,66 @@ for row in rows:
         current_price = data.get('price')
         if not current_price:
             continue
+        # day_low and day_high for intraday stop-loss check
+        # Falls back to current_price if not provided by the API
+        day_low = data.get('day_low') or current_price
+        day_high = data.get('day_high') or current_price
     except:
         print(f'  SKIP {symbol:14s} — could not fetch price')
         continue
 
-    # Check exit conditions
+    # Update trailing stop before checking exit conditions
+    try:
+        trailing_stop = float(row.get('trailing_stop') or stop_loss)
+    except (ValueError, TypeError):
+        trailing_stop = stop_loss
+
+    # Trailing stop update rules (bullish: lock in profits as price rises)
+    if direction == 'bullish':
+        move_pct = (current_price - entry_price) / entry_price * 100
+        if move_pct >= 3.0:
+            new_trail = round(current_price * 0.97, 2)
+            trailing_stop = max(trailing_stop, new_trail)
+        elif move_pct >= 1.5:
+            trailing_stop = max(trailing_stop, entry_price)  # breakeven
+    else:
+        move_pct = (entry_price - current_price) / entry_price * 100
+        if move_pct >= 3.0:
+            new_trail = round(current_price * 1.03, 2)
+            trailing_stop = min(trailing_stop, new_trail)
+        elif move_pct >= 1.5:
+            trailing_stop = min(trailing_stop, entry_price)
+
+    row['trailing_stop'] = str(trailing_stop)
+
+    # Check exit conditions — use intraday high/low to detect stop triggers
+    # that occurred during the day even if current price has moved away.
     exit_reason = None
     exit_price = current_price
 
     if direction == 'bullish':
         pnl_pct = (current_price - entry_price) / entry_price * 100
-        if current_price <= stop_loss:
+        # Check trailing stop first (tighter), then original stop
+        if day_low <= trailing_stop:
+            exit_reason = 'trailing_stop' if trailing_stop > stop_loss else 'stop_loss'
+            exit_price = trailing_stop
+            pnl_pct = (trailing_stop - entry_price) / entry_price * 100
+        elif day_low <= stop_loss:
             exit_reason = 'stop_loss'
+            exit_price = stop_loss
+            pnl_pct = (stop_loss - entry_price) / entry_price * 100
         elif current_price >= target:
             exit_reason = 'target_hit'
     else:
         pnl_pct = (entry_price - current_price) / entry_price * 100
-        if current_price >= stop_loss:
+        if day_high >= trailing_stop:
+            exit_reason = 'trailing_stop' if trailing_stop < stop_loss else 'stop_loss'
+            exit_price = trailing_stop
+            pnl_pct = (entry_price - trailing_stop) / entry_price * 100
+        elif day_high >= stop_loss:
             exit_reason = 'stop_loss'
+            exit_price = stop_loss
+            pnl_pct = (entry_price - stop_loss) / entry_price * 100
         elif current_price <= target:
             exit_reason = 'target_hit'
 
@@ -398,8 +593,59 @@ if by_type:
 if open_trades:
     print()
     print('  \033[1mOpen Positions:\033[0m')
+    total_heat_pct = 0.0
     for t in open_trades:
-        print(f'    {t[\"symbol\"]:14s}  {t[\"direction\"]:7s}  Entry={float(t[\"entry_price\"]):>8.2f}  SL={float(t[\"stop_loss\"]):>8.2f}  TGT={float(t[\"target\"]):>8.2f}  Qty={t[\"shares\"]}')
+        try:
+            entry = float(t['entry_price'])
+            sl = float(t['stop_loss'])
+            shares = int(t['shares'])
+            heat = shares * abs(entry - sl)
+            heat_pct = heat / capital * 100
+            total_heat_pct += heat_pct
+            tsl = t.get('trailing_stop', '')
+            tsl_str = f'  TSL={float(tsl):>8.2f}' if tsl else ''
+            print(f'    {t[\"symbol\"]:14s}  {t[\"direction\"]:7s}  Entry={entry:>8.2f}  SL={sl:>8.2f}  TGT={float(t[\"target\"]):>8.2f}  Qty={shares}{tsl_str}  Heat={heat_pct:.1f}%')
+        except (ValueError, TypeError):
+            print(f'    {t[\"symbol\"]:14s}  {t[\"direction\"]:7s}  Entry={t[\"entry_price\"]:>8s}  SL={t[\"stop_loss\"]:>8s}  TGT={t[\"target\"]:>8s}  Qty={t[\"shares\"]}')
+    heat_color = '\033[0;31m' if total_heat_pct > ${MAX_PORTFOLIO_HEAT_PCT} else '\033[0;32m'
+    print(f'  Portfolio Heat:       {heat_color}{total_heat_pct:.1f}%\033[0m  (max: ${MAX_PORTFOLIO_HEAT_PCT}%)')
+
+print()
+
+# ── Sharpe & Sortino ratios ──────────────────────────────────────────────
+if len(closed_trades) >= 3:
+    import math
+    risk_free_daily = 0.07 / 252  # India 10Y bond yield ~7%
+
+    # Daily returns: pnl_pct / hold_days for each trade
+    daily_returns = []
+    for t in closed_trades:
+        try:
+            pnl = float(t.get('pnl_pct', 0))
+            hold = max(1, int(t.get('hold_days', 1) or 1))
+            daily_returns.append(pnl / hold / 100)
+        except (ValueError, TypeError):
+            pass
+
+    if len(daily_returns) >= 3:
+        mean_ret = sum(daily_returns) / len(daily_returns)
+        variance = sum((r - mean_ret) ** 2 for r in daily_returns) / len(daily_returns)
+        std_dev = math.sqrt(variance) if variance > 0 else 0.0001
+
+        # Sharpe ratio
+        sharpe = (mean_ret - risk_free_daily) / std_dev * math.sqrt(252) if std_dev > 0 else 0.0
+
+        # Sortino ratio (downside deviation only)
+        neg_returns = [r for r in daily_returns if r < risk_free_daily]
+        if neg_returns:
+            downside_var = sum((r - risk_free_daily) ** 2 for r in neg_returns) / len(neg_returns)
+            downside_std = math.sqrt(downside_var)
+            sortino = (mean_ret - risk_free_daily) / downside_std * math.sqrt(252) if downside_std > 0 else 0.0
+        else:
+            sortino = 999.0  # No losing days
+
+        print(f'  Sharpe Ratio:         {sharpe:>+.2f}  (>1.0 = viable, >1.5 = good, >2.0 = excellent)')
+        print(f'  Sortino Ratio:        {sortino:>+.2f}  (penalizes only downside volatility)')
 
 print()
 print('=' * 55)
@@ -478,6 +724,33 @@ do_schedule() {
   crontab -l 2>/dev/null | grep "paper_trade" || echo "  (none)"
 }
 
+do_schedule_realtime() {
+  SCRIPT_PATH="$(cd "$(dirname "$0")" && pwd)/paper_trade.sh"
+  LOG_PATH="$(cd "$(dirname "$0")" && pwd)/backend/paper_trades/cron_realtime.log"
+  PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+  # Check if already scheduled
+  if crontab -l 2>/dev/null | grep -q "paper_trade.sh evaluate"; then
+    warn "Realtime cron already exists. Use 'unschedule' to remove first."
+    crontab -l 2>/dev/null | grep "paper_trade.sh"
+    return
+  fi
+
+  # Daily full routine at 11:00 AM (scan + open trades)
+  DAILY_LINE="0 11 * * 1-5 cd ${PROJECT_DIR} && ${SCRIPT_PATH} full >> ${LOG_PATH} 2>&1"
+  # Evaluate open positions every 15 minutes during market hours (9:30 - 15:30 IST)
+  EVAL_LINE="*/15 9-15 * * 1-5 cd ${PROJECT_DIR} && ${SCRIPT_PATH} evaluate >> ${LOG_PATH} 2>&1"
+
+  (crontab -l 2>/dev/null; echo "$DAILY_LINE"; echo "$EVAL_LINE") | crontab -
+  ok "Realtime evaluation cron installed:"
+  ok "  Daily scan: Mon-Fri at 11:00 AM"
+  ok "  Evaluate: Mon-Fri every 15 min, 9:30 AM - 3:30 PM"
+  ok "  Logs: ${LOG_PATH}"
+  echo ""
+  echo "  Current crontab:"
+  crontab -l 2>/dev/null | grep "paper_trade" || echo "  (none)"
+}
+
 do_unschedule() {
   if ! crontab -l 2>/dev/null | grep -q "paper_trade.sh"; then
     log "No paper_trade cron job found"
@@ -485,7 +758,7 @@ do_unschedule() {
   fi
 
   crontab -l 2>/dev/null | grep -v "paper_trade.sh" | crontab -
-  ok "Cron job removed"
+  ok "Cron job removed (both daily and realtime)"
 }
 
 # ── Main ─────────────────────────────────────────────────────
@@ -497,9 +770,10 @@ case "$CMD" in
   report)        do_report ;;
   full|daily)    do_full ;;
   schedule)      do_schedule ;;
+  realtime)      do_schedule_realtime ;;
   unschedule)    do_unschedule ;;
   -h|--help|help)
-    echo "Usage: $0 {scan|evaluate|report|full|schedule|unschedule}"
+    echo "Usage: $0 {scan|evaluate|report|full|schedule|realtime|unschedule}"
     echo ""
     echo "Commands:"
     echo "  scan         Trigger scan & open paper trades for new signals"
@@ -507,16 +781,21 @@ case "$CMD" in
     echo "  report       Show full P&L report"
     echo "  full         Run evaluate + scan + report (daily routine)"
     echo "  schedule     Install daily 11 AM cron (Mon-Fri)"
-    echo "  unschedule   Remove the cron job"
+    echo "  realtime     Install daily 11 AM scan + 15-min evaluations during market hours"
+    echo "  unschedule   Remove all cron jobs"
     echo ""
     echo "Risk Parameters (edit in script):"
-    echo "  Capital:           Rs.${CAPITAL}"
-    echo "  Max per trade:     ${MAX_POSITION_PCT}% (Rs.$((CAPITAL * MAX_POSITION_PCT / 100)))"
-    echo "  Stop loss:         ${STOP_LOSS_PCT}%"
-    echo "  Target:            ${TARGET_PCT}%"
-    echo "  Min strength:      ${MIN_SIGNAL_STRENGTH}/10"
-    echo "  Max open trades:   ${MAX_OPEN_TRADES}"
-    echo "  Hold limit:        ${HOLD_LIMIT_DAYS} days"
+    echo "  Capital:              Rs.${CAPITAL}"
+    echo "  Max per trade:        ${MAX_POSITION_PCT}% (Rs.$((CAPITAL * MAX_POSITION_PCT / 100)))"
+    echo "  Stop loss:            ${STOP_LOSS_PCT}%"
+    echo "  Target:               ${TARGET_PCT}%"
+    echo "  Min strength:         ${MIN_SIGNAL_STRENGTH}/10"
+    echo "  Max open trades:      ${MAX_OPEN_TRADES}"
+    echo "  Hold limit:           ${HOLD_LIMIT_DAYS} days"
+    echo "  Min price:            Rs.${MIN_PRICE}"
+    echo "  Max sector positions: ${MAX_SECTOR_POSITIONS}"
+    echo "  Portfolio heat limit: ${MAX_PORTFOLIO_HEAT_PCT}%"
+    echo "  Drawdown breaker:     ${MAX_DRAWDOWN_PCT}%"
     echo ""
     echo "Files:"
     echo "  Trades:      ${TRADES_FILE}"
@@ -524,7 +803,7 @@ case "$CMD" in
     ;;
   *)
     err "Unknown command: $CMD"
-    echo "Usage: $0 {scan|evaluate|report|full|schedule|unschedule}"
+    echo "Usage: $0 {scan|evaluate|report|full|schedule|realtime|unschedule}"
     exit 1
     ;;
 esac

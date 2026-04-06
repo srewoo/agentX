@@ -357,3 +357,200 @@ async def get_market_context(symbol: Optional[str] = None) -> dict[str, Any]:
         context["symbol_block_deals"] = []
 
     return context
+
+
+# ── Earnings Blackout Period ─────────────────────────────────
+
+def _is_results_announcement(description: str) -> bool:
+    """Check if an announcement is a financial results / board meeting."""
+    if not description:
+        return False
+    lower = description.lower()
+    keywords = [
+        "financial results", "quarterly results", "board meeting",
+        "q1 results", "q2 results", "q3 results", "q4 results",
+        "annual results", "earnings", "investor presentation",
+    ]
+    return any(kw in lower for kw in keywords)
+
+
+# ── Batched Earnings Calendar ─────────────────────────────────
+# Fetches ALL announcements once per scan cycle, caches them, and provides
+# per-symbol lookups without N+1 API calls.
+
+_earnings_calendar_cache: dict[str, dict[str, Any]] = {}  # symbol → event info
+_earnings_calendar_ts: float = 0.0
+_EARNINGS_CACHE_TTL = 4 * 60 * 60  # 4 hours
+
+
+async def refresh_earnings_calendar() -> dict[str, dict[str, Any]]:
+    """Fetch all upcoming earnings/results announcements once and cache.
+
+    Should be called once at the start of each scan cycle rather than
+    per-symbol. Returns dict mapping symbol → event info.
+    """
+    import time as _time
+    global _earnings_calendar_cache, _earnings_calendar_ts
+
+    if _earnings_calendar_cache and (_time.time() - _earnings_calendar_ts) < _EARNINGS_CACHE_TTL:
+        return _earnings_calendar_cache
+
+    try:
+        all_announcements = await get_announcements()  # all symbols
+        today = date.today()
+        calendar: dict[str, dict[str, Any]] = {}
+
+        for ann in all_announcements:
+            sym = ann.get("symbol")
+            if not sym:
+                continue
+            desc = ann.get("description", "") or ann.get("desc", "")
+            if not _is_results_announcement(desc):
+                continue
+            ann_date_str = ann.get("date", "")
+            try:
+                ann_date = _parse_nse_date(ann_date_str)
+                if ann_date is None:
+                    continue
+                days_diff = (ann_date - today).days
+                if abs(days_diff) <= 5:  # cache events within ±5 days
+                    if sym not in calendar or abs(days_diff) < abs(calendar[sym].get("days_to_event", 999)):
+                        calendar[sym] = {
+                            "has_upcoming_results": True,
+                            "days_to_event": days_diff,
+                            "event_description": desc[:100] if desc else "Board meeting / results",
+                        }
+            except Exception:
+                continue
+
+        _earnings_calendar_cache = calendar
+        _earnings_calendar_ts = _time.time()
+        logger.info("Earnings calendar refreshed: %d symbols with upcoming results", len(calendar))
+        return calendar
+
+    except Exception as e:
+        logger.debug("Earnings calendar refresh failed: %s", e)
+        return _earnings_calendar_cache  # return stale cache if available
+
+
+def _parse_nse_date(date_str: str) -> Optional[date]:
+    """Parse NSE date string which varies in format."""
+    if not date_str:
+        return None
+    for fmt in ("%d-%b-%Y", "%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
+        try:
+            return datetime.strptime(date_str[:11].strip(), fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+async def get_upcoming_results_dates(symbol: str, window_days: int = 3) -> dict[str, Any]:
+    """Check if a symbol has earnings / board meeting within ±window_days.
+
+    Uses the batched earnings calendar (refreshed once per scan cycle).
+    Falls back to per-symbol fetch only if calendar is empty.
+
+    Returns:
+        {
+            "has_upcoming_results": bool,
+            "days_to_event": int or None,
+            "event_description": str or None,
+        }
+    """
+    # Check batched calendar first (zero API cost)
+    if _earnings_calendar_cache:
+        event = _earnings_calendar_cache.get(symbol)
+        if event and abs(event.get("days_to_event", 999)) <= window_days:
+            return event
+        if event is None:
+            return {"has_upcoming_results": False, "days_to_event": None, "event_description": None}
+
+    # Fallback to per-symbol fetch (only happens if calendar wasn't refreshed)
+    try:
+        announcements = await get_announcements(symbol)
+        today = date.today()
+
+        for ann in announcements:
+            ann_date_str = ann.get("date", "")
+            desc = ann.get("description", "") or ann.get("desc", "")
+            if not _is_results_announcement(desc):
+                continue
+            ann_date = _parse_nse_date(ann_date_str)
+            if ann_date is None:
+                continue
+            days_diff = (ann_date - today).days
+            if abs(days_diff) <= window_days:
+                return {
+                    "has_upcoming_results": True,
+                    "days_to_event": days_diff,
+                    "event_description": desc[:100] if desc else "Board meeting / results",
+                }
+    except Exception as e:
+        logger.debug("Earnings date check failed for %s: %s", symbol, e)
+
+    return {"has_upcoming_results": False, "days_to_event": None, "event_description": None}
+
+
+# ── India VIX ────────────────────────────────────────────────
+
+async def get_india_vix() -> Optional[float]:
+    """Fetch India VIX (NIFTY Volatility Index) via yfinance.
+
+    India VIX regimes:
+    - < 14: Low volatility (tighten signal thresholds)
+    - 14-20: Normal (default thresholds)
+    - 20-30: High volatility (widen thresholds)
+    - > 30: Crisis mode (widen further, reduce positions)
+    """
+    try:
+        import yfinance as yf
+
+        loop = asyncio.get_event_loop()
+
+        def _sync_fetch() -> Optional[float]:
+            ticker = yf.Ticker("^INDIAVIX")
+            hist = ticker.history(period="2d", interval="1d")
+            if hist is None or hist.empty:
+                return None
+            return float(hist["Close"].dropna().iloc[-1])
+
+        vix = await asyncio.wait_for(
+            loop.run_in_executor(None, _sync_fetch),
+            timeout=15.0,
+        )
+        return vix
+    except Exception as e:
+        logger.debug("India VIX fetch failed (non-critical): %s", e)
+        return None
+
+
+def get_vix_adjusted_thresholds(vix: Optional[float], base_thresholds: dict) -> dict:
+    """Return VIX-adjusted signal thresholds.
+
+    In high-volatility environments, fixed % thresholds produce too many false signals.
+    Widen them proportionally so only truly significant moves are flagged.
+    """
+    if vix is None:
+        return base_thresholds
+
+    adjusted = dict(base_thresholds)
+
+    if vix < 14:
+        # Low volatility — tighten thresholds (easier to meet)
+        adjusted["price_spike_pct"] = max(2.0, float(adjusted.get("price_spike_pct", 3.0)) * 0.7)
+        adjusted["volume_spike_ratio"] = max(1.5, float(adjusted.get("volume_spike_ratio", 2.0)) * 0.75)
+    elif 20 <= vix < 30:
+        # High volatility — widen thresholds
+        adjusted["price_spike_pct"] = float(adjusted.get("price_spike_pct", 3.0)) * 1.5
+        adjusted["volume_spike_ratio"] = float(adjusted.get("volume_spike_ratio", 2.0)) * 1.5
+        adjusted["rsi_overbought"] = min(80.0, float(adjusted.get("rsi_overbought", 70.0)) + 5)
+        adjusted["rsi_oversold"] = max(20.0, float(adjusted.get("rsi_oversold", 30.0)) - 5)
+    elif vix >= 30:
+        # Crisis — widen significantly
+        adjusted["price_spike_pct"] = float(adjusted.get("price_spike_pct", 3.0)) * 2.0
+        adjusted["volume_spike_ratio"] = float(adjusted.get("volume_spike_ratio", 2.0)) * 2.0
+        adjusted["rsi_overbought"] = min(85.0, float(adjusted.get("rsi_overbought", 70.0)) + 10)
+        adjusted["rsi_oversold"] = max(15.0, float(adjusted.get("rsi_oversold", 30.0)) - 10)
+
+    return adjusted

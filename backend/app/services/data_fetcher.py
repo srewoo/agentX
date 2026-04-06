@@ -78,10 +78,20 @@ def _yfinance_fetch_sync(symbol: str, period: str = "6mo", interval: str = "1d")
     return pd.DataFrame()
 
 
+_YFINANCE_TIMEOUT = 30  # seconds — prevent yfinance from hanging indefinitely
+
+
 async def _yfinance_fetch(symbol: str, period: str, interval: str) -> pd.DataFrame:
-    """Async wrapper for yfinance."""
+    """Async wrapper for yfinance with timeout protection."""
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _yfinance_fetch_sync, symbol, period, interval)
+    try:
+        return await asyncio.wait_for(
+            loop.run_in_executor(None, _yfinance_fetch_sync, symbol, period, interval),
+            timeout=_YFINANCE_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("yfinance fetch timed out after %ds for %s", _YFINANCE_TIMEOUT, symbol)
+        return pd.DataFrame()
 
 
 # ── Main fetch function: NSE first, yfinance fallback ─────────
@@ -176,7 +186,10 @@ async def get_stock_quote(symbol: str) -> dict[str, Any]:
     try:
         yf_sym = symbol if (symbol.startswith("^") or "." in symbol) else f"{symbol}.NS"
         loop = asyncio.get_event_loop()
-        info = await loop.run_in_executor(None, lambda: yf.Ticker(yf_sym).info)
+        info = await asyncio.wait_for(
+            loop.run_in_executor(None, lambda: yf.Ticker(yf_sym).info),
+            timeout=_YFINANCE_TIMEOUT,
+        )
         if info and info.get("regularMarketPrice"):
             return {
                 "symbol": symbol,
@@ -194,6 +207,106 @@ async def get_stock_quote(symbol: str) -> dict[str, Any]:
         logger.debug("yfinance quote failed for %s: %s", symbol, e)
 
     return {"symbol": symbol, "lastPrice": None, "error": "All data sources failed"}
+
+
+# ── Delivery Volume % ────────────────────────────────────────
+# NSE bhavcopy contains delivery data — the fraction of volume that was
+# actual buying/selling (not intraday speculation).
+# >60% delivery = institutional accumulation, <30% = speculative noise.
+
+async def get_delivery_volume(symbol: str) -> dict[str, Any]:
+    """Fetch delivery volume % from NSE for a symbol.
+
+    Returns:
+        {
+            "symbol": str,
+            "delivery_pct": float or None,   # % of traded volume delivered
+            "traded_qty": int or None,
+            "delivered_qty": int or None,
+            "source": str,
+        }
+    """
+    clean = symbol.replace(".NS", "").replace(".BO", "")
+
+    # Try NSE delivery data first
+    try:
+        result = await _fetch_nse_delivery(clean)
+        if result and result.get("delivery_pct") is not None:
+            return result
+    except Exception as e:
+        logger.debug("NSE delivery fetch failed for %s: %s", clean, e)
+
+    return {"symbol": symbol, "delivery_pct": None, "traded_qty": None,
+            "delivered_qty": None, "source": "unavailable"}
+
+
+async def _fetch_nse_delivery(symbol: str) -> dict[str, Any] | None:
+    """Fetch delivery data from NSE API."""
+    import urllib.request
+    import json
+
+    loop = asyncio.get_event_loop()
+
+    def _sync_fetch() -> dict[str, Any] | None:
+        url = f"https://www.nseindia.com/api/quote-equity?symbol={symbol}&section=trade_info"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+            "Accept": "application/json",
+            "Referer": "https://www.nseindia.com",
+        }
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+
+        # NSE trade_info has securityWiseDP which contains delivery data
+        sec_dp = data.get("securityWiseDP", {})
+        if not sec_dp:
+            # Try marketDeptOrderBook path
+            market_data = data.get("marketDeptOrderBook", {})
+            trade_info = market_data.get("tradeInfo", {})
+            traded_qty = trade_info.get("totalTradedVolume")
+            delivered_qty = trade_info.get("deliveryQuantity")
+            delivery_pct = trade_info.get("deliveryToTradedQuantity")
+
+            if delivery_pct is not None:
+                try:
+                    return {
+                        "symbol": symbol,
+                        "delivery_pct": float(str(delivery_pct).replace(",", "")),
+                        "traded_qty": int(float(str(traded_qty).replace(",", ""))) if traded_qty else None,
+                        "delivered_qty": int(float(str(delivered_qty).replace(",", ""))) if delivered_qty else None,
+                        "source": "nse",
+                    }
+                except (ValueError, TypeError):
+                    pass
+            return None
+
+        # Parse securityWiseDP
+        delivery_pct_val = sec_dp.get("deliveryToTradedQuantity") or sec_dp.get("delToTradeQty")
+        traded_qty = sec_dp.get("totalTradedVolume") or sec_dp.get("quantityTraded")
+        delivered_qty = sec_dp.get("deliveryQuantity") or sec_dp.get("deliverableQty")
+
+        if delivery_pct_val is not None:
+            try:
+                return {
+                    "symbol": symbol,
+                    "delivery_pct": float(str(delivery_pct_val).replace(",", "").replace("%", "")),
+                    "traded_qty": int(float(str(traded_qty).replace(",", ""))) if traded_qty else None,
+                    "delivered_qty": int(float(str(delivered_qty).replace(",", ""))) if delivered_qty else None,
+                    "source": "nse",
+                }
+            except (ValueError, TypeError):
+                pass
+
+        return None
+
+    try:
+        return await asyncio.wait_for(
+            loop.run_in_executor(None, _sync_fetch),
+            timeout=12.0,
+        )
+    except Exception:
+        return None
 
 
 # Major Indian stocks for scanning (NIFTY 50 + broader universe)

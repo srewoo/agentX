@@ -22,6 +22,38 @@ _EVAL_SEMAPHORE = asyncio.Semaphore(3)
 # Evaluation windows in days — signal is checked at each milestone
 EVAL_WINDOWS = [1, 3, 7, 30]
 
+# In-memory performance cache used by signal_engine for dynamic weighting.
+# Format: {"signal_type:direction": {"win_rate": float, "total_signals": int}}
+# Updated after every _recalculate_performance() call, and seeded on startup.
+_performance_cache: dict[str, dict[str, Any]] = {}
+
+
+async def seed_performance_cache() -> int:
+    """Load signal_performance table into _performance_cache on startup.
+
+    This ensures dynamic signal weighting works immediately without waiting
+    for 30+ live signals to accumulate. Returns number of entries loaded.
+    """
+    global _performance_cache
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT signal_type, direction, win_rate, total_signals FROM signal_performance"
+            ) as cursor:
+                rows = await cursor.fetchall()
+            for row in rows:
+                key = f"{row['signal_type']}:{row['direction']}"
+                _performance_cache[key] = {
+                    "win_rate": row["win_rate"],
+                    "total_signals": row["total_signals"],
+                }
+        logger.info("Performance cache seeded with %d entries on startup", len(_performance_cache))
+        return len(_performance_cache)
+    except Exception as e:
+        logger.debug("Performance cache seed failed (non-critical): %s", e)
+        return 0
+
 
 async def evaluate_signals() -> dict[str, Any]:
     """
@@ -267,6 +299,21 @@ async def _recalculate_performance() -> None:
             )
 
         await db.commit()
+
+    # Refresh in-memory cache for dynamic signal weighting in signal_engine
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT signal_type, direction, win_rate, total_signals FROM signal_performance"
+        ) as cursor:
+            rows = await cursor.fetchall()
+        for row in rows:
+            key = f"{row['signal_type']}:{row['direction']}"
+            _performance_cache[key] = {
+                "win_rate": row["win_rate"],
+                "total_signals": row["total_signals"],
+            }
+
     logger.info("Performance stats recalculated")
 
 

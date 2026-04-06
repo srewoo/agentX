@@ -46,6 +46,9 @@ def _sanitize_for_prompt(value: Any, max_len: int = 200) -> str:
     - Converts to string
     - Removes all control characters (newlines, tabs, etc.) that could inject
       new prompt sections or escape the intended context
+    - Escapes backslashes and quotes to prevent prompt injection via
+      crafted stock names, news headlines, or other external text
+    - Strips template/instruction delimiters that could hijack prompt structure
     - Collapses excess whitespace
     - Truncates to max_len
 
@@ -58,6 +61,19 @@ def _sanitize_for_prompt(value: Any, max_len: int = 200) -> str:
         return "N/A"
     # Remove control chars (most dangerous: \n allows new prompt injection lines)
     s = _CONTROL_CHARS_RE.sub(" ", s)
+    # Escape backslashes first (before other escapes add more backslashes)
+    s = s.replace("\\", "\\\\")
+    # Escape quotes to prevent breaking out of string contexts
+    s = s.replace('"', '\\"')
+    s = s.replace("'", "\\'")
+    # Strip template/instruction delimiters that could hijack prompt structure
+    s = s.replace("{{", "{ {")
+    s = s.replace("}}", "} }")
+    s = s.replace("```", "` ` `")
+    # Remove common prompt injection phrases (case-insensitive)
+    s = re.sub(r"(?i)(ignore\s+(previous|above|all)\s+instructions)", "[filtered]", s)
+    s = re.sub(r"(?i)(system\s*:\s*)", "[filtered] ", s)
+    s = re.sub(r"(?i)(you\s+are\s+now\s+)", "[filtered] ", s)
     # Collapse multiple spaces
     s = re.sub(r" {2,}", " ", s).strip()
     return s[:max_len]
@@ -228,7 +244,13 @@ def _format_market_context(ctx: dict) -> str:
 # Signal enrichment (called by orchestrator — max 1/cycle)
 # ─────────────────────────────────────────────
 
-async def enrich_signal(signal: dict[str, Any], technicals: dict, settings: dict) -> str:
+async def enrich_signal(
+    signal: dict[str, Any],
+    technicals: dict,
+    settings: dict,
+    fundamentals: Optional[dict[str, Any]] = None,
+    sentiment_score: Optional[float] = None,
+) -> str:
     """
     Generate a 2-3 sentence LLM narrative for a detected signal.
     Returns the summary string, or empty string on failure.
@@ -265,6 +287,27 @@ async def enrich_signal(signal: dict[str, Any], technicals: dict, settings: dict
     except Exception:
         pass
 
+    # Build fundamentals section if available
+    fundamentals_str = "Not available."
+    if fundamentals and fundamentals.get("fundamental_score") is not None:
+        fund_score = fundamentals.get("fundamental_score", "N/A")
+        fund_signal = _sanitize_for_prompt(fundamentals.get("fundamental_signal", "N/A"), max_len=20)
+        pe = _sanitize_for_prompt(safe_float((fundamentals.get("valuation") or {}).get("pe")))
+        roe = _pct_display((fundamentals.get("profitability") or {}).get("roe"))
+        de = _sanitize_for_prompt(safe_float((fundamentals.get("financial_health") or {}).get("debt_to_equity")))
+        rev_growth = _pct_display((fundamentals.get("growth") or {}).get("revenue_growth"))
+        fundamentals_str = f"Score: {fund_score}/10 ({fund_signal}), P/E: {pe}, ROE: {roe}%, D/E: {de}, Revenue Growth: {rev_growth}%"
+
+    # Build sentiment section if available
+    sentiment_str = "Not available."
+    if sentiment_score is not None:
+        if sentiment_score > 0.2:
+            sentiment_str = f"Positive ({sentiment_score:.2f})"
+        elif sentiment_score < -0.2:
+            sentiment_str = f"Negative ({sentiment_score:.2f})"
+        else:
+            sentiment_str = f"Neutral ({sentiment_score:.2f})"
+
     prompt = f"""A technical signal was detected for {symbol}. Provide a brief 2-3 sentence analysis.
 
 Signal: {signal_type.replace('_', ' ').title()} ({direction})
@@ -277,13 +320,17 @@ Technical Context:
 - MACD: {macd_sig}
 - Market Regime: {regime}
 
+Fundamentals: {fundamentals_str}
+
+News Sentiment: {sentiment_str}
+
 Market Context:
 {market_ctx_str}
 
 Instructions:
 - Explain WHY this signal matters in simple terms
 - Mention 1 supporting factor and 1 risk factor
-- Consider the market context (options data, institutional activity, corporate actions) if available
+- Consider fundamentals, sentiment, and market context if available
 - Do NOT predict prices or give buy/sell recommendations
 - Keep it factual and grounded in the data above
 
