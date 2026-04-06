@@ -127,7 +127,13 @@ async function pollSignals(force = false): Promise<void> {
       chrome.runtime.sendMessage({ type: "SIGNALS_UPDATED", count: unreadCount }).catch(() => {});
     }
   } catch (err) {
-    console.error("[agentX SW] Poll failed:", err);
+    if (err instanceof DOMException && err.name === "AbortError") {
+      console.warn("[agentX SW] Poll timed out — backend may be busy or unreachable");
+    } else if (err instanceof TypeError && (err.message.includes("fetch") || err.message.includes("network"))) {
+      console.warn("[agentX SW] Poll failed — backend not reachable");
+    } else {
+      console.error("[agentX SW] Poll failed:", err instanceof Error ? err.message : String(err));
+    }
   }
 }
 

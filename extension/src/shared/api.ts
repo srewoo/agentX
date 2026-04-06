@@ -84,7 +84,7 @@ export const api = {
     fii_dii: { fii_net: number | null; dii_net: number | null; sentiment: string; source: string } | null;
     india_vix: number | null;
     market_regime: { regime: string; confidence: number; description: string } | null;
-  }>("/api/market/context"),
+  }>("/api/market/context", {}, 60_000),
 
   // Settings
   getSettings: () => request<{ settings: AppSettings }>("/api/settings"),
