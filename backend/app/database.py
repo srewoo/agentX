@@ -100,6 +100,29 @@ CREATE_SIGNALS_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_signals_unread ON signals(read, dismissed);",
 ]
 
+# Weekly autonomous backtest results — one row per scheduled run.
+# Used by /api/performance/insights to track signal-engine performance over
+# time and surface drift (e.g. confluence WR dropping vs last week).
+CREATE_BACKTEST_RUNS_TABLE = """
+CREATE TABLE IF NOT EXISTS backtest_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_at TEXT NOT NULL,
+    period TEXT NOT NULL,
+    eval_window_days INTEGER NOT NULL,
+    stocks_count INTEGER NOT NULL,
+    total_signals INTEGER NOT NULL,
+    avg_pnl_pct REAL,
+    directional_win_rate REAL,
+    best_signal_type TEXT,
+    worst_signal_type TEXT,
+    payload TEXT NOT NULL  -- JSON blob of full per-symbol results
+);
+"""
+
+CREATE_BACKTEST_RUNS_INDEXES = [
+    "CREATE INDEX IF NOT EXISTS idx_backtest_runs_run_at ON backtest_runs(run_at DESC);",
+]
+
 DEFAULT_SETTINGS = {
     "alert_interval_minutes": str(settings.default_alert_interval_minutes),
     "risk_mode": "balanced",
@@ -141,11 +164,15 @@ async def init_db():
         await db.execute(CREATE_SIGNAL_OUTCOMES_TABLE)
         await db.execute(CREATE_SIGNAL_PERFORMANCE_TABLE)
         await db.execute(CREATE_PRICE_ALERTS_TABLE)
+        await db.execute(CREATE_BACKTEST_RUNS_TABLE)
 
         for idx_sql in CREATE_SIGNALS_INDEXES:
             await db.execute(idx_sql)
 
         for idx_sql in CREATE_PRICE_ALERTS_INDEXES:
+            await db.execute(idx_sql)
+
+        for idx_sql in CREATE_BACKTEST_RUNS_INDEXES:
             await db.execute(idx_sql)
 
         # Seed default settings (INSERT OR IGNORE — don't overwrite user changes)

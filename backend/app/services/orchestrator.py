@@ -563,10 +563,11 @@ async def run_scan_cycle() -> list[dict]:
 
 
 class SignalOrchestrator:
-    """Background scheduler that runs scan cycles on a configurable interval."""
+    """Background scheduler — scan cycles + weekly autonomous backtest."""
 
     def __init__(self):
         self._task: Optional[asyncio.Task] = None
+        self._backtest_task: Optional[asyncio.Task] = None
         self._running = False
 
     async def start(self) -> None:
@@ -574,16 +575,18 @@ class SignalOrchestrator:
             return
         self._running = True
         self._task = asyncio.create_task(self._loop())
-        logger.info("Signal orchestrator started")
+        self._backtest_task = asyncio.create_task(self._backtest_loop())
+        logger.info("Signal orchestrator started (scan + weekly backtest)")
 
     async def stop(self) -> None:
         self._running = False
-        if self._task:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
+        for t in (self._task, self._backtest_task):
+            if t:
+                t.cancel()
+                try:
+                    await t
+                except asyncio.CancelledError:
+                    pass
         logger.info("Signal orchestrator stopped")
 
     async def _loop(self) -> None:
@@ -613,8 +616,109 @@ class SignalOrchestrator:
                 # Back off before retry
                 await asyncio.sleep(60)
 
+    async def _backtest_loop(self) -> None:
+        """Weekly autonomous backtest of NIFTY 50 — persisted for trend analysis.
+
+        Sleeps until the next Sunday 18:00 IST, then runs a 1y/5d backtest on
+        the watchlist + a curated NIFTY-50 subset. Results persist to the
+        backtest_runs table; /api/performance/insights diffs runs to detect
+        signal-engine drift over time.
+        """
+        # Initial delay — let the rest of the app finish booting before pulling
+        # 50 stocks of history. 5 minutes is enough for any first-time setup.
+        await asyncio.sleep(300)
+
+        while self._running:
+            try:
+                next_run = _next_weekly_backtest_dt()
+                wait_s = max(60, (next_run - datetime.now(timezone.utc)).total_seconds())
+                logger.info("Next weekly backtest at %s UTC (in %.1fh)", next_run.isoformat(), wait_s / 3600)
+                await asyncio.sleep(wait_s)
+                if not self._running:
+                    break
+                await self._run_weekly_backtest()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("Weekly backtest loop error: %s", e)
+                await asyncio.sleep(3600)  # back off 1h on unexpected errors
+
+    async def _run_weekly_backtest(self) -> None:
+        """Execute the weekly backtest and persist the result row."""
+        from app.services.backtester import run_backtest
+        import json
+        symbols = await _get_watchlist_symbols()
+        # Always include the top liquid NIFTY names so we have a stable baseline
+        baseline = [s["symbol"] for s in MAJOR_STOCKS[:25]]
+        all_syms = list(dict.fromkeys(baseline + symbols))[:50]  # de-dupe, cap at 50
+
+        logger.info("Weekly autonomous backtest starting on %d symbols", len(all_syms))
+        per_symbol: list[dict] = []
+        all_pnl: list[float] = []
+        all_wins = 0
+        all_evaluated = 0
+        type_pnl: dict[str, float] = {}
+        type_count: dict[str, int] = {}
+
+        for sym in all_syms:
+            try:
+                r = await run_backtest(sym, period="1y", eval_windows=[1, 3, 5, 10])
+                per_symbol.append(r)
+                ov = r.get("overall", {})
+                if ov.get("avg_pnl_5d") is not None:
+                    all_pnl.append(ov["avg_pnl_5d"])
+                # Aggregate per-type
+                for stype, dirs in (r.get("by_signal_type") or {}).items():
+                    for direction, m in dirs.items():
+                        if m.get("is_neutral"): continue
+                        wins = m.get("wins_5d", 0); losses = m.get("losses_5d", 0)
+                        all_wins += wins; all_evaluated += wins + losses
+                        if m.get("avg_pnl_5d") is not None and m.get("total"):
+                            type_pnl[stype] = type_pnl.get(stype, 0.0) + m["avg_pnl_5d"] * m["total"]
+                            type_count[stype] = type_count.get(stype, 0) + m["total"]
+            except Exception as e:
+                logger.debug("Backtest failed for %s: %s", sym, e)
+
+        avg_pnl = round(sum(all_pnl) / len(all_pnl), 4) if all_pnl else 0.0
+        win_rate = round(all_wins / all_evaluated * 100, 2) if all_evaluated else 0.0
+        type_avg = {t: type_pnl[t] / type_count[t] for t in type_pnl if type_count[t]}
+        best = max(type_avg.items(), key=lambda x: x[1])[0] if type_avg else None
+        worst = min(type_avg.items(), key=lambda x: x[1])[0] if type_avg else None
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                """INSERT INTO backtest_runs
+                   (run_at, period, eval_window_days, stocks_count, total_signals,
+                    avg_pnl_pct, directional_win_rate, best_signal_type, worst_signal_type, payload)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    datetime.now(timezone.utc).isoformat(),
+                    "1y", 5, len(all_syms),
+                    sum(r.get("total_signals", 0) for r in per_symbol),
+                    avg_pnl, win_rate, best, worst,
+                    json.dumps({"per_symbol": per_symbol, "by_type_avg_pnl_5d": type_avg}),
+                ),
+            )
+            await db.commit()
+        logger.info(
+            "Weekly backtest complete: %d stocks · WR %.1f%% · avg PnL %.2f%% · best %s · worst %s",
+            len(all_syms), win_rate, avg_pnl, best, worst,
+        )
+
     def is_running(self) -> bool:
         return self._running
+
+
+def _next_weekly_backtest_dt() -> datetime:
+    """Return next Sunday 18:00 IST in UTC."""
+    IST_OFFSET = timedelta(hours=5, minutes=30)
+    now_utc = datetime.now(timezone.utc)
+    now_ist = now_utc + IST_OFFSET
+    days_until_sun = (6 - now_ist.weekday()) % 7  # Mon=0, Sun=6
+    target_ist = (now_ist + timedelta(days=days_until_sun)).replace(hour=18, minute=0, second=0, microsecond=0)
+    if days_until_sun == 0 and now_ist >= target_ist:
+        target_ist += timedelta(days=7)
+    return (target_ist - IST_OFFSET).replace(tzinfo=timezone.utc)
 
 
 # Global orchestrator instance
