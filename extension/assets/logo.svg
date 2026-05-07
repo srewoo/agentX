@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  agentX logo.
+
+  Concept: a bold "X" formed by two crossing strokes on a rounded purple tile.
+    - One stroke is a rising chart line with a sharp peak — represents the
+      deterministic trading signal engine.
+    - The other is a smooth curve — represents the AI / "agent" overlay.
+  The peak of the chart stroke pierces the curve to suggest signal-driven
+  decisions amplified by AI judgment.
+
+  Designed to remain legible at 16×16 (browser action favicon) by keeping
+  strokes thick (≥10% of canvas) and using high-contrast white on a vivid
+  purple gradient that matches the popup's brand-DEFAULT (#7C3AED) →
+  brand-light (#A78BFA) tokens.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" role="img" aria-label="agentX logo">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#7C3AED"/>
+      <stop offset="100%" stop-color="#5B21B6"/>
+    </linearGradient>
+    <linearGradient id="rise" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0%"  stop-color="#FFFFFF" stop-opacity="0.92"/>
+      <stop offset="100%" stop-color="#10B981"/>
+    </linearGradient>
+    <linearGradient id="curve" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#A78BFA"/>
+      <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0.85"/>
+    </linearGradient>
+    <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="2.2" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- Rounded tile background -->
+  <rect x="2" y="2" width="124" height="124" rx="28" ry="28" fill="url(#bg)"/>
+  <!-- subtle inner highlight to give depth -->
+  <rect x="2" y="2" width="124" height="124" rx="28" ry="28" fill="none"
+        stroke="rgba(255,255,255,0.10)" stroke-width="2"/>
+
+  <!-- AI curve: smooth S-stroke from bottom-left to top-right.
+       Drawn first so the chart line sits in front. -->
+  <path d="M 26 96 C 50 96, 50 32, 102 32"
+        stroke="url(#curve)" stroke-width="14" stroke-linecap="round"
+        fill="none" opacity="0.92"/>
+
+  <!-- Chart stroke: zig-zag rise crossing the curve, with a sharp peak.
+       Forms the second arm of the X. -->
+  <polyline points="26,32 56,68 76,46 102,96"
+            stroke="url(#rise)" stroke-width="14" stroke-linecap="round"
+            stroke-linejoin="round" fill="none"
+            filter="url(#glow)"/>
+
+  <!-- Apex dot — marks the signal peak -->
+  <circle cx="76" cy="46" r="6.5" fill="#10B981"
+          stroke="#FFFFFF" stroke-width="2.5"/>
+</svg>
