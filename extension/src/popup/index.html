@@ -9,6 +9,9 @@
       html { width: 527px; height: 600px; }
       body { width: 527px; height: 600px; margin: 0; overflow: hidden; background: #18181B; color: #F4F4F5; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
       #root { width: 527px; height: 600px; overflow: hidden; position: relative; }
+      html.standalone, html.standalone body { width: 100vw; height: 100vh; overflow: hidden; }
+      html.standalone body { display: flex; align-items: stretch; justify-content: center; padding: 0; }
+      html.standalone #root { width: 100%; height: 100vh; overflow: hidden; position: relative; }
     </style>
   </head>
   <body>

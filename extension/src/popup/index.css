@@ -11,6 +11,43 @@
 
 .tab-btn { transition: color 0.15s ease, border-color 0.15s ease; }
 
+/* ── Standalone (popped-out) responsive layout ──────────────────
+   In the popped-out window the viewport can be wide, so flip lists
+   that stack vertically in the popup into auto-fill grids. The
+   selector only matches when <html class="standalone"> is set, so
+   the regular 527px popup layout is unaffected. */
+html.standalone .responsive-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: 0.625rem;
+  align-content: start;
+}
+html.standalone .responsive-grid > * { margin-bottom: 0; }
+
+/* Cap text-heavy header rows so they don't span 1500px on big screens. */
+html.standalone .responsive-content-cap {
+  max-width: 1280px;
+  width: 100%;
+  margin-left: auto;
+  margin-right: auto;
+}
+
+/* Two-column top region in standalone: insights | today's plan. */
+html.standalone .responsive-top {
+  display: grid;
+  grid-template-columns: minmax(320px, 1fr) minmax(320px, 1fr);
+  gap: 0.5rem;
+  padding: 0.5rem;
+  max-width: 1280px;
+  width: 100%;
+  margin-left: auto;
+  margin-right: auto;
+}
+html.standalone .responsive-top > * { border: 1px solid rgb(39 39 42); border-radius: 0.5rem; }
+@media (max-width: 900px) {
+  html.standalone .responsive-top { grid-template-columns: 1fr; }
+}
+
 /* ── Light theme overrides ────────────────────────────────────────
    Swaps the dark surfaces and zinc text scale to a high-contrast
    light palette via attribute selector. Colors below mirror the

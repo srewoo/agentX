@@ -322,16 +322,18 @@ export default function Dashboard({ onSelectSymbol }: DashboardProps = {}) {
         </div>
       )}
 
-      {/* Agent insights — recommendations from the autonomous loop */}
-      <InsightsCard />
+      <div className="responsive-top">
+        {/* Agent insights — recommendations from the autonomous loop */}
+        <InsightsCard />
 
-      {/* Today's plan card */}
-      <TodaysPlan
-        signals={signals}
-        marketRegime={marketCtx?.market_regime?.regime ?? null}
-        marketOpen={marketOpen}
-        onSelectSymbol={onSelectSymbol}
-      />
+        {/* Today's plan card */}
+        <TodaysPlan
+          signals={signals}
+          marketRegime={marketCtx?.market_regime?.regime ?? null}
+          marketOpen={marketOpen}
+          onSelectSymbol={onSelectSymbol}
+        />
+      </div>
 
       {/* Market context bar: Indices + Regime + VIX + FII/DII */}
       {(indices || (marketCtx && (marketCtx.market_regime || marketCtx.india_vix != null || marketCtx.fii_dii))) && (
@@ -485,7 +487,7 @@ export default function Dashboard({ onSelectSymbol }: DashboardProps = {}) {
       </div>
 
       {/* Signal list */}
-      <div className="flex-1 overflow-y-auto px-3 py-2 flex flex-col">
+      <div className="flex-1 overflow-y-auto px-3 py-2 flex flex-col responsive-content-cap">
         {error && (
           <div className="text-xs text-loss bg-loss/10 border border-loss/30 rounded p-2 mb-2">
             Backend error: {error}. Is the backend running?
@@ -525,14 +527,16 @@ export default function Dashboard({ onSelectSymbol }: DashboardProps = {}) {
             </div>
           </div>
         ) : (
-          filteredSignals.map((signal) => (
-            <SignalCard
-              key={signal.id}
-              signal={signal}
-              onRead={markRead}
-              onDismiss={dismiss}
-            />
-          ))
+          <div className="responsive-grid">
+            {filteredSignals.map((signal) => (
+              <SignalCard
+                key={signal.id}
+                signal={signal}
+                onRead={markRead}
+                onDismiss={dismiss}
+              />
+            ))}
+          </div>
         )}
         <div className="mt-auto pt-2 px-1">
           <Disclaimer />

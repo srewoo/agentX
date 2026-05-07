@@ -38,6 +38,19 @@ export default function App() {
     setActiveTab("search");
   }, []);
 
+  const isStandalone = typeof window !== "undefined"
+    && new URLSearchParams(window.location.search).get("standalone") === "1";
+
+  const handlePopOut = useCallback(() => {
+    const url = chrome.runtime.getURL("popup/index.html") + "?standalone=1";
+    if (chrome.windows?.create) {
+      chrome.windows.create({ url, type: "popup", width: 1100, height: 800 });
+    } else {
+      chrome.tabs.create({ url });
+    }
+    window.close();
+  }, []);
+
   // First-run check + deep-link consumption + theme
   useEffect(() => {
     (async () => {
@@ -71,14 +84,34 @@ export default function App() {
   }, [theme]);
 
   return (
-    <div className="relative flex flex-col bg-surface text-zinc-100" style={{ width: 527, height: 600, maxHeight: 600, overflow: "hidden" }} data-theme={theme}>
+    <div
+      className="relative flex flex-col bg-surface text-zinc-100"
+      style={
+        isStandalone
+          ? { width: "100%", height: "100%", overflow: "hidden" }
+          : { width: 527, height: 600, maxHeight: 600, overflow: "hidden" }
+      }
+      data-theme={theme}
+    >
       {/* Header */}
       <div className="flex-shrink-0 flex items-center justify-between px-4 py-2 border-b border-border bg-panel">
         <div className="flex items-center gap-2">
           <span className="text-brand text-lg">📈</span>
           <span className="font-semibold text-sm text-zinc-100">agentX</span>
         </div>
-        <span className="text-xs text-zinc-500">NSE/BSE Copilot</span>
+        <div className="flex items-center gap-3">
+          <span className="text-xs text-zinc-500">NSE/BSE Copilot</span>
+          {!isStandalone && (
+            <button
+              onClick={handlePopOut}
+              title="Pop out to a standalone window"
+              aria-label="Pop out to a standalone window"
+              className="text-zinc-400 hover:text-brand-light text-base leading-none px-1"
+            >
+              ⛶
+            </button>
+          )}
+        </div>
       </div>
 
       {/* Content */}
