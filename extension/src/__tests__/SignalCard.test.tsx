@@ -12,6 +12,8 @@ vi.mock("../popup/components/MiniChart", () => ({
 vi.mock("../shared/api", () => ({
   api: {
     markRead: vi.fn(async () => ({ ok: true })),
+    getTechnicals: vi.fn(async () => ({ atr: null })),
+    getHistory: vi.fn(async () => ({ history: [] })),
   },
 }));
 

@@ -1,13 +1,75 @@
-import { useState } from "react";
-import type { Signal } from "../../shared/types";
+import { useEffect, useState } from "react";
+import type { Signal, AppSettings, PaperTrade, SignalEdgeRow } from "../../shared/types";
 import { SIGNAL_TYPE_LABELS, DIRECTION_ACTION, ACTION_COLORS, getSignalTimeframe } from "../../shared/constants";
 import { api } from "../../shared/api";
+import { getSettings, saveSettings } from "../../shared/storage";
+import { paperTrades } from "../../shared/localStore";
+import { getEdgeFor } from "../../shared/edgeCache";
 import MiniChart from "./MiniChart";
 
 interface Props {
   signal: Signal;
   onRead: (id: string) => void;
   onDismiss: (id: string) => void;
+}
+
+interface RiskPlan {
+  target?: number;
+  stop?: number;
+  qty?: number;
+  riskPerShare?: number;
+  riskAmount?: number;
+  rewardAmount?: number;
+  rr?: number;
+  source: "atr" | "heuristic";
+}
+
+/**
+ * Compute target / SL using ATR (volatility-adjusted) when available,
+ * falling back to a fixed % heuristic otherwise. Position size follows
+ * the Van Tharp risk-per-trade rule: qty = (capital × risk%) / (entry − stop).
+ */
+function computeRiskPlan(
+  signal: Signal,
+  atr: number | null,
+  settings: Partial<AppSettings>
+): RiskPlan {
+  const price = signal.current_price;
+  if (price == null || price <= 0) return { source: "heuristic" };
+
+  const slMult = settings.atr_sl_mult ?? 1.5;
+  const tgtMult = settings.atr_target_mult ?? 3.0;
+  const capital = settings.capital ?? 100000;
+  const riskPct = (settings.risk_per_trade_pct ?? 1.0) / 100;
+
+  // ATR-based when available; else %-based heuristic preserving the same R:R
+  const useAtr = atr != null && atr > 0;
+  const riskPerShare = useAtr ? atr * slMult : price * 0.02 * slMult;
+  const rewardPerShare = useAtr ? atr * tgtMult : price * 0.02 * tgtMult;
+
+  const dir = signal.direction === "bearish" ? -1 : signal.direction === "bullish" ? 1 : 0;
+  if (dir === 0) {
+    // Neutral signals: show levels but don't suggest a trade.
+    return { source: useAtr ? "atr" : "heuristic" };
+  }
+  const stop = price - dir * riskPerShare;
+  const target = price + dir * rewardPerShare;
+
+  const riskAmount = capital * riskPct;
+  const qty = Math.max(0, Math.floor(riskAmount / riskPerShare));
+  const rewardAmount = qty * rewardPerShare;
+  const rr = riskPerShare > 0 ? rewardPerShare / riskPerShare : undefined;
+
+  return {
+    target,
+    stop,
+    qty,
+    riskPerShare,
+    riskAmount: qty * riskPerShare, // actual ₹ risk at suggested qty
+    rewardAmount,
+    rr,
+    source: useAtr ? "atr" : "heuristic",
+  };
 }
 
 function timeAgo(isoDate: string): string {
@@ -17,6 +79,26 @@ function timeAgo(isoDate: string): string {
   const hrs = Math.floor(mins / 60);
   if (hrs < 24) return `${hrs}h ago`;
   return `${Math.floor(hrs / 24)}d ago`;
+}
+
+/**
+ * A signal is "stale" if it was generated before today's NSE market open
+ * (9:15 IST) and is still unread. The price level it called is no longer
+ * tradeable at the original entry, so we flag it loudly. Read signals are
+ * never marked stale — the user has already acknowledged them.
+ */
+function isStale(isoDate: string, read: boolean): boolean {
+  if (read) return false;
+  const created = new Date(isoDate).getTime();
+  // 9:15 IST today, expressed in UTC ms
+  const IST_OFFSET_MS = (5 * 60 + 30) * 60 * 1000;
+  const istNow = new Date(Date.now() + IST_OFFSET_MS);
+  const ymd = Date.UTC(istNow.getUTCFullYear(), istNow.getUTCMonth(), istNow.getUTCDate());
+  const todayOpenUTC = ymd + (9 * 60 + 15) * 60 * 1000 - IST_OFFSET_MS;
+  // If we're still before today's open, fall back to "older than 18h" so signals
+  // from yesterday's session don't show as fresh at 8 AM.
+  const cutoff = Date.now() < todayOpenUTC ? Date.now() - 18 * 60 * 60 * 1000 : todayOpenUTC;
+  return created < cutoff;
 }
 
 // Use shared getSignalTimeframe from constants to avoid duplication
@@ -29,11 +111,67 @@ const TIMEFRAME_STYLE: Record<string, string> = {
 
 export default function SignalCard({ signal, onRead, onDismiss }: Props) {
   const [expanded, setExpanded] = useState(false);
+  const [tradeAdded, setTradeAdded] = useState(false);
+  const [muteMsg, setMuteMsg] = useState<string | null>(null);
+  const [atr, setAtr] = useState<number | null>(
+    typeof signal.metadata?.atr === "number" ? (signal.metadata.atr as number) : null
+  );
+  const [settings, setSettings] = useState<Partial<AppSettings>>({});
+  const [edge, setEdge] = useState<SignalEdgeRow | null>(null);
+
+  // Load advisor settings + lazy-fetch ATR on first expand if not in metadata
+  useEffect(() => {
+    getSettings().then(setSettings);
+    if (signal.direction !== "neutral") {
+      getEdgeFor(signal.signal_type, signal.direction).then(setEdge);
+    }
+  }, [signal.signal_type, signal.direction]);
+  useEffect(() => {
+    if (!expanded || atr != null) return;
+    api.getTechnicals(signal.symbol)
+      .then((t) => { if (typeof t.atr === "number") setAtr(t.atr); })
+      .catch(() => { /* fallback to heuristic remains */ });
+  }, [expanded, atr, signal.symbol]);
 
   const action = DIRECTION_ACTION[signal.direction] || "HOLD";
   const actionColor = ACTION_COLORS[action] || "#F59E0B";
   const timeframe = getSignalTimeframe(signal.signal_type, signal.strength);
   const label = SIGNAL_TYPE_LABELS[signal.signal_type] || signal.signal_type;
+  const plan = computeRiskPlan(signal, atr, settings);
+  const { target, stop, qty, riskAmount, rewardAmount, rr, source } = plan;
+
+  const muteSymbol = async () => {
+    const s = (await getSettings()) as Partial<AppSettings>;
+    const list = new Set([...(s.muted_symbols ?? []), signal.symbol.toUpperCase()]);
+    await saveSettings({ ...s, muted_symbols: Array.from(list) });
+    setMuteMsg(`Muted ${signal.symbol}. Reload signals to apply.`);
+  };
+
+  const muteType = async () => {
+    const s = (await getSettings()) as Partial<AppSettings>;
+    const list = new Set([...(s.muted_signal_types ?? []), signal.signal_type]);
+    await saveSettings({ ...s, muted_signal_types: Array.from(list) });
+    setMuteMsg(`Muted "${label}". Reload signals to apply.`);
+  };
+
+  const takeTrade = async () => {
+    if (!signal.current_price) return;
+    const t: PaperTrade = {
+      id: crypto.randomUUID(),
+      symbol: signal.symbol,
+      side: signal.direction === "bearish" ? "SELL" : "BUY",
+      qty: qty && qty > 0 ? qty : 1,
+      entry_price: signal.current_price,
+      entry_at: new Date().toISOString(),
+      signal_id: signal.id,
+      target,
+      stop_loss: stop,
+      status: "open",
+    };
+    await paperTrades.add(t);
+    setTradeAdded(true);
+    setTimeout(() => setTradeAdded(false), 2500);
+  };
 
   const handleExpand = () => {
     setExpanded((e) => !e);
@@ -81,6 +219,14 @@ export default function SignalCard({ signal, onRead, onDismiss }: Props) {
         </div>
 
         <div className="flex items-center gap-2">
+          {isStale(signal.created_at, signal.read) && (
+            <span
+              className="text-[10px] font-semibold px-1.5 py-0.5 rounded border bg-amber-500/10 text-amber-400 border-amber-500/30"
+              title="This signal fired before today's market open. The entry level may no longer be valid — re-check before acting."
+            >
+              STALE
+            </span>
+          )}
           <span className="text-xs text-zinc-500">{timeAgo(signal.created_at)}</span>
           {/* Strength bar */}
           <div className="flex gap-0.5">
@@ -110,6 +256,28 @@ export default function SignalCard({ signal, onRead, onDismiss }: Props) {
               {(signal.metadata?.signal_count as number) || 2}x CONFLUENCE
             </span>
           )}
+          {/* Merged-count badge (signal dedup) */}
+          {Boolean(signal.metadata?.merged_count) && (signal.metadata!.merged_count as number) > 1 && (
+            <span
+              className="text-[10px] font-semibold px-1.5 py-0.5 rounded border bg-zinc-700/40 text-zinc-300 border-zinc-600/40"
+              title={`Also fired today: ${(signal.metadata!.merged_types as string[] | undefined)?.join(", ") || ""}`}
+            >
+              +{(signal.metadata!.merged_count as number) - 1} more
+            </span>
+          )}
+          {/* Historical edge chip (from internal backtest) */}
+          {edge && (
+            <span
+              className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border ${
+                edge.avg_pnl > 0.5 ? "bg-emerald-500/15 text-emerald-400 border-emerald-500/30"
+                  : edge.avg_pnl >= 0 ? "bg-zinc-700/50 text-zinc-300 border-zinc-600/40"
+                  : "bg-red-500/10 text-red-400 border-red-500/30"
+              }`}
+              title={`Backtest 5d: ${edge.win_rate.toFixed(1)}% WR, ${edge.avg_pnl >= 0 ? "+" : ""}${edge.avg_pnl.toFixed(2)}% avg PnL across ${edge.trades} historical trades`}
+            >
+              {edge.avg_pnl >= 0 ? "+" : ""}{edge.avg_pnl.toFixed(2)}% edge
+            </span>
+          )}
           {/* FII flow indicator */}
           {signal.metadata?.fii_modifier != null && (signal.metadata.fii_modifier as number) !== 0 && (
             <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded border ${
@@ -133,7 +301,7 @@ export default function SignalCard({ signal, onRead, onDismiss }: Props) {
             </span>
           )}
           {/* Counter-trend warning */}
-          {signal.metadata?.conflicting_signals && (
+          {Boolean(signal.metadata?.conflicting_signals) && (
             <span className="text-[10px] font-medium px-1.5 py-0.5 rounded border bg-yellow-500/10 text-yellow-400 border-yellow-500/25">
               MIXED
             </span>
@@ -154,6 +322,21 @@ export default function SignalCard({ signal, onRead, onDismiss }: Props) {
       {/* Expanded: LLM summary + risk */}
       {expanded && (
         <div className="mt-2.5 pt-2.5 border-t border-border space-y-2">
+          {edge && (
+            <div className={`text-[11px] rounded p-2 leading-relaxed ${
+              edge.avg_pnl > 0.5 ? "bg-emerald-500/10 border border-emerald-500/20 text-zinc-300"
+                : edge.avg_pnl >= 0 ? "bg-zinc-900/60 text-zinc-400"
+                : "bg-red-500/10 border border-red-500/20 text-zinc-300"
+            }`}>
+              <span className="font-semibold">Historical edge: </span>
+              {edge.win_rate.toFixed(1)}% win rate · {edge.avg_pnl >= 0 ? "+" : ""}{edge.avg_pnl.toFixed(2)}% avg PnL @ 5d ({edge.trades} backtested trades)
+              {edge.avg_pnl < 0 && (
+                <span className="block text-[10px] mt-0.5 italic text-loss/80">
+                  This setup historically lost money. Treat with skepticism.
+                </span>
+              )}
+            </div>
+          )}
           {signal.llm_summary && (
             <div className="text-xs text-zinc-200 leading-relaxed bg-zinc-900/60 rounded-lg p-2.5">
               <span className="text-brand-light font-semibold">AI Insight: </span>
@@ -165,16 +348,77 @@ export default function SignalCard({ signal, onRead, onDismiss }: Props) {
               <span className="font-semibold">⚠ Risk: </span>{signal.risk}
             </div>
           )}
+          {(target != null || stop != null) && (
+            <div className="space-y-1.5">
+              <div className="grid grid-cols-3 gap-1.5 text-[10px]">
+                <div className="bg-zinc-900/60 rounded p-1.5 text-center">
+                  <div className="text-zinc-500">Entry</div>
+                  <div className="text-zinc-100 font-semibold">₹{signal.current_price?.toFixed(1)}</div>
+                </div>
+                {target != null && (
+                  <div className="bg-emerald-500/10 border border-emerald-500/20 rounded p-1.5 text-center">
+                    <div className="text-zinc-500">Target</div>
+                    <div className="text-emerald-400 font-semibold">₹{target.toFixed(1)}</div>
+                  </div>
+                )}
+                {stop != null && (
+                  <div className="bg-red-500/10 border border-red-500/20 rounded p-1.5 text-center">
+                    <div className="text-zinc-500">Stop</div>
+                    <div className="text-red-400 font-semibold">₹{stop.toFixed(1)}</div>
+                  </div>
+                )}
+              </div>
+              {qty != null && qty > 0 && (
+                <div className="bg-zinc-900/40 rounded px-2 py-1.5 text-[10px] flex items-center justify-between">
+                  <div>
+                    <span className="text-zinc-500">Suggested qty </span>
+                    <span className="font-bold text-zinc-100">{qty}</span>
+                    {atr != null && (
+                      <span className="text-zinc-600"> · ATR ₹{atr.toFixed(2)}</span>
+                    )}
+                  </div>
+                  <div className="flex gap-2">
+                    <span><span className="text-zinc-500">Risk </span><span className="text-loss font-medium">₹{Math.round(riskAmount ?? 0).toLocaleString("en-IN")}</span></span>
+                    <span><span className="text-zinc-500">→ </span><span className="text-profit font-medium">₹{Math.round(rewardAmount ?? 0).toLocaleString("en-IN")}</span></span>
+                    {rr != null && <span className="text-zinc-400">R:R {rr.toFixed(1)}</span>}
+                  </div>
+                </div>
+              )}
+              <div className="text-[10px] text-zinc-600">
+                {source === "atr"
+                  ? `Volatility-adjusted (ATR × ${(settings.atr_sl_mult ?? 1.5)} stop / ATR × ${(settings.atr_target_mult ?? 3)} target)`
+                  : "Heuristic (ATR unavailable — using fixed % bands)"}
+                {qty != null && qty > 0 && ` · ${(settings.risk_per_trade_pct ?? 1)}% of ₹${(settings.capital ?? 100000).toLocaleString("en-IN")} capital`}
+              </div>
+            </div>
+          )}
           <MiniChart symbol={signal.symbol} height={120} />
-          <div className="flex items-center justify-between">
+          {muteMsg && <div className="text-[10px] text-zinc-400 italic">{muteMsg}</div>}
+          {tradeAdded && <div className="text-[10px] text-profit">✓ Added to paper book</div>}
+          <div className="flex items-center justify-between flex-wrap gap-1.5">
             <span className="text-xs text-zinc-500">Strength: {signal.strength}/10</span>
-            <button
-              className="text-xs text-zinc-500 hover:text-loss"
-              aria-label={`Dismiss ${signal.symbol} signal`}
-              onClick={(e) => { e.stopPropagation(); onDismiss(signal.id); }}
-            >
-              Dismiss
-            </button>
+            <div className="flex gap-1.5 text-[10px]">
+              {signal.current_price != null && (
+                <button onClick={(e) => { e.stopPropagation(); takeTrade(); }}
+                  className="px-2 py-0.5 rounded border border-emerald-500/30 text-emerald-400 hover:bg-emerald-500/10">
+                  Take this trade
+                </button>
+              )}
+              <button onClick={(e) => { e.stopPropagation(); muteSymbol(); }}
+                className="px-2 py-0.5 rounded border border-zinc-700 text-zinc-400 hover:text-zinc-100">
+                Mute {signal.symbol}
+              </button>
+              <button onClick={(e) => { e.stopPropagation(); muteType(); }}
+                className="px-2 py-0.5 rounded border border-zinc-700 text-zinc-400 hover:text-zinc-100">
+                Mute type
+              </button>
+              <button
+                aria-label={`Dismiss ${signal.symbol} signal`}
+                onClick={(e) => { e.stopPropagation(); onDismiss(signal.id); }}
+                className="text-zinc-500 hover:text-loss px-1">
+                Dismiss
+              </button>
+            </div>
           </div>
         </div>
       )}

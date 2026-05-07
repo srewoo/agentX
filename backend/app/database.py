@@ -125,8 +125,15 @@ _SIGNAL_MAX_AGE_DAYS = 7
 async def init_db():
     """Initialize database schema and default settings."""
     async with aiosqlite.connect(DB_PATH) as db:
-        # Enable WAL mode for concurrent reads while writing
+        # Concurrency / durability tuning. WAL is persistent (database-level);
+        # synchronous=NORMAL is also persistent — both safe and considerably
+        # faster than the rollback-journal default. busy_timeout is per-connection
+        # only, so we re-apply it everywhere we open a connection.
         await db.execute("PRAGMA journal_mode=WAL;")
+        await db.execute("PRAGMA synchronous=NORMAL;")
+        await db.execute("PRAGMA busy_timeout=5000;")  # 5s wait before "database is locked"
+        await db.execute("PRAGMA temp_store=MEMORY;")
+        await db.execute("PRAGMA foreign_keys=ON;")
 
         await db.execute(CREATE_SIGNALS_TABLE)
         await db.execute(CREATE_WATCHLIST_TABLE)
@@ -175,8 +182,33 @@ async def cleanup_old_signals() -> int:
     return deleted
 
 
+async def _apply_per_conn_pragmas(conn: aiosqlite.Connection) -> None:
+    """Apply per-connection pragmas. WAL + synchronous persist at the DB level
+    via init_db(); busy_timeout and foreign_keys are per-connection."""
+    await conn.execute("PRAGMA busy_timeout=5000;")
+    await conn.execute("PRAGMA foreign_keys=ON;")
+
+
 async def get_db() -> aiosqlite.Connection:
     """Return a connected aiosqlite connection. Caller must close."""
     conn = await aiosqlite.connect(DB_PATH)
     conn.row_factory = aiosqlite.Row
+    await _apply_per_conn_pragmas(conn)
     return conn
+
+
+def connect():
+    """Async context-manager wrapper around aiosqlite.connect that auto-applies
+    per-connection pragmas (busy_timeout, foreign_keys). Drop-in replacement
+    for `async with aiosqlite.connect(DB_PATH) as db:` in hot paths."""
+    return _ConnectCM()
+
+
+class _ConnectCM:
+    async def __aenter__(self):
+        self._conn = await aiosqlite.connect(DB_PATH)
+        await _apply_per_conn_pragmas(self._conn)
+        return self._conn
+
+    async def __aexit__(self, exc_type, exc, tb):
+        await self._conn.close()

@@ -27,24 +27,25 @@ _LLM_BASE_DELAY = 1.0  # seconds
 
 SUPPORTED_MODELS: dict[str, list[str]] = {
     "openai": [
-        "gpt-4.1",           # flagship, April 2025
-        "gpt-4.1-mini",      # fast + cheap replacement for gpt-4o-mini
-        "gpt-4o",            # still available
-        "gpt-4o-mini",       # still available
-        "o3",                # reasoning
+        "gpt-5",             # GPT-5 flagship
+        "gpt-5-mini",        # fast + cheap GPT-5 tier
+        "gpt-5-nano",        # cheapest GPT-5
+        "gpt-4.1",           # GPT-4.1 — kept for fallback
+        "gpt-4.1-mini",      # GPT-4.1 mini fallback
         "o4-mini",           # reasoning, budget
+        "o3",                # reasoning legacy
     ],
     "gemini": [
-        "gemini-2.5-pro",    # best as of March 2026
-        "gemini-2.5-flash",  # fast + cheap
-        "gemini-2.0-flash",  # current stable default
-        "gemini-1.5-pro",    # fallback
+        "gemini-3.1-pro",      # Gemini 3.1 Pro flagship
+        "gemini-3.1-flash",    # Gemini 3.1 Flash — fast + cheap
+        "gemini-3-flash",      # Gemini 3 Flash fallback
+        "gemini-2.5-pro",      # legacy, kept for compat
     ],
     "claude": [
-        "claude-opus-4-6",             # Claude Opus 4.6 — most capable
-        "claude-sonnet-4-6",           # Claude Sonnet 4.6 — balanced
-        "claude-haiku-4-5-20251001",   # Claude Haiku 4.5 — fast + cheap
-        "claude-3-5-sonnet-20241022",  # legacy, kept for backward compat
+        "claude-opus-4-7",             # Opus 4.7 — most capable
+        "claude-sonnet-4-5",           # Sonnet 4.5 — balanced default
+        "claude-haiku-4-5-20251001",   # Haiku 4.5 — fast + cheap
+        "claude-sonnet-4-6",           # legacy, kept for compat
     ],
 }
 

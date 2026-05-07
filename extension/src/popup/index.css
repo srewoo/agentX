@@ -10,3 +10,28 @@
 .signal-card:hover { background: #2D2D33 !important; }
 
 .tab-btn { transition: color 0.15s ease, border-color 0.15s ease; }
+
+/* ── Light theme overrides ────────────────────────────────────────
+   Swaps the dark surfaces and zinc text scale to a high-contrast
+   light palette via attribute selector. Colors below mirror the
+   tailwind tokens used throughout the popup. */
+[data-theme="light"] .bg-surface { background-color: #FAFAFA !important; }
+[data-theme="light"] .bg-panel { background-color: #F4F4F5 !important; }
+[data-theme="light"] .bg-panel\/50 { background-color: rgba(244,244,245,0.7) !important; }
+[data-theme="light"] .border-border { border-color: #D4D4D8 !important; }
+[data-theme="light"] .text-zinc-100, [data-theme="light"] .text-zinc-200 { color: #18181B !important; }
+[data-theme="light"] .text-zinc-300 { color: #27272A !important; }
+[data-theme="light"] .text-zinc-400 { color: #52525B !important; }
+[data-theme="light"] .text-zinc-500 { color: #71717A !important; }
+[data-theme="light"] .text-zinc-600 { color: #A1A1AA !important; }
+[data-theme="light"] .bg-zinc-800 { background-color: #FFFFFF !important; }
+[data-theme="light"] .bg-zinc-800\/50,
+[data-theme="light"] .bg-zinc-800\/60,
+[data-theme="light"] .bg-zinc-800\/80 { background-color: #FFFFFF !important; }
+[data-theme="light"] .bg-zinc-900\/30,
+[data-theme="light"] .bg-zinc-900\/40,
+[data-theme="light"] .bg-zinc-900\/60 { background-color: #FAFAFA !important; }
+[data-theme="light"] .bg-zinc-950\/95 { background-color: rgba(244,244,245,0.95) !important; }
+[data-theme="light"] ::-webkit-scrollbar-track { background: #E4E4E7; }
+[data-theme="light"] ::-webkit-scrollbar-thumb { background: #A1A1AA; }
+[data-theme="light"] .signal-card:hover { background: #ECECEE !important; }

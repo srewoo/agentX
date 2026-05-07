@@ -5,6 +5,11 @@ from typing import Optional
 
 from fastapi import APIRouter, HTTPException
 
+from app.services.signal_edge import (
+    EDGE_META,
+    RECOMMENDED_MUTES,
+    all_edge_rows,
+)
 from app.services.signal_tracker import (
     evaluate_signals,
     get_performance_stats,
@@ -14,6 +19,20 @@ from app.services.signal_tracker import (
 
 router = APIRouter(prefix="/api/performance", tags=["performance"])
 logger = logging.getLogger(__name__)
+
+
+@router.get("/edge")
+async def signal_edge():
+    """Static per-signal-type edge from the latest internal backtest run.
+
+    Used by the extension to surface 'this setup historically wins X%' on
+    each signal card and to default-mute unprofitable detectors.
+    """
+    return {
+        "meta": EDGE_META,
+        "recommended_mutes": RECOMMENDED_MUTES,
+        "rows": all_edge_rows(),
+    }
 
 
 @router.get("/summary")

@@ -2,6 +2,10 @@ import { useState, useCallback, useRef, useEffect } from "react";
 import StockQuoteCard from "../components/StockQuote";
 import AnalysisPanel from "../components/AnalysisPanel";
 import MiniChart from "../components/MiniChart";
+import OptionsPanel from "../components/OptionsPanel";
+import BacktestPanel from "../components/BacktestPanel";
+import NewsPanel from "../components/NewsPanel";
+import FundamentalsCard from "../components/FundamentalsCard";
 import { api } from "../../shared/api";
 import type { StockQuote, AIAnalysisResponse } from "../../shared/types";
 
@@ -17,7 +21,7 @@ interface SearchProps {
 }
 
 function useDebounce<T extends unknown[]>(fn: (...args: T) => void, delay: number) {
-  const timer = useRef<ReturnType<typeof setTimeout>>(null);
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   return useCallback((...args: T) => {
     if (timer.current) clearTimeout(timer.current);
     timer.current = setTimeout(() => fn(...args), delay);
@@ -188,6 +192,18 @@ export default function Search({ initialSymbol, onSymbolConsumed }: SearchProps 
                 </button>
               </>
             )}
+
+            {/* Fundamentals snapshot */}
+            <FundamentalsCard symbol={selectedSymbol!} />
+
+            {/* Options chain (FnO-eligible only) */}
+            <OptionsPanel symbol={selectedSymbol!} />
+
+            {/* Historical backtest of signals on this symbol */}
+            <BacktestPanel symbol={selectedSymbol!} />
+
+            {/* News filtered to this symbol */}
+            <NewsPanel collapsedDefault={true} filterSymbols={[selectedSymbol!]} />
           </>
         )}
 

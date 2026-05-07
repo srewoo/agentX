@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useCallback } from "react";
+import { useEffect, useRef, useState } from "react";
 import { createChart, type IChartApi, type ISeriesApi, ColorType, CrosshairMode, LineStyle, CandlestickSeries, HistogramSeries, LineSeries } from "lightweight-charts";
 import { api } from "../../shared/api";
 
@@ -37,6 +37,45 @@ function computeSMA(closes: number[], window: number): (number | null)[] {
   return result;
 }
 
+/** EMA. Standard recursive formula with first value = SMA seed. */
+function computeEMA(closes: number[], period: number): (number | null)[] {
+  const out: (number | null)[] = new Array(closes.length).fill(null);
+  if (closes.length < period) return out;
+  const k = 2 / (period + 1);
+  let sum = 0;
+  for (let i = 0; i < period; i++) sum += closes[i];
+  let ema = sum / period;
+  out[period - 1] = ema;
+  for (let i = period; i < closes.length; i++) {
+    ema = closes[i] * k + ema * (1 - k);
+    out[i] = ema;
+  }
+  return out;
+}
+
+/** RSI(14) — Wilder's smoothing. */
+function computeRSI(closes: number[], period = 14): (number | null)[] {
+  const out: (number | null)[] = new Array(closes.length).fill(null);
+  if (closes.length < period + 1) return out;
+  let gain = 0, loss = 0;
+  for (let i = 1; i <= period; i++) {
+    const d = closes[i] - closes[i - 1];
+    if (d >= 0) gain += d; else loss -= d;
+  }
+  let avgG = gain / period;
+  let avgL = loss / period;
+  out[period] = avgL === 0 ? 100 : 100 - 100 / (1 + avgG / avgL);
+  for (let i = period + 1; i < closes.length; i++) {
+    const d = closes[i] - closes[i - 1];
+    const g = d > 0 ? d : 0;
+    const l = d < 0 ? -d : 0;
+    avgG = (avgG * (period - 1) + g) / period;
+    avgL = (avgL * (period - 1) + l) / period;
+    out[i] = avgL === 0 ? 100 : 100 - 100 / (1 + avgG / avgL);
+  }
+  return out;
+}
+
 /** Compute Bollinger Bands (SMA20 +/- 2*stddev). Returns { upper, lower } arrays. */
 function computeBollingerBands(closes: number[], window = 20, mult = 2): { upper: (number | null)[]; lower: (number | null)[] } {
   const upper: (number | null)[] = [];
@@ -72,11 +111,16 @@ export default function MiniChart({ symbol, height = 150 }: Props) {
   const sma50SeriesRef = useRef<ISeriesApi<"Line"> | null>(null);
   const bbUpperSeriesRef = useRef<ISeriesApi<"Line"> | null>(null);
   const bbLowerSeriesRef = useRef<ISeriesApi<"Line"> | null>(null);
+  const ema9SeriesRef = useRef<ISeriesApi<"Line"> | null>(null);
+  const ema21SeriesRef = useRef<ISeriesApi<"Line"> | null>(null);
+  const rsiSeriesRef = useRef<ISeriesApi<"Line"> | null>(null);
 
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
   const [showSMA, setShowSMA] = useState(false);
   const [showBB, setShowBB] = useState(false);
+  const [showEMA, setShowEMA] = useState(false);
+  const [showRSI, setShowRSI] = useState(false);
   const [activeTimeframe, setActiveTimeframe] = useState(3); // index into TIMEFRAMES, default "3M"
 
   // Toggle overlay visibility
@@ -97,6 +141,15 @@ export default function MiniChart({ symbol, height = 150 }: Props) {
       bbLowerSeriesRef.current.applyOptions({ visible: showBB });
     }
   }, [showBB]);
+
+  useEffect(() => {
+    if (ema9SeriesRef.current) ema9SeriesRef.current.applyOptions({ visible: showEMA });
+    if (ema21SeriesRef.current) ema21SeriesRef.current.applyOptions({ visible: showEMA });
+  }, [showEMA]);
+
+  useEffect(() => {
+    if (rsiSeriesRef.current) rsiSeriesRef.current.applyOptions({ visible: showRSI });
+  }, [showRSI]);
 
   // Create chart and fetch data
   useEffect(() => {
@@ -196,6 +249,39 @@ export default function MiniChart({ symbol, height = 150 }: Props) {
     });
     bbLowerSeriesRef.current = bbLowerSeries;
 
+    // EMA9 / EMA21
+    const ema9Series = chart.addSeries(LineSeries, {
+      color: "#FBBF24",
+      lineWidth: 1,
+      priceLineVisible: false,
+      lastValueVisible: false,
+      visible: showEMA,
+    });
+    ema9SeriesRef.current = ema9Series;
+
+    const ema21Series = chart.addSeries(LineSeries, {
+      color: "#34D399",
+      lineWidth: 1,
+      priceLineVisible: false,
+      lastValueVisible: false,
+      visible: showEMA,
+    });
+    ema21SeriesRef.current = ema21Series;
+
+    // RSI panel — uses its own price scale on the left
+    const rsiSeries = chart.addSeries(LineSeries, {
+      color: "#A78BFA",
+      lineWidth: 1,
+      priceLineVisible: false,
+      lastValueVisible: false,
+      visible: showRSI,
+      priceScaleId: "rsi",
+    });
+    rsiSeries.priceScale().applyOptions({
+      scaleMargins: { top: 0.7, bottom: 0 },
+    });
+    rsiSeriesRef.current = rsiSeries;
+
     // Fetch data
     let cancelled = false;
 
@@ -243,6 +329,13 @@ export default function MiniChart({ symbol, height = 150 }: Props) {
         bbUpperSeries.setData(toLineData(bb.upper));
         bbLowerSeries.setData(toLineData(bb.lower));
 
+        const ema9 = computeEMA(closes, 9);
+        const ema21 = computeEMA(closes, 21);
+        const rsi = computeRSI(closes, 14);
+        ema9Series.setData(toLineData(ema9));
+        ema21Series.setData(toLineData(ema21));
+        rsiSeries.setData(toLineData(rsi));
+
         chart.timeScale().fitContent();
         setLoading(false);
       })
@@ -275,6 +368,9 @@ export default function MiniChart({ symbol, height = 150 }: Props) {
       sma50SeriesRef.current = null;
       bbUpperSeriesRef.current = null;
       bbLowerSeriesRef.current = null;
+      ema9SeriesRef.current = null;
+      ema21SeriesRef.current = null;
+      rsiSeriesRef.current = null;
     };
   }, [symbol, height, activeTimeframe]);
 
@@ -313,10 +409,32 @@ export default function MiniChart({ symbol, height = 150 }: Props) {
         >
           BB
         </button>
+        <button
+          onClick={() => setShowEMA((v) => !v)}
+          className={`text-[10px] px-1.5 py-0.5 rounded border font-medium transition-colors ${
+            showEMA ? "border-amber-500/50 text-amber-400 bg-amber-500/10" : "border-zinc-700 text-zinc-500 hover:text-zinc-400"
+          }`}
+        >
+          EMA
+        </button>
+        <button
+          onClick={() => setShowRSI((v) => !v)}
+          className={`text-[10px] px-1.5 py-0.5 rounded border font-medium transition-colors ${
+            showRSI ? "border-violet-500/50 text-violet-400 bg-violet-500/10" : "border-zinc-700 text-zinc-500 hover:text-zinc-400"
+          }`}
+        >
+          RSI
+        </button>
         {showSMA && (
           <span className="text-[9px] text-zinc-600 ml-1">
             <span className="text-blue-400">SMA20</span>{" "}
             <span className="text-orange-400">SMA50</span>
+          </span>
+        )}
+        {showEMA && (
+          <span className="text-[9px] text-zinc-600 ml-1">
+            <span className="text-amber-400">EMA9</span>{" "}
+            <span className="text-emerald-400">EMA21</span>
           </span>
         )}
       </div>

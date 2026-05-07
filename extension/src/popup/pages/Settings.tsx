@@ -2,11 +2,21 @@ import { useState } from "react";
 import { useSettings } from "../hooks/useSettings";
 import { LLM_MODELS } from "../../shared/constants";
 import type { AppSettings } from "../../shared/types";
+import { downloadFile } from "../../shared/localStore";
+import { saveSettings, getSettings } from "../../shared/storage";
+import { api } from "../../shared/api";
+
+// Sensitive keys to scrub from JSON exports
+const SENSITIVE_EXPORT = new Set([
+  "llm_api_key", "openai_api_key", "gemini_api_key", "claude_api_key", "api_key",
+  "telegram_bot_token",
+]);
 
 export default function Settings() {
   const { settings, loading, saving, update } = useSettings();
   const [saved, setSaved] = useState(false);
   const [backendUrl, setBackendUrl] = useState("");
+  const [importMsg, setImportMsg] = useState<string | null>(null);
 
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -21,6 +31,52 @@ export default function Settings() {
 
   const set = (key: keyof AppSettings, value: unknown) =>
     update({ [key]: value } as Partial<AppSettings>);
+
+  const exportSettings = async () => {
+    const all = (await getSettings()) as Record<string, unknown>;
+    const safe: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(all)) {
+      if (!SENSITIVE_EXPORT.has(k)) safe[k] = v;
+    }
+    downloadFile(`agentx-settings-${new Date().toISOString().slice(0, 10)}.json`, JSON.stringify(safe, null, 2), "application/json");
+  };
+
+  const importSettings = async (file: File) => {
+    setImportMsg(null);
+    try {
+      const text = await file.text();
+      const parsed = JSON.parse(text) as Partial<AppSettings>;
+      const current = (await getSettings()) as Partial<AppSettings>;
+      // Don't overwrite secrets that aren't in the export
+      const merged = { ...current, ...parsed };
+      await saveSettings(merged);
+      setImportMsg("✓ Settings imported. Reload to see all changes.");
+    } catch (e) {
+      setImportMsg(e instanceof Error ? `Import failed: ${e.message}` : "Import failed");
+    }
+  };
+
+  const clearMutes = () => {
+    update({ muted_symbols: [], muted_signal_types: [], snoozed_until: null });
+  };
+
+  const snoozeFor = (mins: number) => {
+    const until = new Date(Date.now() + mins * 60_000).toISOString();
+    update({ snoozed_until: until });
+  };
+
+  const applyRecommendedMutes = async () => {
+    try {
+      const edge = await api.getSignalEdge();
+      const set = new Set(settings.muted_signal_types ?? []);
+      edge.recommended_mutes.forEach((t) => set.add(t));
+      await update({ muted_signal_types: Array.from(set) });
+      setImportMsg(`✓ Muted ${edge.recommended_mutes.length} loser signal types.`);
+      setTimeout(() => setImportMsg(null), 3000);
+    } catch (e) {
+      setImportMsg(e instanceof Error ? e.message : "Couldn't fetch recommendations");
+    }
+  };
 
   const provider = (settings.llm_provider || "gemini") as keyof typeof LLM_MODELS;
   const models = LLM_MODELS[provider] || [];
@@ -100,6 +156,103 @@ export default function Settings() {
           </div>
         </section>
 
+        {/* Advisor Mode — risk + position sizing + regime + costs */}
+        <section>
+          <h3 className="text-xs font-semibold text-zinc-400 uppercase tracking-wider mb-2">Advisor Mode</h3>
+          <div className="space-y-3">
+            <div className="grid grid-cols-2 gap-2">
+              <div>
+                <label className="text-xs text-zinc-400 block mb-1">Trading capital (₹)</label>
+                <input
+                  type="number" min={0} step={1000}
+                  value={settings.capital ?? 100000}
+                  onChange={(e) => set("capital", Number(e.target.value))}
+                  className="w-full bg-zinc-800 border border-border rounded px-2 py-1 text-xs text-zinc-100"
+                />
+              </div>
+              <div>
+                <label className="text-xs text-zinc-400 block mb-1">Risk per trade (%)</label>
+                <input
+                  type="number" min={0.1} max={5} step={0.1}
+                  value={settings.risk_per_trade_pct ?? 1}
+                  onChange={(e) => set("risk_per_trade_pct", Number(e.target.value))}
+                  className="w-full bg-zinc-800 border border-border rounded px-2 py-1 text-xs text-zinc-100"
+                />
+                <p className="text-[10px] text-zinc-600 mt-0.5">
+                  Pros: 0.5–1%. Aggressive: ≤2%.
+                </p>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 gap-2">
+              <div>
+                <label className="text-xs text-zinc-400 block mb-1">ATR × Stop Loss</label>
+                <input
+                  type="number" min={0.5} max={5} step={0.1}
+                  value={settings.atr_sl_mult ?? 1.5}
+                  onChange={(e) => set("atr_sl_mult", Number(e.target.value))}
+                  className="w-full bg-zinc-800 border border-border rounded px-2 py-1 text-xs text-zinc-100"
+                />
+              </div>
+              <div>
+                <label className="text-xs text-zinc-400 block mb-1">ATR × Target</label>
+                <input
+                  type="number" min={0.5} max={10} step={0.1}
+                  value={settings.atr_target_mult ?? 3.0}
+                  onChange={(e) => set("atr_target_mult", Number(e.target.value))}
+                  className="w-full bg-zinc-800 border border-border rounded px-2 py-1 text-xs text-zinc-100"
+                />
+                <p className="text-[10px] text-zinc-600 mt-0.5">
+                  R:R = Target ÷ SL = {((settings.atr_target_mult ?? 3) / (settings.atr_sl_mult ?? 1.5)).toFixed(2)}
+                </p>
+              </div>
+            </div>
+
+            <label className="flex items-center justify-between text-xs text-zinc-300">
+              <span>
+                Regime-aware filter
+                <span className="text-[10px] text-zinc-600 block">
+                  Hide breakouts in ranging markets, mean-reversion in strong trends
+                </span>
+              </span>
+              <input
+                type="checkbox"
+                checked={settings.regime_filter !== false}
+                onChange={(e) => set("regime_filter", e.target.checked)}
+                className="accent-brand"
+              />
+            </label>
+
+            <label className="flex items-center justify-between text-xs text-zinc-300">
+              <span>
+                Deduplicate signals
+                <span className="text-[10px] text-zinc-600 block">
+                  Same symbol + day + direction → keep strongest, badge the rest
+                </span>
+              </span>
+              <input
+                type="checkbox"
+                checked={settings.dedupe_signals !== false}
+                onChange={(e) => set("dedupe_signals", e.target.checked)}
+                className="accent-brand"
+              />
+            </label>
+
+            <div>
+              <label className="text-xs text-zinc-400 block mb-1">Round-trip cost (%)</label>
+              <input
+                type="number" min={0} max={5} step={0.05}
+                value={settings.roundtrip_cost_pct ?? 0.5}
+                onChange={(e) => set("roundtrip_cost_pct", Number(e.target.value))}
+                className="w-full bg-zinc-800 border border-border rounded px-2 py-1 text-xs text-zinc-100"
+              />
+              <p className="text-[10px] text-zinc-600 mt-0.5">
+                Brokerage + STT + slippage. Backtest PnL is shown net of this.
+              </p>
+            </div>
+          </div>
+        </section>
+
         {/* LLM Settings */}
         <section>
           <h3 className="text-xs font-semibold text-zinc-400 uppercase tracking-wider mb-2">AI / LLM</h3>
@@ -149,6 +302,168 @@ export default function Settings() {
               );
             })}
           </div>
+        </section>
+
+        {/* Notifications & Audio */}
+        <section>
+          <h3 className="text-xs font-semibold text-zinc-400 uppercase tracking-wider mb-2">Notifications</h3>
+          <div className="space-y-3">
+            <label className="flex items-center justify-between text-xs text-zinc-300">
+              <span>Audio alerts on high-strength signals</span>
+              <input
+                type="checkbox"
+                checked={!!settings.audio_alerts}
+                onChange={(e) => set("audio_alerts", e.target.checked)}
+                className="accent-brand"
+              />
+            </label>
+            {settings.audio_alerts && (
+              <div>
+                <label className="text-xs text-zinc-400 block mb-1">Audio threshold (strength)</label>
+                <input
+                  type="range" min={5} max={10}
+                  value={settings.audio_strength_threshold ?? 8}
+                  onChange={(e) => set("audio_strength_threshold", Number(e.target.value))}
+                  className="w-full accent-brand"
+                />
+                <div className="text-[10px] text-zinc-500">≥ {settings.audio_strength_threshold ?? 8}/10</div>
+              </div>
+            )}
+            <div>
+              <label className="text-xs text-zinc-400 block mb-1">Snooze all signals</label>
+              <div className="flex flex-wrap gap-1.5">
+                {[15, 60, 240, 1440].map((m) => (
+                  <button key={m} onClick={() => snoozeFor(m)}
+                    className="text-[10px] px-2 py-0.5 rounded border border-border text-zinc-300 hover:text-zinc-100">
+                    {m < 60 ? `${m}m` : m < 1440 ? `${m / 60}h` : "1d"}
+                  </button>
+                ))}
+                <button onClick={() => set("snoozed_until", null)}
+                  className="text-[10px] px-2 py-0.5 rounded border border-border text-zinc-500 hover:text-zinc-300">
+                  Clear
+                </button>
+              </div>
+              {settings.snoozed_until && Date.parse(settings.snoozed_until) > Date.now() && (
+                <div className="text-[10px] text-amber-400 mt-1">
+                  Snoozed until {new Date(settings.snoozed_until).toLocaleString("en-IN")}
+                </div>
+              )}
+            </div>
+
+            {((settings.muted_symbols?.length ?? 0) > 0 || (settings.muted_signal_types?.length ?? 0) > 0) && (
+              <div>
+                <label className="text-xs text-zinc-400 block mb-1">Muted</label>
+                <div className="flex flex-wrap gap-1">
+                  {(settings.muted_symbols ?? []).map((s) => (
+                    <button key={`sym-${s}`} onClick={() => set("muted_symbols", (settings.muted_symbols ?? []).filter((x) => x !== s))}
+                      className="text-[10px] px-1.5 py-0.5 rounded border border-zinc-700 text-zinc-300 hover:border-loss hover:text-loss">
+                      {s} ×
+                    </button>
+                  ))}
+                  {(settings.muted_signal_types ?? []).map((t) => (
+                    <button key={`type-${t}`} onClick={() => set("muted_signal_types", (settings.muted_signal_types ?? []).filter((x) => x !== t))}
+                      className="text-[10px] px-1.5 py-0.5 rounded border border-zinc-700 text-zinc-300 hover:border-loss hover:text-loss">
+                      {t} ×
+                    </button>
+                  ))}
+                </div>
+                <div className="flex items-center gap-2 mt-1">
+                  <button onClick={clearMutes} className="text-[10px] text-zinc-500 hover:text-zinc-300">Clear all mutes</button>
+                  <span className="text-zinc-700">·</span>
+                  <button
+                    onClick={applyRecommendedMutes}
+                    className="text-[10px] text-amber-400 hover:text-amber-200"
+                    title="Mute signal types that lost money in the internal backtest"
+                  >
+                    Apply recommended (backtest-based)
+                  </button>
+                </div>
+              </div>
+            )}
+            {!((settings.muted_symbols?.length ?? 0) > 0 || (settings.muted_signal_types?.length ?? 0) > 0) && (
+              <button
+                onClick={applyRecommendedMutes}
+                className="text-[10px] text-amber-400 hover:text-amber-200"
+                title="Mute signal types that lost money in the internal backtest"
+              >
+                Apply recommended mutes (5 backtest losers)
+              </button>
+            )}
+          </div>
+        </section>
+
+        {/* Telegram forwarding */}
+        <section>
+          <h3 className="text-xs font-semibold text-zinc-400 uppercase tracking-wider mb-2">Telegram (optional)</h3>
+          <div className="space-y-2">
+            <p className="text-[10px] text-zinc-600 leading-relaxed">
+              Forward high-strength signals to your Telegram. Create a bot via @BotFather, get your chat_id from @userinfobot.
+            </p>
+            <input
+              type="password"
+              placeholder="Bot token"
+              value={settings.telegram_bot_token ?? ""}
+              onChange={(e) => set("telegram_bot_token", e.target.value)}
+              className="w-full bg-zinc-800 border border-border rounded px-2 py-1.5 text-xs text-zinc-100"
+            />
+            <input
+              type="text"
+              placeholder="Chat ID"
+              value={settings.telegram_chat_id ?? ""}
+              onChange={(e) => set("telegram_chat_id", e.target.value)}
+              className="w-full bg-zinc-800 border border-border rounded px-2 py-1.5 text-xs text-zinc-100"
+            />
+            <div>
+              <label className="text-xs text-zinc-400 block mb-1">Min strength to forward</label>
+              <input
+                type="range" min={5} max={10}
+                value={settings.telegram_min_strength ?? 8}
+                onChange={(e) => set("telegram_min_strength", Number(e.target.value))}
+                className="w-full accent-brand"
+              />
+              <div className="text-[10px] text-zinc-500">≥ {settings.telegram_min_strength ?? 8}/10</div>
+            </div>
+          </div>
+        </section>
+
+        {/* Appearance */}
+        <section>
+          <h3 className="text-xs font-semibold text-zinc-400 uppercase tracking-wider mb-2">Appearance</h3>
+          <div>
+            <label className="text-xs text-zinc-400 block mb-1">Theme</label>
+            <div className="flex gap-1">
+              {(["dark", "light"] as const).map((t) => (
+                <button
+                  key={t}
+                  onClick={() => set("theme", t)}
+                  className={`flex-1 py-1.5 text-xs rounded border capitalize ${
+                    (settings.theme ?? "dark") === t
+                      ? "bg-brand text-white border-brand"
+                      : "border-border text-zinc-400 hover:text-zinc-200"
+                  }`}
+                >
+                  {t}
+                </button>
+              ))}
+            </div>
+          </div>
+        </section>
+
+        {/* Data — import/export */}
+        <section>
+          <h3 className="text-xs font-semibold text-zinc-400 uppercase tracking-wider mb-2">Data</h3>
+          <div className="flex gap-1.5">
+            <button onClick={exportSettings}
+              className="flex-1 text-[11px] py-1.5 rounded border border-border text-zinc-300 hover:text-zinc-100">
+              Export settings (no secrets)
+            </button>
+            <label className="flex-1 text-[11px] text-center py-1.5 rounded border border-border text-zinc-300 hover:text-zinc-100 cursor-pointer">
+              Import JSON
+              <input type="file" accept=".json,application/json" className="hidden"
+                onChange={(e) => { const f = e.target.files?.[0]; if (f) importSettings(f); }} />
+            </label>
+          </div>
+          {importMsg && <div className="text-[10px] text-zinc-400 mt-1">{importMsg}</div>}
         </section>
 
         {/* Backend URL */}

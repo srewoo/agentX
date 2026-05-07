@@ -8,7 +8,17 @@ const DEFAULTS: Partial<AppSettings> = {
   risk_mode: "balanced",
   signal_types: ["intraday", "swing", "long_term"],
   llm_provider: "gemini",
-  llm_model: "gemini-2.0-flash",
+  llm_model: "gemini-3.1-flash",
+  // Advisor-mode defaults — Van Tharp 1% risk, ATR×1.5 stop, ATR×3 target (1:2 R:R),
+  // 0.5% round-trip cost (typical retail discount-broker brokerage + STT + slippage),
+  // and regime-aware filtering on by default.
+  capital: 100000,
+  risk_per_trade_pct: 1.0,
+  atr_sl_mult: 1.5,
+  atr_target_mult: 3.0,
+  regime_filter: true,
+  roundtrip_cost_pct: 0.5,
+  dedupe_signals: true,
 };
 
 export function useSettings() {

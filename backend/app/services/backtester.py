@@ -192,6 +192,16 @@ async def run_backtest(
         "total_signals": total_signals,
         "by_signal_type": by_signal_type,
         "overall": overall,
+        # Methodology disclosure — every per-trade PnL above is already net of this cost.
+        # Walk-forward: at bar i we slice df.iloc[:i+1] and recompute technicals + signals
+        # on that slice only (no center=True rolling, no negative shifts), enter at
+        # close[i], evaluate at close[i+w]. No look-ahead bias.
+        "methodology": {
+            "transaction_cost_pct": TRANSACTION_COST_PCT,
+            "walk_forward": True,
+            "entry": "close_of_signal_bar",
+            "eval": "close_of_bar_plus_window",
+        },
     }
 
 

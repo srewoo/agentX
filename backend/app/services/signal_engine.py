@@ -484,9 +484,12 @@ def detect_macd_divergence(
 def _get_signal_weight(signal_type: str, direction: str) -> float:
     """Return dynamic weight for a signal type based on historical win rate.
 
+    Priority order:
+      1. Live performance cache (signal_tracker._performance_cache) — uses
+         the user's actual signal outcomes once enough have been evaluated.
+      2. Static edge table from the 25k-signal internal backtest — used as
+         a cold-start prior so brand-new installs aren't flying blind.
     Weight = win_rate / 50.0, clamped to [0.5, 1.5].
-    Returns 1.0 (neutral) if insufficient data (< _MIN_SIGNAL_SAMPLE signals).
-    This is synchronous — reads from an in-memory cache updated by signal_tracker.
     """
     try:
         from app.services.signal_tracker import _performance_cache  # type: ignore[attr-defined]
@@ -494,6 +497,15 @@ def _get_signal_weight(signal_type: str, direction: str) -> float:
         perf = _performance_cache.get(key)
         if perf and perf.get("total_signals", 0) >= _MIN_SIGNAL_SAMPLE:
             weight = perf["win_rate"] / 50.0
+            return max(0.5, min(1.5, weight))
+    except Exception:
+        pass
+    # Cold-start fallback: static edge table.
+    try:
+        from app.services.signal_edge import get_edge
+        edge = get_edge(signal_type, direction)
+        if edge:
+            weight = edge["win_rate"] / 50.0
             return max(0.5, min(1.5, weight))
     except Exception:
         pass
@@ -645,40 +657,57 @@ def scan_symbol(
                 sig["strength"] = new_strength
 
     # ── Multi-signal confluence detection ────────────────────────────────────
+    # Backtest of 2026-05-07 (25k signals) showed bullish confluence was
+    # net-negative when it stacked correlated chart patterns (cup_and_handle +
+    # double_bottom + inverse_h&s). Fix: require ≥2 distinct *families*
+    # (momentum/divergence/pattern/candle/volatility/volume…) before firing.
+    # This is a deliberate sample-driven change, not a heuristic.
+    from app.services.signal_edge import get_family
+
     bullish_sigs = [s for s in signals if s.get("direction") == "bullish"]
     bearish_sigs = [s for s in signals if s.get("direction") == "bearish"]
 
-    if len(bullish_sigs) >= 2:
-        max_bull_strength = max(s["strength"] for s in bullish_sigs)
-        confluence_strength = min(10, max_bull_strength + len(bullish_sigs) - 1)
-        contributing = [s["signal_type"] for s in bullish_sigs]
-        confluence_sig = _make_signal(
+    def _emit_confluence(sigs: list, direction: str) -> Optional[dict]:
+        if len(sigs) < 2:
+            return None
+        families = {get_family(s["signal_type"]) for s in sigs}
+        if len(families) < 2:
+            # Stacking correlated detectors of the same family — historically
+            # this just amplifies the same bias and lost money in the backtest.
+            return None
+        # Pick best signal per family to keep the contributors diverse.
+        best_per_family: dict[str, dict] = {}
+        for s in sigs:
+            fam = get_family(s["signal_type"])
+            if fam not in best_per_family or s["strength"] > best_per_family[fam]["strength"]:
+                best_per_family[fam] = s
+        contributors = list(best_per_family.values())
+        contributing_types = [s["signal_type"] for s in contributors]
+        max_strength = max(s["strength"] for s in contributors)
+        # Bonus = +1 per *additional family*, not per signal — diversity is the edge.
+        confluence_strength = min(10, max_strength + (len(families) - 1))
+        return _make_signal(
             symbol=symbol,
             signal_type=CONFLUENCE,
-            direction="bullish",
+            direction=direction,
             strength=confluence_strength,
-            reason=f"Multi-signal bullish confluence: {', '.join(contributing)}",
+            reason=f"{direction.title()} confluence across {len(families)} signal families: {', '.join(contributing_types)}",
             risk="Confluence increases probability but not certainty. Manage risk normally.",
             current_price=current_price,
-            metadata={"contributing_signals": contributing, "signal_count": len(bullish_sigs)},
+            metadata={
+                "contributing_signals": contributing_types,
+                "contributing_families": sorted(families),
+                "signal_count": len(contributors),
+                "family_count": len(families),
+            },
         )
-        signals.append(confluence_sig)
 
-    if len(bearish_sigs) >= 2:
-        max_bear_strength = max(s["strength"] for s in bearish_sigs)
-        confluence_strength = min(10, max_bear_strength + len(bearish_sigs) - 1)
-        contributing = [s["signal_type"] for s in bearish_sigs]
-        confluence_sig = _make_signal(
-            symbol=symbol,
-            signal_type=CONFLUENCE,
-            direction="bearish",
-            strength=confluence_strength,
-            reason=f"Multi-signal bearish confluence: {', '.join(contributing)}",
-            risk="Confluence increases probability but not certainty. Manage risk normally.",
-            current_price=current_price,
-            metadata={"contributing_signals": contributing, "signal_count": len(bearish_sigs)},
-        )
-        signals.append(confluence_sig)
+    bullish_conf = _emit_confluence(bullish_sigs, "bullish")
+    if bullish_conf:
+        signals.append(bullish_conf)
+    bearish_conf = _emit_confluence(bearish_sigs, "bearish")
+    if bearish_conf:
+        signals.append(bearish_conf)
 
     # Conflicting signals (both bullish and bearish fire) — reduce all strengths
     if bullish_sigs and bearish_sigs:

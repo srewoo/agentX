@@ -209,26 +209,53 @@ async def nse_market_status() -> Optional[list[dict]]:
 # ── Index data ───────────────────────────────────────────────
 
 def _sync_fetch_index_quote() -> Optional[dict]:
-    """Fetch NIFTY 50 quote from NSE status endpoint."""
+    """Fetch NSE index quotes — broad market + all sectoral indices.
+
+    Uses ``nse.listIndices()`` (returns ~135 indices including all NIFTY
+    sectoral indices) and falls back to the leaner status endpoint when
+    that fails. The frontend's Sectors heatmap relies on receiving the
+    sectoral breakouts, not just NIFTY 50.
+    """
+    result: dict = {}
+    # Primary source: full index list (broad + sectoral + thematic)
+    try:
+        nse = _get_nse()
+        if nse:
+            data = nse.listIndices()
+            for row in (data.get("data") or []) if isinstance(data, dict) else []:
+                name = row.get("index") or row.get("indexSymbol")
+                if not name:
+                    continue
+                result[name] = {
+                    "last": row.get("last"),
+                    "variation": row.get("variation"),
+                    "percentChange": row.get("percentChange"),
+                    "open": row.get("open"),
+                    "high": row.get("high"),
+                    "low": row.get("low"),
+                    "previousClose": row.get("previousClose"),
+                }
+    except Exception as e:
+        logger.debug("NSE listIndices failed: %s", e)
+
+    # Fallback: use the status endpoint for the broad indices we still need
     try:
         statuses = _sync_market_status()
-        if not statuses:
-            return None
-        result = {}
-        for s in statuses:
-            idx_name = s.get("index", "")
-            if idx_name in ("NIFTY 50", "NIFTY BANK", "INDIA VIX"):
-                result[idx_name] = {
-                    "last": s.get("last"),
-                    "variation": s.get("variation"),
-                    "percentChange": s.get("percentChange"),
-                    "marketStatus": s.get("marketStatus"),
-                    "tradeDate": s.get("tradeDate"),
-                }
-        return result
+        if statuses:
+            for s in statuses:
+                idx_name = s.get("index", "")
+                if idx_name and idx_name not in result:
+                    result[idx_name] = {
+                        "last": s.get("last"),
+                        "variation": s.get("variation"),
+                        "percentChange": s.get("percentChange"),
+                        "marketStatus": s.get("marketStatus"),
+                        "tradeDate": s.get("tradeDate"),
+                    }
     except Exception as e:
-        logger.debug("NSE index fetch failed: %s", e)
-        return None
+        logger.debug("NSE status endpoint failed: %s", e)
+
+    return result or None
 
 
 async def nse_fetch_indices() -> Optional[dict]:

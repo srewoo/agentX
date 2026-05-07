@@ -55,47 +55,67 @@ async def health_check():
 
 @router.get("/market/indices")
 async def get_indices():
-    """Get NIFTY 50, NIFTY BANK, INDIA VIX from NSE (fast, no yfinance)."""
+    """Get NIFTY 50, NIFTY BANK, INDIA VIX (NSE) + BSE SENSEX (yfinance)."""
+    import asyncio
+
     cache_key = "market:indices"
     cached = await cache_manager.get(cache_key)
     if cached:
         return cached
 
-    result = {}
+    result: dict = {}
 
-    # Try NSE first (returns NIFTY 50, NIFTY BANK, INDIA VIX from status endpoint)
-    try:
-        nse_data = await nse_fetch_indices()
-        if nse_data:
-            for name, data in nse_data.items():
-                result[name] = {
-                    "symbol": name,
-                    "price": safe_float(data.get("last")),
-                    "change": safe_float(data.get("variation")),
-                    "change_pct": safe_float(data.get("percentChange")),
-                    "market_status": data.get("marketStatus"),
-                }
-    except Exception as e:
-        logger.debug("NSE indices failed: %s", e)
+    async def _from_yf(symbol: str, name: str):
+        """Fetch one index from yfinance and shape it like the NSE rows."""
+        try:
+            df = await async_fetch_history(symbol, period="5d", interval="1d")
+            if df is None or df.empty:
+                return None
+            current = safe_float(df["Close"].iloc[-1])
+            prev = safe_float(df["Close"].iloc[-2]) if len(df) > 1 else None
+            change = round(current - prev, 2) if current and prev else None
+            change_pct = round((change / prev) * 100, 2) if change and prev else None
+            return name, {
+                "symbol": symbol,
+                "price": current,
+                "change": change,
+                "change_pct": change_pct,
+            }
+        except Exception as e:
+            logger.warning("Failed to fetch %s: %s", symbol, e)
+            return None
 
-    # Fallback to yfinance if NSE returned nothing
+    # NSE indices and BSE SENSEX in parallel — SENSEX always comes from yfinance
+    # because NSE's status endpoint doesn't carry it.
+    async def _nse():
+        try:
+            return await nse_fetch_indices()
+        except Exception as e:
+            logger.debug("NSE indices failed: %s", e)
+            return None
+
+    nse_data, sensex = await asyncio.gather(_nse(), _from_yf("^BSESN", "BSE SENSEX"))
+
+    if nse_data:
+        for name, data in nse_data.items():
+            result[name] = {
+                "symbol": name,
+                "price": safe_float(data.get("last")),
+                "change": safe_float(data.get("variation")),
+                "change_pct": safe_float(data.get("percentChange")),
+                "market_status": data.get("marketStatus"),
+            }
+
+    if sensex:
+        sensex_name, sensex_payload = sensex
+        result[sensex_name] = sensex_payload
+
+    # Fallback: NSE failed AND SENSEX yfinance failed → try NIFTY via yfinance
     if not result:
-        for sym, name in [("^NSEI", "NIFTY 50"), ("^BSESN", "BSE SENSEX")]:
-            try:
-                df = await async_fetch_history(sym, period="5d", interval="1d")
-                if df is not None and not df.empty:
-                    current = safe_float(df["Close"].iloc[-1])
-                    prev = safe_float(df["Close"].iloc[-2]) if len(df) > 1 else None
-                    change = round(current - prev, 2) if current and prev else None
-                    change_pct = round((change / prev) * 100, 2) if change and prev else None
-                    result[name] = {
-                        "symbol": sym,
-                        "price": current,
-                        "change": change,
-                        "change_pct": change_pct,
-                    }
-            except Exception as e:
-                logger.warning("Failed to fetch %s: %s", sym, e)
+        nifty = await _from_yf("^NSEI", "NIFTY 50")
+        if nifty:
+            n_name, n_payload = nifty
+            result[n_name] = n_payload
 
     if result:
         await cache_manager.set(cache_key, result, ttl=timedelta(minutes=2))
@@ -172,7 +192,22 @@ async def get_news(limit: int = 20):
 
     try:
         news = await get_market_news(limit=limit)
-        result = {"news": news, "count": len(news)}
+        # Normalize wire shape to match the frontend NewsItem contract.
+        # Internally we use {link, published, sentiment_score, relevance_symbols};
+        # the extension reads {url, published_at, sentiment, symbols}.
+        normalized = [
+            {
+                "title": n.get("title"),
+                "url": n.get("link") or n.get("url"),
+                "source": n.get("source"),
+                "published_at": n.get("published") or n.get("published_at"),
+                "sentiment": n.get("sentiment_score") if n.get("sentiment_score") is not None else n.get("sentiment"),
+                "symbols": n.get("relevance_symbols") or n.get("symbols") or [],
+                "summary": n.get("summary"),
+            }
+            for n in news
+        ]
+        result = {"news": normalized, "count": len(normalized)}
         await cache_manager.set(cache_key, result, ttl=timedelta(minutes=15))
         return result
     except Exception as e:
@@ -183,6 +218,7 @@ async def get_news(limit: int = 20):
 @router.get("/market/context")
 async def get_market_context_summary():
     """Market context summary: FII/DII flows, India VIX, NIFTY regime. Used by the frontend dashboard."""
+    import asyncio
     from app.services.fii_dii import get_fii_dii_data
     from app.services.market_data import get_india_vix
     from app.services.market_regime import detect_market_regime
@@ -198,28 +234,29 @@ async def get_market_context_summary():
         "market_regime": None,
     }
 
-    # FII/DII flows
-    try:
-        fii_data = await get_fii_dii_data()
-        result["fii_dii"] = fii_data
-    except Exception as e:
-        logger.debug("FII/DII fetch failed for context: %s", e)
+    # Run all fetches in parallel with individual timeouts
+    async def _fii():
+        return await asyncio.wait_for(get_fii_dii_data(), timeout=15)
 
-    # India VIX
-    try:
-        vix = await get_india_vix()
-        result["india_vix"] = vix
-    except Exception as e:
-        logger.debug("India VIX fetch failed for context: %s", e)
+    async def _vix():
+        return await asyncio.wait_for(get_india_vix(), timeout=15)
 
-    # Market regime (NIFTY 50)
-    try:
-        nifty_df = await async_fetch_history("^NSEI", period="1y", interval="1d")
+    async def _regime():
+        nifty_df = await asyncio.wait_for(
+            async_fetch_history("^NSEI", period="1y", interval="1d"), timeout=30
+        )
         if nifty_df is not None and not nifty_df.empty and len(nifty_df) >= 200:
-            regime = detect_market_regime(nifty_df)
-            result["market_regime"] = regime
-    except Exception as e:
-        logger.debug("Market regime detection failed: %s", e)
+            return detect_market_regime(nifty_df)
+        return None
+
+    results = await asyncio.gather(_fii(), _vix(), _regime(), return_exceptions=True)
+
+    if not isinstance(results[0], BaseException):
+        result["fii_dii"] = results[0]
+    if not isinstance(results[1], BaseException) and results[1] is not None:
+        result["india_vix"] = results[1]
+    if not isinstance(results[2], BaseException) and results[2] is not None:
+        result["market_regime"] = results[2]
 
     if any(v is not None for v in result.values()):
         await cache_manager.set(cache_key, result, ttl=timedelta(minutes=10))

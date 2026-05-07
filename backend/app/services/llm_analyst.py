@@ -172,8 +172,8 @@ def _build_fallback_chain(
     """
     # Default fallback models per provider (fast + cheap)
     _fallback_defaults: dict[str, tuple[str, str]] = {
-        "openai": ("openai", "gpt-4.1-mini"),
-        "gemini": ("gemini", "gemini-2.0-flash"),
+        "openai": ("openai", "gpt-5-mini"),
+        "gemini": ("gemini", "gemini-3.1-flash"),
         "claude":  ("claude",  "claude-haiku-4-5-20251001"),
     }
 
@@ -256,7 +256,7 @@ async def enrich_signal(
     Returns the summary string, or empty string on failure.
     """
     provider = settings.get("llm_provider", "gemini")
-    model = settings.get("llm_model", "gemini-2.0-flash")
+    model = settings.get("llm_model", "gemini-3.1-flash")
     api_key = _get_api_key(settings, provider)
 
     if not api_key:
@@ -384,7 +384,7 @@ async def run_analysis(
     Returns structured analysis dict.
     """
     provider = settings.get("llm_provider", "gemini")
-    model = settings.get("llm_model", "gemini-2.0-flash")
+    model = settings.get("llm_model", "gemini-3.1-flash")
     api_key = _get_api_key(settings, provider)
 
     # Use provided fundamentals or fetch them (best-effort)

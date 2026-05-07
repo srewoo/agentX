@@ -51,13 +51,26 @@ def _get_finbert():
 
 
 # ---------------------------------------------------------------------------
-# Indian market RSS feeds
+# Indian market RSS feeds — re-verified 2026-05-07. The earlier set
+# (moneycontrol/marketnews.xml, ET /rssfeed/1998036.cms, business-standard/markets-113.xml)
+# all started returning 4xx/5xx; replaced with current working endpoints.
 # ---------------------------------------------------------------------------
 INDIA_RSS_FEEDS = [
-    {"name": "Moneycontrol - Market News", "url": "https://www.moneycontrol.com/rss/marketnews.xml"},
-    {"name": "Economic Times - Markets", "url": "https://economictimes.indiatimes.com/markets/rssfeed/1998036.cms"},
-    {"name": "Business Standard - Markets", "url": "https://www.business-standard.com/rss/markets-113.xml"},
+    {"name": "Moneycontrol Top",        "url": "https://www.moneycontrol.com/rss/MCtopnews.xml"},
+    {"name": "Moneycontrol Business",   "url": "https://www.moneycontrol.com/rss/business.xml"},
+    {"name": "Economic Times Markets",  "url": "https://economictimes.indiatimes.com/markets/stocks/news/rssfeeds/2146842.cms"},
+    {"name": "Livemint Markets",        "url": "https://www.livemint.com/rss/markets"},
+    {"name": "BusinessLine Markets",    "url": "https://www.thehindubusinessline.com/markets/feeder/default.rss"},
+    {"name": "Business Standard",       "url": "https://www.business-standard.com/rss/latest-news-101.rss"},
+    {"name": "NDTV Profit",             "url": "https://feeds.feedburner.com/ndtvprofit-latest"},
 ]
+
+# Browser-style UA — some publishers (Business Standard, Moneycontrol) block
+# obviously-bot user-agents with 403, so we mimic a real browser.
+RSS_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
 
 # ---------------------------------------------------------------------------
 # Keyword lists (used as fallback)
@@ -185,7 +198,7 @@ async def fetch_rss_feed(url: str, source_name: str, timeout: int = 10) -> list[
     if not FEEDPARSER_AVAILABLE:
         return []
     try:
-        feed = feedparser.parse(url, request_headers={"User-Agent": "StockPilot/1.0"})
+        feed = feedparser.parse(url, request_headers={"User-Agent": RSS_USER_AGENT})
         entries = feed.entries[:10]
         if not entries:
             return []
@@ -231,14 +244,32 @@ async def fetch_rss_feed(url: str, source_name: str, timeout: int = 10) -> list[
 # Public API
 # ---------------------------------------------------------------------------
 async def get_market_news(limit: int = 20) -> list[dict[str, Any]]:
-    """Fetch general market news from multiple RSS sources."""
+    """Fetch general market news from multiple RSS sources in parallel.
+
+    Sources are fetched concurrently; failed feeds simply contribute zero
+    articles instead of blocking the whole call. Deduplicated by link.
+    """
     if not FEEDPARSER_AVAILABLE:
         return []
 
+    import asyncio
+    results = await asyncio.gather(
+        *(fetch_rss_feed(f["url"], f["name"]) for f in INDIA_RSS_FEEDS),
+        return_exceptions=True,
+    )
+
     all_articles: list[dict] = []
-    for feed_info in INDIA_RSS_FEEDS:
-        articles = await fetch_rss_feed(feed_info["url"], feed_info["name"])
-        all_articles.extend(articles)
+    seen_links: set[str] = set()
+    for r in results:
+        if isinstance(r, BaseException):
+            continue
+        for art in r:
+            link = art.get("link") or art.get("title")
+            if link and link in seen_links:
+                continue
+            if link:
+                seen_links.add(link)
+            all_articles.append(art)
 
     all_articles.sort(key=lambda x: x.get("published", ""), reverse=True)
 

@@ -8,6 +8,146 @@ const PILL_ID = "stockpilot-pill-root";
 const STORAGE_POS_KEY = "pillPosition";
 const STORAGE_HIDDEN_KEY = "pillHidden";
 
+// ── Ticker detection on supported NSE/BSE-relevant sites ────────────
+interface SiteRule {
+  match: RegExp;
+  /** Returns the detected ticker symbol, or null. */
+  extract: () => string | null;
+}
+
+const SITE_RULES: SiteRule[] = [
+  {
+    // Moneycontrol stock page: /india/stockpricequote/<sector>/<co>/<code>
+    match: /(^|\.)moneycontrol\.com$/i,
+    extract: () => {
+      const t = document.querySelector<HTMLElement>(".inid_name, .nsecp, [data-symbol]");
+      const sym = t?.dataset?.symbol || t?.textContent?.trim();
+      return sym ? sym.toUpperCase().split(/\s+/)[0] : null;
+    },
+  },
+  {
+    // Tickertape: /stocks/<symbol>-<id>
+    match: /(^|\.)tickertape\.in$/i,
+    extract: () => {
+      const m = location.pathname.match(/\/stocks\/([^/?#]+)/i);
+      if (!m) return null;
+      // Last segment of slug is usually the ticker
+      const slug = decodeURIComponent(m[1]);
+      const parts = slug.toUpperCase().split("-");
+      return parts[parts.length - 1] || null;
+    },
+  },
+  {
+    // Screener.in: /company/<SYMBOL>/
+    match: /(^|\.)screener\.in$/i,
+    extract: () => {
+      const m = location.pathname.match(/\/company\/([^/]+)/i);
+      return m ? decodeURIComponent(m[1]).toUpperCase() : null;
+    },
+  },
+  {
+    // TradingView: /symbols/NSE-RELIANCE/ or /chart/?symbol=NSE:RELIANCE
+    match: /(^|\.)tradingview\.com$/i,
+    extract: () => {
+      const path = location.pathname.match(/\/symbols\/(?:NSE|BSE)[-:]([^/?#]+)/i);
+      if (path) return decodeURIComponent(path[1]).toUpperCase();
+      const qs = new URLSearchParams(location.search).get("symbol");
+      if (qs) {
+        const m = qs.match(/(?:NSE|BSE)[:\-](.+)/i);
+        if (m) return m[1].toUpperCase();
+      }
+      return null;
+    },
+  },
+];
+
+function detectedTicker(): string | null {
+  const host = location.hostname;
+  for (const rule of SITE_RULES) {
+    if (rule.match.test(host)) {
+      try { return rule.extract(); } catch { return null; }
+    }
+  }
+  return null;
+}
+
+const PANEL_ID = "agentx-inline-panel";
+
+interface ProxyQuoteResponse {
+  ok: boolean;
+  quote?: { symbol: string; price: number | null; change_pct: number | null; name: string | null };
+  signal?: { direction: string; signal_type: string; strength: number; reason: string } | null;
+  error?: string;
+}
+
+function toggleInlinePanel(shadow: ShadowRoot, anchor: HTMLElement, symbol: string): void {
+  const existing = shadow.getElementById(PANEL_ID);
+  if (existing) { existing.remove(); return; }
+
+  const panel = document.createElement("div");
+  panel.id = PANEL_ID;
+  panel.className = "agentx-panel";
+
+  // Position adjacent to the pill
+  const rect = anchor.getBoundingClientRect();
+  const panelW = 300;
+  const left = Math.max(8, Math.min(window.innerWidth - panelW - 8, rect.left - panelW - 12));
+  const top = Math.max(8, Math.min(window.innerHeight - 200, rect.top));
+  panel.style.left = `${left}px`;
+  panel.style.top = `${top}px`;
+
+  panel.innerHTML = `
+    <div class="agentx-panel-header">
+      <span style="font-weight:600;color:#E4E4E7;">📈 agentX · ${escapeHtml(symbol)}</span>
+      <button class="agentx-close" aria-label="Close">✕</button>
+    </div>
+    <div class="agentx-panel-body">
+      <div class="agentx-panel-loading">Loading…</div>
+    </div>
+  `;
+  shadow.appendChild(panel);
+
+  panel.querySelector(".agentx-close")?.addEventListener("click", () => panel.remove());
+
+  // Fetch via background to avoid CORS / mixed content issues
+  chrome.runtime.sendMessage({ type: "PROXY_QUOTE", symbol }, (res: ProxyQuoteResponse) => {
+    const body = panel.querySelector(".agentx-panel-body");
+    if (!body) return;
+    if (!res || !res.ok) {
+      body.innerHTML = `<div class="agentx-panel-error">${escapeHtml(res?.error || "agentX backend unreachable. Start it via ./start.sh and retry.")}</div>`;
+      return;
+    }
+    const q = res.quote;
+    const sig = res.signal;
+    const stance = sig ? (sig.direction === "bullish" ? "BUY" : sig.direction === "bearish" ? "SELL" : "HOLD") : "—";
+    const stanceClass = stance === "BUY" ? "buy" : stance === "SELL" ? "sell" : stance === "HOLD" ? "hold" : "";
+    const pct = q?.change_pct ?? null;
+    const pctColor = pct == null ? "#71717A" : pct >= 0 ? "#10B981" : "#EF4444";
+    body.innerHTML = `
+      <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:6px;">
+        <div>
+          <div style="font-size:16px;font-weight:700;color:#FAFAFA;">${q?.price != null ? "₹" + q.price.toLocaleString("en-IN") : "—"}</div>
+          <div style="font-size:11px;color:${pctColor};">${pct == null ? "" : (pct >= 0 ? "+" : "") + pct.toFixed(2) + "%"}</div>
+        </div>
+        ${stance !== "—" ? `<span class="agentx-stance ${stanceClass}">${stance}</span>` : ""}
+      </div>
+      ${q?.name ? `<div class="agentx-row"><span class="label">Name</span><span style="color:#A1A1AA;text-align:right;max-width:180px;">${escapeHtml(q.name)}</span></div>` : ""}
+      ${sig ? `<div class="agentx-row"><span class="label">Signal</span><span style="color:#A1A1AA;">${escapeHtml(sig.signal_type)} · ${sig.strength}/10</span></div>` : ""}
+      ${sig?.reason ? `<div style="margin-top:8px;color:#D4D4D8;font-size:11px;line-height:1.5;">${escapeHtml(sig.reason)}</div>` : ""}
+      <button class="agentx-btn">Open in agentX</button>
+    `;
+    body.querySelector(".agentx-btn")?.addEventListener("click", () => {
+      chrome.storage.local.set({ deepLinkTarget: { symbol, ts: Date.now() } });
+      chrome.runtime.sendMessage({ type: "OPEN_POPUP" }).catch(() => {});
+    });
+  });
+}
+
+function escapeHtml(s: string): string {
+  return s.replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c] as string));
+}
+
 function mount(): void {
   if (document.getElementById(PILL_ID)) return;
 
@@ -113,6 +253,81 @@ function createPill(): void {
     }
     .close-btn:hover { background: #EF4444; color: white; border-color: #EF4444; }
     .pill-wrap:hover .close-btn { display: flex; }
+    .pill.has-ticker::after {
+      content: "";
+      position: absolute;
+      bottom: -2px;
+      right: -2px;
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: #10B981;
+      border: 2px solid #18181B;
+    }
+    .agentx-panel {
+      position: fixed;
+      width: 300px;
+      background: #18181B;
+      border: 1px solid #3F3F46;
+      border-radius: 12px;
+      box-shadow: 0 12px 40px rgba(0,0,0,0.5);
+      color: #E4E4E7;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      pointer-events: all;
+      z-index: 2147483646;
+      overflow: hidden;
+    }
+    .agentx-panel-header {
+      padding: 10px 12px;
+      border-bottom: 1px solid #27272A;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 11px;
+    }
+    .agentx-panel-body {
+      padding: 12px;
+      font-size: 12px;
+      line-height: 1.5;
+      max-height: 360px;
+      overflow-y: auto;
+    }
+    .agentx-row { display: flex; justify-content: space-between; padding: 3px 0; font-size: 11px; }
+    .agentx-row .label { color: #71717A; }
+    .agentx-stance {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 6px;
+      font-weight: 700;
+      font-size: 11px;
+    }
+    .agentx-stance.buy { color: #10B981; background: rgba(16,185,129,0.12); border: 1px solid rgba(16,185,129,0.4); }
+    .agentx-stance.sell { color: #EF4444; background: rgba(239,68,68,0.12); border: 1px solid rgba(239,68,68,0.4); }
+    .agentx-stance.hold { color: #F59E0B; background: rgba(245,158,11,0.12); border: 1px solid rgba(245,158,11,0.4); }
+    .agentx-btn {
+      background: #7C3AED;
+      color: white;
+      border: none;
+      border-radius: 6px;
+      padding: 6px 10px;
+      font-size: 11px;
+      font-weight: 600;
+      cursor: pointer;
+      width: 100%;
+      margin-top: 8px;
+    }
+    .agentx-btn:hover { background: #6D28D9; }
+    .agentx-close {
+      background: transparent;
+      border: none;
+      color: #71717A;
+      cursor: pointer;
+      font-size: 14px;
+      padding: 0 4px;
+    }
+    .agentx-close:hover { color: #EF4444; }
+    .agentx-panel-loading { color: #71717A; font-size: 11px; text-align: center; padding: 16px; }
+    .agentx-panel-error { color: #EF4444; font-size: 11px; padding: 8px; }
   `;
   shadow.appendChild(style);
 
@@ -201,15 +416,32 @@ function createPill(): void {
     chrome.storage.local.set({ [STORAGE_POS_KEY]: { x: rect.left, y: rect.top } });
   });
 
-  // Click → open popup (only if not dragged)
+  // Click → if a ticker is detected on this page, toggle inline panel; else open popup
   pill.addEventListener("click", () => {
     if (wasDragged) return;
+    const sym = detectedTicker();
+    if (sym) {
+      toggleInlinePanel(shadow, wrap, sym);
+      return;
+    }
     chrome.runtime.sendMessage({ type: "OPEN_POPUP" }).catch(() => {
       chrome.runtime.sendMessage({ type: "GET_EXTENSION_URL" }).then((res) => {
         if (res?.url) window.open(res.url, "_blank");
       }).catch(() => {});
     });
   });
+
+  // Long-press / right-click on pill → always open the full popup
+  pill.addEventListener("contextmenu", (e) => {
+    e.preventDefault();
+    chrome.storage.local.set({ deepLinkTarget: { symbol: detectedTicker() || "", ts: Date.now() } });
+    chrome.runtime.sendMessage({ type: "OPEN_POPUP" }).catch(() => {});
+  });
+
+  // If a ticker is detected on this page, give the pill a subtle indicator
+  if (detectedTicker()) {
+    pill.classList.add("has-ticker");
+  }
 
   // Close button → hide pill
   closeBtn.addEventListener("click", (e) => {

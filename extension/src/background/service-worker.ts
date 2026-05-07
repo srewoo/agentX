@@ -125,6 +125,27 @@ async function pollSignals(force = false): Promise<void> {
 
       // Notify popup/content scripts of new signals
       chrome.runtime.sendMessage({ type: "SIGNALS_UPDATED", count: unreadCount }).catch(() => {});
+
+      // Forward high-strength signals to Telegram if configured
+      try {
+        const settingsAll = await getSettings() as Record<string, string | number | undefined>;
+        const tgToken = String(settingsAll.telegram_bot_token || "");
+        const tgChat = String(settingsAll.telegram_chat_id || "");
+        const minStrength = Number(settingsAll.telegram_min_strength ?? 8);
+        if (tgToken && tgChat) {
+          for (const sig of trulyNew.filter((s) => s.strength >= minStrength)) {
+            const action = sig.direction === "bullish" ? "BUY" : sig.direction === "bearish" ? "SELL" : "WATCH";
+            const text = `*agentX* ${action} ${sig.symbol} (${sig.strength}/10)\n${sig.reason}${sig.current_price ? `\nPrice: ₹${sig.current_price}` : ""}`;
+            fetch(`https://api.telegram.org/bot${encodeURIComponent(tgToken)}/sendMessage`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ chat_id: tgChat, text, parse_mode: "Markdown" }),
+            }).catch(() => {});
+          }
+        }
+      } catch (tgErr) {
+        console.warn("[agentX SW] Telegram forward failed:", tgErr);
+      }
     }
   } catch (err) {
     if (err instanceof DOMException && err.name === "AbortError") {
@@ -197,11 +218,42 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         return { ok: true };
       }
       case "OPEN_POPUP": {
-        // chrome.action.openPopup() available Chrome 127+ only
-        if (chrome.action.openPopup) {
+        // chrome.action.openPopup() available Chrome 127+ only — may throw on older builds
+        try {
           await (chrome.action as unknown as { openPopup: () => Promise<void> }).openPopup();
-        }
+        } catch { /* unsupported — silently no-op */ }
         return { ok: true };
+      }
+      case "PROXY_QUOTE": {
+        // Content script asks the SW (which has host_permissions) to fetch quote+signal.
+        try {
+          const settings = await getSettings() as Record<string, string>;
+          const baseUrl = settings.backend_url || "http://localhost:8020";
+          const headers: Record<string, string> = { "Content-Type": "application/json" };
+          if (settings.api_key) headers["X-API-Key"] = settings.api_key;
+          const sym = String(message.symbol || "").trim().toUpperCase();
+          if (!sym) return { ok: false, error: "No symbol" };
+
+          const ctrl = new AbortController();
+          const timer = setTimeout(() => ctrl.abort(), 10_000);
+          try {
+            const qRes = await fetch(`${baseUrl}/api/stocks/${encodeURIComponent(sym)}/quote`, { headers, signal: ctrl.signal });
+            if (!qRes.ok) return { ok: false, error: `Quote ${qRes.status}` };
+            const quote = await qRes.json();
+            // Try to find a recent signal for this symbol from cached signals
+            const stored = await getStoredSignals();
+            const sig = stored.find((s) => s.symbol.toUpperCase() === sym && !s.dismissed) || null;
+            return {
+              ok: true,
+              quote: { symbol: quote.symbol, price: quote.price, change_pct: quote.change_pct, name: quote.name },
+              signal: sig ? { direction: sig.direction, signal_type: sig.signal_type, strength: sig.strength, reason: sig.reason } : null,
+            };
+          } finally {
+            clearTimeout(timer);
+          }
+        } catch (e) {
+          return { ok: false, error: e instanceof Error ? e.message : "Proxy fetch failed" };
+        }
       }
       default:
         return null;
@@ -220,6 +272,55 @@ chrome.runtime.onInstalled.addListener(async () => {
   await registerAlarm(interval);
   // Run initial poll immediately
   await pollSignals();
+
+  // Right-click context menu — "Analyze in agentX"
+  try {
+    chrome.contextMenus.removeAll(() => {
+      chrome.contextMenus.create({
+        id: "agentx-analyze-selection",
+        title: 'Analyze "%s" in agentX',
+        contexts: ["selection"],
+      });
+      chrome.contextMenus.create({
+        id: "agentx-open",
+        title: "Open agentX",
+        contexts: ["page"],
+      });
+    });
+  } catch (e) {
+    console.warn("[agentX SW] contextMenus.create failed:", e);
+  }
+});
+
+// Context menu click handler
+chrome.contextMenus?.onClicked.addListener(async (info) => {
+  if (info.menuItemId === "agentx-analyze-selection" && info.selectionText) {
+    const raw = String(info.selectionText).trim().toUpperCase();
+    // Heuristic: extract a likely ticker (alphanum 2-12 chars, allow & and -)
+    const match = raw.match(/^[A-Z][A-Z0-9&-]{1,11}$/) || raw.match(/[A-Z][A-Z0-9&-]{1,11}/);
+    const symbol = match ? match[0] : raw.split(/\s+/)[0];
+    await chrome.storage.local.set({ deepLinkTarget: { symbol, ts: Date.now() } });
+    try { await (chrome.action as unknown as { openPopup: () => Promise<void> }).openPopup(); }
+    catch { /* unsupported on older Chrome — handoff via deepLinkTarget will surface on next popup open */ }
+  } else if (info.menuItemId === "agentx-open") {
+    try { await (chrome.action as unknown as { openPopup: () => Promise<void> }).openPopup(); }
+    catch { /* unsupported */ }
+  }
+});
+
+// Notification click → pin signal id for the popup to consume
+chrome.notifications?.onClicked.addListener(async (notificationId) => {
+  const m = notificationId.match(/^signal-(.+)$/);
+  if (m) {
+    await chrome.storage.local.set({ pinnedSignal: { id: m[1], ts: Date.now() } });
+    // Also extract symbol from stored signals for symbol-deep-link
+    const signals = await getStoredSignals();
+    const sig = signals.find((s) => s.id === m[1]);
+    if (sig) await chrome.storage.local.set({ deepLinkTarget: { symbol: sig.symbol, ts: Date.now() } });
+  }
+  try { await (chrome.action as unknown as { openPopup: () => Promise<void> }).openPopup(); }
+  catch { /* unsupported */ }
+  try { await chrome.notifications.clear(notificationId); } catch { /* ignored */ }
 });
 
 chrome.runtime.onStartup.addListener(async () => {

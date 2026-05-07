@@ -47,17 +47,17 @@ class TestSupportedModels:
     def test_all_providers_present(self):
         assert set(SUPPORTED_MODELS.keys()) == {"openai", "gemini", "claude"}
 
-    def test_openai_contains_gpt41(self):
-        assert "gpt-4.1" in SUPPORTED_MODELS["openai"]
+    def test_openai_contains_gpt5(self):
+        assert "gpt-5" in SUPPORTED_MODELS["openai"]
 
-    def test_gemini_contains_25_flash(self):
-        assert "gemini-2.5-flash" in SUPPORTED_MODELS["gemini"]
+    def test_gemini_contains_31_flash(self):
+        assert "gemini-3.1-flash" in SUPPORTED_MODELS["gemini"]
 
-    def test_claude_contains_opus_46(self):
-        assert "claude-opus-4-6" in SUPPORTED_MODELS["claude"]
+    def test_claude_contains_opus_47(self):
+        assert "claude-opus-4-7" in SUPPORTED_MODELS["claude"]
 
-    def test_claude_contains_sonnet_46(self):
-        assert "claude-sonnet-4-6" in SUPPORTED_MODELS["claude"]
+    def test_claude_contains_sonnet_45(self):
+        assert "claude-sonnet-4-5" in SUPPORTED_MODELS["claude"]
 
     def test_each_provider_has_models(self):
         for provider, models in SUPPORTED_MODELS.items():
@@ -75,18 +75,18 @@ class TestIsOpenAIReasoning:
         assert _is_openai_reasoning("o4-mini")
 
     def test_gpt4o_not_reasoning(self):
-        assert not _is_openai_reasoning("gpt-4o")
+        assert not _is_openai_reasoning("gpt-5")
 
     def test_gpt41_not_reasoning(self):
         assert not _is_openai_reasoning("gpt-4.1")
 
     def test_gpt41_mini_not_reasoning(self):
-        assert not _is_openai_reasoning("gpt-4.1-mini")
+        assert not _is_openai_reasoning("gpt-5-mini")
 
 
 class TestValidateProviderModel:
     def test_valid_openai_model(self):
-        _validate_provider_model("openai", "gpt-4o")  # should not raise
+        _validate_provider_model("openai", "gpt-5")  # should not raise
 
     def test_unknown_provider_raises(self):
         with pytest.raises(ValueError, match="Unknown provider"):
@@ -105,12 +105,12 @@ class TestCallLlmMissingKey:
     @pytest.mark.asyncio
     async def test_empty_key_raises_value_error(self):
         with pytest.raises(ValueError, match="No API key"):
-            await call_llm("openai", "gpt-4o", "", "hello")
+            await call_llm("openai", "gpt-5", "", "hello")
 
     @pytest.mark.asyncio
     async def test_none_key_raises_value_error(self):
         with pytest.raises(ValueError, match="No API key"):
-            await call_llm("openai", "gpt-4o", None, "hello")  # type: ignore
+            await call_llm("openai", "gpt-5", None, "hello")  # type: ignore
 
 
 # ─────────────────────────────────────────────
@@ -126,7 +126,7 @@ class TestCallOpenAI:
 
         with patch("app.services.llm_client.openai") as mock_openai:
             mock_openai.AsyncOpenAI.return_value = mock_client
-            result = await call_llm("openai", "gpt-4o", "key123", "test prompt")
+            result = await call_llm("openai", "gpt-5", "key123", "test prompt")
 
         assert result == '{"result": "ok"}'
 
@@ -138,7 +138,7 @@ class TestCallOpenAI:
 
         with patch("app.services.llm_client.openai") as mock_openai:
             mock_openai.AsyncOpenAI.return_value = mock_client
-            await call_llm("openai", "gpt-4o", "key123", "prompt")
+            await call_llm("openai", "gpt-5", "key123", "prompt")
 
         call_kwargs = mock_client.chat.completions.create.call_args.kwargs
         assert call_kwargs.get("response_format") == {"type": "json_object"}
@@ -194,7 +194,7 @@ class TestCallOpenAI:
         with patch("app.services.llm_client.openai") as mock_openai:
             mock_openai.AsyncOpenAI.return_value = mock_client
             with pytest.raises(RuntimeError, match="OpenAI error"):
-                await call_llm("openai", "gpt-4o", "key123", "prompt")
+                await call_llm("openai", "gpt-5", "key123", "prompt")
 
 
 # ─────────────────────────────────────────────
@@ -225,7 +225,7 @@ class TestCallGemini:
         mock_genai.GenerativeModel.return_value = mock_model
 
         with patch("app.services.llm_client.genai", mock_genai):
-            await call_llm("gemini", "gemini-2.5-flash", "key", "prompt")
+            await call_llm("gemini", "gemini-3.1-flash", "key", "prompt")
 
         mock_model.generate_content_async.assert_called_once()
         mock_model.generate_content.assert_not_called()
@@ -305,7 +305,7 @@ class TestFallbackChain:
             result = await call_llm(
                 "claude", "claude-sonnet-4-6", "key",
                 "prompt",
-                fallback_chain=[("openai", "gpt-4.1-mini", "oai-key")],
+                fallback_chain=[("openai", "gpt-5-mini", "oai-key")],
             )
 
         assert call_count["n"] == 1
@@ -325,7 +325,7 @@ class TestFallbackChain:
             result = await call_llm(
                 "claude", "claude-sonnet-4-6", "claude-key",
                 "prompt",
-                fallback_chain=[("openai", "gpt-4.1-mini", "oai-key")],
+                fallback_chain=[("openai", "gpt-5-mini", "oai-key")],
             )
 
         assert call_count["n"] == 2
@@ -341,7 +341,7 @@ class TestFallbackChain:
                 await call_llm(
                     "claude", "claude-sonnet-4-6", "key",
                     "prompt",
-                    fallback_chain=[("openai", "gpt-4.1-mini", "oai-key")],
+                    fallback_chain=[("openai", "gpt-5-mini", "oai-key")],
                 )
 
     @pytest.mark.asyncio
@@ -368,10 +368,10 @@ class TestFallbackChain:
 
         with patch("app.services.llm_client._dispatch", side_effect=dispatch_impl):
             result = await call_llm(
-                "gemini", "gemini-2.0-flash", "gemini-key",
+                "gemini", "gemini-3.1-flash", "gemini-key",
                 "prompt",
                 fallback_chain=[
-                    ("openai", "gpt-4.1-mini", ""),       # empty key — skip
+                    ("openai", "gpt-5-mini", ""),       # empty key — skip
                     ("claude", "claude-sonnet-4-6", "ckey"),  # should be used
                 ],
             )

@@ -99,8 +99,28 @@ export function getSignalTimeframe(signalType: string, strength: number): "Intra
   return SIGNAL_TIMEFRAME[signalType] ?? "Swing";
 }
 
+// Latest as of 2026-Q2. First entry is the default for fresh installs;
+// flagship models are listed first within each provider.
 export const LLM_MODELS: Record<string, string[]> = {
-  gemini: ["gemini-2.0-flash", "gemini-2.5-flash", "gemini-2.5-pro", "gemini-1.5-pro"],
-  openai: ["gpt-4.1-mini", "gpt-4.1", "gpt-4o", "gpt-4o-mini", "o4-mini", "o3"],
-  claude: ["claude-sonnet-4-6", "claude-haiku-4-5-20251001", "claude-opus-4-6", "claude-3-5-sonnet-20241022"],
+  gemini: [
+    "gemini-3.1-flash",  // default — fast + cheap
+    "gemini-3.1-pro",    // flagship
+    "gemini-3-flash",    // fallback
+    "gemini-2.5-pro",    // legacy
+  ],
+  openai: [
+    "gpt-5-mini",        // default — fast + cheap
+    "gpt-5",             // flagship
+    "gpt-5-nano",        // cheapest
+    "gpt-4.1",           // legacy fallback
+    "gpt-4.1-mini",      // legacy fallback
+    "o4-mini",           // reasoning, budget
+    "o3",                // reasoning legacy
+  ],
+  claude: [
+    "claude-sonnet-4-5",            // default — balanced
+    "claude-opus-4-7",              // flagship
+    "claude-haiku-4-5-20251001",    // fast + cheap
+    "claude-sonnet-4-6",            // legacy fallback
+  ],
 };

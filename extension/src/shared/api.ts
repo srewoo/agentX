@@ -1,5 +1,9 @@
 import { getBackendUrl, getSettings } from "./storage";
-import type { Signal, StockQuote, TechnicalsResponse, AIAnalysisResponse, WatchlistItem, AppSettings, HealthResponse } from "./types";
+import type {
+  Signal, StockQuote, TechnicalsResponse, AIAnalysisResponse, WatchlistItem, AppSettings, HealthResponse,
+  NewsItem, CorporateAction, OptionsAnalysis, BlockDeal, BacktestResult, ScreenerParams, FundamentalsResponse,
+  SignalEdgeResponse,
+} from "./types";
 
 const DEFAULT_TIMEOUT_MS = 30_000; // 30 seconds
 
@@ -57,6 +61,7 @@ export const api = {
     request<{ results: Array<{ symbol: string; name: string; exchange: string }> }>(`/api/stocks/search?q=${encodeURIComponent(q)}`),
   getQuote: (symbol: string) => request<StockQuote>(`/api/stocks/${symbol}/quote`),
   getTechnicals: (symbol: string) => request<TechnicalsResponse>(`/api/stocks/${symbol}/technicals`),
+  getFundamentals: (symbol: string) => request<FundamentalsResponse>(`/api/stocks/${encodeURIComponent(symbol)}/fundamentals`, {}, 45_000),
   getHistory: (symbol: string, period = "6mo", interval = "1d") =>
     request<{ history: Array<{ date: string; o: number; h: number; l: number; c: number; v: number }> }>(
       `/api/stocks/${symbol}/history?period=${period}&interval=${interval}`
@@ -79,7 +84,6 @@ export const api = {
 
   // Market
   getIndices: () => request<Record<string, { symbol: string; price: number; change: number; change_pct: number }>>("/api/market/indices"),
-  getNews: (limit = 20) => request<{ news: unknown[]; count: number }>(`/api/market/news?limit=${limit}`),
   getMarketContext: () => request<{
     fii_dii: { fii_net: number | null; dii_net: number | null; sentiment: string; source: string } | null;
     india_vix: number | null;
@@ -114,4 +118,49 @@ export const api = {
 
   // Manual scan (120s timeout — scan now fetches FII/DII, VIX, delivery volume, RS, etc.)
   triggerScan: () => request<{ signals_found: number; scan_duration_ms: number }>("/api/scan/trigger", { method: "POST" }, 120_000),
+
+  // ── Tier 1/2/3 added bindings ───────────────────────────────────────
+  getNews: (limit = 20) =>
+    request<{ news: NewsItem[]; count: number }>(`/api/market/news?limit=${limit}`),
+  getCorporateActions: () =>
+    request<{ actions: CorporateAction[]; count: number }>("/api/market/actions"),
+  getBlockDeals: () =>
+    request<{ deals: BlockDeal[]; count: number }>("/api/market/block-deals"),
+  getOptionsAnalysis: (symbol: string) =>
+    request<OptionsAnalysis>(`/api/market/options/${encodeURIComponent(symbol)}`),
+
+  // Custom screener (parametric)
+  customScreener: (params: ScreenerParams) => {
+    const qs = new URLSearchParams();
+    Object.entries(params).forEach(([k, v]) => {
+      if (v !== undefined && v !== null && v !== "") qs.set(k, String(v));
+    });
+    return request<{ count: number; results: Array<{ symbol: string; name: string; close: number; change_pct: number; rsi: number | null; volume_ratio: number | null; recommendation: string | null; sector?: string; market_cap?: number }> }>(
+      `/api/screener?${qs.toString()}`
+    );
+  },
+  getScreenerPresets: () =>
+    request<{ presets: Record<string, { label: string; description?: string; params: ScreenerParams }> }>("/api/screener/presets"),
+
+  // Backtest
+  backtest: (symbol: string, period = "1y", evalDays = 5) =>
+    request<BacktestResult>(`/api/backtest/${encodeURIComponent(symbol)}?period=${period}&eval_days=${evalDays}`, { method: "POST" }, 90_000),
+
+  // Performance breakdown by signal type
+  getPerformanceByType: (signalType?: string, direction?: string) => {
+    const qs = new URLSearchParams();
+    if (signalType) qs.set("signal_type", signalType);
+    if (direction) qs.set("direction", direction);
+    const q = qs.toString();
+    return request<{ data: Array<{ signal_type: string; direction: string; total: number; wins: number; win_rate: number; avg_pnl_pct: number }> }>(
+      `/api/performance/by-type${q ? `?${q}` : ""}`
+    );
+  },
+
+  // Per-signal-type edge (static, derived from internal backtest)
+  getSignalEdge: () => request<SignalEdgeResponse>("/api/performance/edge"),
+
+  // Alert history (triggered)
+  getAlertHistory: () =>
+    request<{ alerts: Array<{ id: string; symbol: string; target_price: number; condition: string; triggered_at: string | null; triggered_price: number | null; note: string | null }> }>("/api/alerts/history"),
 };

@@ -10,6 +10,7 @@ from fastapi import APIRouter, HTTPException
 from app.services.data_fetcher import MAJOR_STOCKS, async_fetch_history, get_stock_info
 from app.services.nse_fetcher import nse_fetch_quote
 from app.services.screener import get_all_indian_stocks
+from app.services.fundamentals import get_fundamentals
 from app.services.technicals import (
     compute_fibonacci_levels,
     compute_support_resistance,
@@ -225,3 +226,30 @@ async def get_technicals(symbol: str):
 
     await cache_manager.set(cache_key, result, ttl=timedelta(minutes=30))
     return result
+
+
+@router.get("/{symbol}/fundamentals")
+async def get_stock_fundamentals(symbol: str):
+    """Fundamentals snapshot (PE, ROE, D/E, margins, growth, dividend) + health score."""
+    symbol = sanitize_symbol(symbol)
+    cache_key = make_cache_key("stock:fundamentals", symbol)
+    cached = await cache_manager.get(cache_key)
+    if cached:
+        return cached
+
+    try:
+        data = await get_fundamentals(symbol)
+    except Exception as e:
+        logger.exception("Fundamentals fetch failed for %s: %s", symbol, e)
+        raise HTTPException(status_code=502, detail="Fundamentals unavailable")
+
+    # Attach sector medians for peer-relative comparison.
+    from app.services.sector_medians import get_sector_medians
+    sector = data.get("sector") if isinstance(data, dict) else None
+    medians = get_sector_medians(sector)
+    if medians:
+        data["sector_medians"] = medians
+
+    # Fundamentals don't change intraday — 6h cache.
+    await cache_manager.set(cache_key, data, ttl=timedelta(hours=6))
+    return data

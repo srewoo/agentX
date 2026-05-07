@@ -96,6 +96,8 @@ export interface TechnicalsResponse {
     confidence: number;
     description: string;
   } | null;
+  atr?: number | null;
+  atr_pct?: number | null;
 }
 
 export interface AIAnalysis {
@@ -135,6 +137,212 @@ export interface AppSettings {
   openai_api_key: string;
   gemini_api_key: string;
   claude_api_key: string;
+  // ── added by Tier 1/2/3 buildout ─────────────────────────────────
+  onboarding_complete?: boolean;
+  theme?: "dark" | "light";
+  audio_alerts?: boolean;
+  audio_strength_threshold?: number; // 1-10
+  muted_symbols?: string[];
+  muted_signal_types?: string[];
+  snoozed_until?: string | null; // ISO timestamp; signals suppressed until then
+  telegram_bot_token?: string;
+  telegram_chat_id?: string;
+  telegram_min_strength?: number;
+  encrypt_keys?: boolean; // when true, *_api_key fields are stored as encrypted blobs
+  custom_screener_presets?: CustomScreenerPreset[];
+
+  // ── Advisor mode (ATR-based risk + position sizing + regime + costs) ──
+  /** Trading capital in INR — used for position-size suggestions on signals. */
+  capital?: number;
+  /** Risk per trade as % of capital (default 1.0 = 1% — Van Tharp / Kelly fraction). */
+  risk_per_trade_pct?: number;
+  /** ATR multiplier for stop-loss (default 1.5 — tighter for swing, wider for positional). */
+  atr_sl_mult?: number;
+  /** ATR multiplier for target (default 3.0 — gives 1:2 R:R when SL=1.5). */
+  atr_target_mult?: number;
+  /** When true (default), Dashboard hides regime-incompatible signals. */
+  regime_filter?: boolean;
+  /** Round-trip cost as % of trade value (brokerage + STT + slippage; default 0.5). */
+  roundtrip_cost_pct?: number;
+  /** Collapse signals on the same (symbol, day, direction) into one card (default true). */
+  dedupe_signals?: boolean;
+}
+
+export interface FundamentalsResponse {
+  symbol: string;
+  valuation?: {
+    pe: number | null;
+    forward_pe: number | null;
+    pb: number | null;
+    ps: number | null;
+    ev_ebitda: number | null;
+  };
+  growth?: {
+    revenue_growth: number | null;
+    earnings_growth: number | null;
+    quarterly_earnings_growth: number | null;
+  };
+  profitability?: {
+    roe: number | null;
+    roa: number | null;
+    profit_margin: number | null;
+    operating_margin: number | null;
+    gross_margin: number | null;
+  };
+  financial_health?: {
+    debt_to_equity: number | null;
+    current_ratio: number | null;
+    quick_ratio: number | null;
+    total_debt: number | null;
+    total_cash: number | null;
+  };
+  dividends?: {
+    dividend_yield: number | null;
+    dividend_rate: number | null;
+    payout_ratio: number | null;
+  };
+  ownership?: {
+    insider_pct: number | null;
+    institutional_pct: number | null;
+  };
+  health_score?: number; // 0-10
+  signal?: string; // "Strong Buy" | "Buy" | "Hold" | ...
+  sector?: string;
+  industry?: string;
+  sector_medians?: {
+    pe?: number | null;
+    pb?: number | null;
+    ev_ebitda?: number | null;
+    roe?: number | null;
+    profit_margin?: number | null;
+    operating_margin?: number | null;
+    debt_to_equity?: number | null;
+    revenue_growth?: number | null;
+    earnings_growth?: number | null;
+    dividend_yield?: number | null;
+  };
+}
+
+export interface CustomScreenerPreset {
+  id: string;
+  name: string;
+  params: ScreenerParams;
+  created_at: string;
+}
+
+export interface ScreenerParams {
+  rsi_min?: number;
+  rsi_max?: number;
+  volume_ratio_min?: number;
+  change_pct_min?: number;
+  change_pct_max?: number;
+  market_cap_min?: number;
+  market_cap_max?: number;
+  sector?: string;
+  limit?: number;
+}
+
+// ── New shared types for added features ─────────────────────────────
+export interface NewsItem {
+  title: string;
+  url?: string;
+  source?: string;
+  published_at?: string;
+  sentiment?: number; // -1..1
+  symbols?: string[];
+  summary?: string;
+}
+
+export interface CorporateAction {
+  symbol: string;
+  name?: string;
+  action_type: string; // "Dividend" | "Split" | "Bonus" | "Earnings" | "AGM" etc.
+  ex_date?: string;
+  record_date?: string;
+  details?: string;
+}
+
+export interface OptionsAnalysis {
+  symbol: string;
+  pcr?: number;
+  max_pain?: number;
+  unusual_oi?: Array<{ strike: number; type: "CE" | "PE"; change_oi: number; oi: number }>;
+  sentiment?: string;
+  expiry?: string;
+  spot?: number;
+  error?: string;
+}
+
+export interface BlockDeal {
+  symbol: string;
+  client?: string;
+  qty?: number;
+  price?: number;
+  date?: string;
+  side?: "buy" | "sell";
+}
+
+export interface SignalEdgeRow {
+  signal_type: string;
+  direction: "bullish" | "bearish";
+  family: string;
+  win_rate: number;
+  avg_pnl: number;
+  trades: number;
+}
+
+export interface SignalEdgeResponse {
+  meta: {
+    source: string;
+    period: string;
+    eval_window_days: number;
+    stocks: number;
+    total_signals: number;
+    transaction_cost_pct: number;
+  };
+  recommended_mutes: string[];
+  rows: SignalEdgeRow[];
+}
+
+export interface BacktestResult {
+  symbol: string;
+  total_signals: number;
+  windows: Record<string, { win_rate: number; avg_pnl_pct: number; trades: number }>;
+  by_signal_type?: Array<{ signal_type: string; trades: number; win_rate: number; avg_pnl_pct: number }>;
+  methodology?: {
+    transaction_cost_pct: number;
+    walk_forward: boolean;
+    entry: string;
+    eval: string;
+  };
+}
+
+export interface PaperTrade {
+  id: string;
+  symbol: string;
+  side: "BUY" | "SELL";
+  qty: number;
+  entry_price: number;
+  entry_at: string;
+  signal_id?: string;
+  target?: number;
+  stop_loss?: number;
+  status: "open" | "closed";
+  exit_price?: number;
+  exit_at?: string;
+  notes?: string;
+}
+
+export interface Holding {
+  symbol: string;
+  qty: number;
+  avg_price: number;
+  notes?: string;
+}
+
+export interface WatchlistGroup {
+  symbol: string;
+  group: string;
 }
 
 export interface HealthResponse {

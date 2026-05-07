@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { api } from "../../shared/api";
+import CustomScreener from "../components/CustomScreener";
 
 interface ScreenerResult {
   symbol: string;
@@ -9,7 +10,7 @@ interface ScreenerResult {
   rsi: number | null;
   volume_ratio: number | null;
   recommendation: string | null;
-  dividend_yield: number | null;
+  dividend_yield?: number | null;
 }
 
 const PRESETS = [
@@ -27,10 +28,25 @@ interface ScreenerProps {
 }
 
 export default function Screener({ onSelectSymbol }: ScreenerProps) {
+  const [mode, setMode] = useState<"presets" | "custom">("presets");
   const [activePreset, setActivePreset] = useState<PresetId | null>(null);
   const [results, setResults] = useState<ScreenerResult[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  if (mode === "custom") {
+    return (
+      <div className="flex flex-col h-full">
+        <div className="px-3 pt-2 pb-1.5 border-b border-border flex gap-1.5">
+          <button onClick={() => setMode("presets")} className="text-[10px] font-semibold px-2 py-0.5 rounded-full border text-zinc-500 border-zinc-700 hover:text-zinc-300">Presets</button>
+          <button className="text-[10px] font-semibold px-2 py-0.5 rounded-full border bg-brand/20 text-brand-light border-brand/40">Custom</button>
+        </div>
+        <div className="flex-1 min-h-0">
+          <CustomScreener onSelectSymbol={onSelectSymbol} />
+        </div>
+      </div>
+    );
+  }
 
   const runPreset = async (preset: PresetId) => {
     setActivePreset(preset);
@@ -55,8 +71,14 @@ export default function Screener({ onSelectSymbol }: ScreenerProps) {
 
   return (
     <div className="flex flex-col h-full">
+      {/* Mode tabs */}
+      <div className="px-3 pt-2 pb-1.5 border-b border-border flex gap-1.5">
+        <button className="text-[10px] font-semibold px-2 py-0.5 rounded-full border bg-brand/20 text-brand-light border-brand/40">Presets</button>
+        <button onClick={() => setMode("custom")} className="text-[10px] font-semibold px-2 py-0.5 rounded-full border text-zinc-500 border-zinc-700 hover:text-zinc-300">Custom</button>
+      </div>
+
       {/* Preset buttons */}
-      <div className="px-3 pt-3 pb-2 border-b border-border">
+      <div className="px-3 pt-2 pb-2 border-b border-border">
         <div className="flex gap-1.5 flex-wrap">
           {PRESETS.map((preset) => (
             <button

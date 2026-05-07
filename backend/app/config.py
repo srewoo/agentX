@@ -19,7 +19,7 @@ class Settings(BaseSettings):
 
     # LLM defaults (overridable via /api/settings endpoint)
     default_llm_provider: str = "gemini"
-    default_llm_model: str = "gemini-2.0-flash"
+    default_llm_model: str = "gemini-3.1-flash"
     gemini_api_key: str = ""
     openai_api_key: str = ""
     claude_api_key: str = ""
