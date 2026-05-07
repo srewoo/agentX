@@ -2,7 +2,7 @@ import { getBackendUrl, getSettings } from "./storage";
 import type {
   Signal, StockQuote, TechnicalsResponse, AIAnalysisResponse, WatchlistItem, AppSettings, HealthResponse,
   NewsItem, CorporateAction, OptionsAnalysis, BlockDeal, BacktestResult, ScreenerParams, FundamentalsResponse,
-  SignalEdgeResponse,
+  SignalEdgeResponse, InsightsResponse, BacktestRun,
 } from "./types";
 
 const DEFAULT_TIMEOUT_MS = 30_000; // 30 seconds
@@ -159,6 +159,11 @@ export const api = {
 
   // Per-signal-type edge (static, derived from internal backtest)
   getSignalEdge: () => request<SignalEdgeResponse>("/api/performance/edge"),
+
+  // Autonomous-loop endpoints
+  getInsights: () => request<InsightsResponse>("/api/performance/insights"),
+  getBacktestHistory: (limit = 12) =>
+    request<{ runs: BacktestRun[]; count: number }>(`/api/performance/backtest-history?limit=${limit}`),
 
   // Alert history (triggered)
   getAlertHistory: () =>

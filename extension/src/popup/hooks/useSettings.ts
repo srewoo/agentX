@@ -19,6 +19,9 @@ const DEFAULTS: Partial<AppSettings> = {
   regime_filter: true,
   roundtrip_cost_pct: 0.5,
   dedupe_signals: true,
+  auto_paper_trade: false,
+  auto_paper_min_strength: 8,
+  auto_paper_max_open: 10,
 };
 
 export function useSettings() {

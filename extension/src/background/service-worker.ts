@@ -4,11 +4,13 @@
  * Key MV3 constraint: service workers are EPHEMERAL — they can be killed after
  * 30 seconds of inactivity. Use chrome.alarms for periodic work, never setInterval.
  */
-import { getStoredSignals, setStoredSignals, getLastPollTime, setLastPollTime, getSettings } from "../shared/storage";
-import type { Signal } from "../shared/types";
+import { getStoredSignals, setStoredSignals, getLastPollTime, setLastPollTime, getSettings, getBackendUrl } from "../shared/storage";
+import type { Signal, PaperTrade, AppSettings } from "../shared/types";
 
 const ALARM_NAME = "stockpilot-scan";
+const PAPER_ALARM_NAME = "stockpilot-paper-track";
 const DEFAULT_INTERVAL_MINUTES = 30;
+const PAPER_INTERVAL_MINUTES = 5; // SL/Target check cadence during market hours
 const MAX_SIGNALS = 100;
 
 // ── Market hours ─────────────────────────────────────────────────────────────
@@ -38,6 +40,222 @@ async function registerAlarm(periodMinutes = DEFAULT_INTERVAL_MINUTES): Promise<
     delayInMinutes: 1, // First fire after 1 minute
     periodInMinutes: periodMinutes,
   });
+}
+
+/** Paper-trade tracker alarm — runs whether or not the user has the popup open. */
+async function registerPaperAlarm(): Promise<void> {
+  await chrome.alarms.clear(PAPER_ALARM_NAME);
+  chrome.alarms.create(PAPER_ALARM_NAME, {
+    delayInMinutes: 1,
+    periodInMinutes: PAPER_INTERVAL_MINUTES,
+  });
+}
+
+// ── Auto-paper-trade from incoming signals ───────────────────────────────────
+//
+// Closes the agent loop: high-conviction signals get auto-entered into the
+// paper book with ATR-based SL/Target and Van-Tharp position sizing. The
+// auto-tracker (below) then closes them when SL/Target is hit, building a
+// self-improving performance dataset without any user intervention.
+//
+// Opt-in via Settings.auto_paper_trade. Strength threshold and capital risk
+// are read live each cycle so the user can tune from the UI without restart.
+
+async function autoPaperFromSignals(newSignals: Signal[]): Promise<void> {
+  if (!newSignals.length) return;
+  const settings = (await getSettings()) as Partial<AppSettings>;
+  if (!settings.auto_paper_trade) return;
+
+  const minStrength = Number(settings.auto_paper_min_strength ?? 8);
+  const capital = Number(settings.capital ?? 100000);
+  const riskPct = Number(settings.risk_per_trade_pct ?? 1.0) / 100;
+  const slMult = Number(settings.atr_sl_mult ?? 1.5);
+  const tgtMult = Number(settings.atr_target_mult ?? 3.0);
+  const maxOpen = Number(settings.auto_paper_max_open ?? 10);
+  const mutedSyms = new Set(settings.muted_symbols ?? []);
+  const mutedTypes = new Set(settings.muted_signal_types ?? []);
+
+  // Filter to actionable signals
+  const candidates = newSignals.filter((s) => {
+    if (s.direction === "neutral") return false;
+    if (s.strength < minStrength) return false;
+    if (s.current_price == null || s.current_price <= 0) return false;
+    if (mutedSyms.has(s.symbol.toUpperCase())) return false;
+    if (mutedTypes.has(s.signal_type)) return false;
+    return true;
+  });
+  if (!candidates.length) return;
+
+  // Cap total open positions (portfolio heat protection)
+  const r = await chrome.storage.local.get("paperTrades");
+  const trades = (r.paperTrades as PaperTrade[] | undefined) ?? [];
+  const openCount = trades.filter((t) => t.status === "open").length;
+  let remainingSlots = Math.max(0, maxOpen - openCount);
+  if (remainingSlots === 0) {
+    console.log("[agentX SW] auto-paper: max open reached, skipping");
+    return;
+  }
+
+  // Skip duplicates — never auto-take a second trade on a symbol already open
+  const openSyms = new Set(trades.filter((t) => t.status === "open").map((t) => t.symbol.toUpperCase()));
+  const seenSignalIds = new Set(trades.map((t) => t.signal_id).filter(Boolean));
+
+  const newTrades: PaperTrade[] = [];
+  for (const s of candidates) {
+    if (remainingSlots <= 0) break;
+    if (openSyms.has(s.symbol.toUpperCase())) continue;
+    if (seenSignalIds.has(s.id)) continue;
+
+    // Risk plan — prefer ATR from signal metadata; fall back to 2%-band heuristic
+    const price = s.current_price!;
+    const atrMeta = typeof s.metadata?.atr === "number" ? (s.metadata.atr as number) : null;
+    const riskPerShare = atrMeta != null && atrMeta > 0 ? atrMeta * slMult : price * 0.02 * slMult;
+    const rewardPerShare = atrMeta != null && atrMeta > 0 ? atrMeta * tgtMult : price * 0.02 * tgtMult;
+    const dir = s.direction === "bullish" ? 1 : -1;
+    const stop = price - dir * riskPerShare;
+    const target = price + dir * rewardPerShare;
+    const qty = Math.max(1, Math.floor((capital * riskPct) / riskPerShare));
+
+    newTrades.push({
+      id: crypto.randomUUID(),
+      symbol: s.symbol,
+      side: s.direction === "bearish" ? "SELL" : "BUY",
+      qty,
+      entry_price: price,
+      entry_at: new Date().toISOString(),
+      signal_id: s.id,
+      target,
+      stop_loss: stop,
+      status: "open",
+      notes: `auto-entry · ${s.signal_type} · str ${s.strength}`,
+    });
+    remainingSlots--;
+    openSyms.add(s.symbol.toUpperCase());
+  }
+
+  if (!newTrades.length) return;
+  await chrome.storage.local.set({ paperTrades: [...newTrades, ...trades] });
+  console.log(`[agentX SW] auto-paper: opened ${newTrades.length} positions`);
+
+  // One consolidated notification (Chrome rate-limits per-id notifications)
+  try {
+    const summary = newTrades.slice(0, 3).map((t) => `${t.side} ${t.symbol} qty ${t.qty}`).join(" · ");
+    chrome.notifications.create(`paper-auto-${Date.now()}`, {
+      type: "basic",
+      iconUrl: "/assets/icon-128.png",
+      title: `📒 Auto-paper: ${newTrades.length} new position${newTrades.length > 1 ? "s" : ""}`,
+      message: summary + (newTrades.length > 3 ? ` +${newTrades.length - 3} more` : ""),
+      priority: 1,
+    });
+  } catch { /* notification errors are non-fatal */ }
+}
+
+// ── Paper-trade auto-tracking ────────────────────────────────────────────────
+
+interface QuoteResp { symbol: string; price: number | null; }
+
+async function fetchQuote(baseUrl: string, symbol: string, apiKey: string): Promise<number | null> {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (apiKey) headers["X-API-Key"] = apiKey;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 8_000);
+  try {
+    const res = await fetch(`${baseUrl}/api/stocks/${encodeURIComponent(symbol)}/quote`, { headers, signal: ctrl.signal });
+    if (!res.ok) return null;
+    const j = await res.json() as QuoteResp;
+    return j.price;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Walk every open paper trade. If price has crossed SL or Target, close the
+ * trade with the reason and notify the user. Reads/writes paper trades via
+ * chrome.storage.local directly so this works whether or not the popup is open.
+ *
+ * Triggering rules:
+ *  - BUY  trade: target hit when price ≥ target; stop hit when price ≤ stop_loss.
+ *  - SELL trade: target hit when price ≤ target; stop hit when price ≥ stop_loss.
+ * Trades without target/stop are skipped (manual-only management).
+ */
+async function trackPaperTrades(): Promise<void> {
+  if (!isMarketOpen()) return;
+  try {
+    const r = await chrome.storage.local.get("paperTrades");
+    const trades = (r.paperTrades as PaperTrade[] | undefined) ?? [];
+    const open = trades.filter((t) => t.status === "open" && (t.target != null || t.stop_loss != null));
+    if (open.length === 0) return;
+
+    const baseUrl = await getBackendUrl();
+    const settings = await getSettings() as Record<string, string>;
+    const apiKey = settings.api_key || "";
+
+    // Unique symbols only — coalesce multiple trades on the same ticker
+    const uniqueSymbols = Array.from(new Set(open.map((t) => t.symbol)));
+    const priceBySym = new Map<string, number>();
+
+    // Concurrency-cap fan-out
+    const inflight: Promise<void>[] = [];
+    const cap = 4;
+    let cursor = 0;
+    while (cursor < uniqueSymbols.length || inflight.length > 0) {
+      while (inflight.length < cap && cursor < uniqueSymbols.length) {
+        const sym = uniqueSymbols[cursor++];
+        inflight.push(fetchQuote(baseUrl, sym, apiKey).then((p) => {
+          if (p != null) priceBySym.set(sym, p);
+        }));
+      }
+      if (inflight.length === 0) break;
+      const settled = await Promise.race(inflight.map((p, i) => p.then(() => i)));
+      inflight.splice(settled, 1);
+    }
+
+    // Apply SL/Target rules
+    let closedAny = false;
+    const updated: PaperTrade[] = trades.map((t) => {
+      if (t.status !== "open") return t;
+      const price = priceBySym.get(t.symbol);
+      if (price == null) return t;
+      const dir = t.side === "BUY" ? 1 : -1;
+      const targetHit = t.target != null && (dir === 1 ? price >= t.target : price <= t.target);
+      const stopHit = t.stop_loss != null && (dir === 1 ? price <= t.stop_loss : price >= t.stop_loss);
+      if (!targetHit && !stopHit) return t;
+
+      const reason = targetHit ? "target" : "stop";
+      const exit_price = targetHit ? t.target! : t.stop_loss!;
+      closedAny = true;
+
+      // User-visible notification
+      try {
+        const pnlPct = ((exit_price - t.entry_price) / t.entry_price) * 100 * dir;
+        const verb = reason === "target" ? "🎯 Target hit" : "🛑 Stop hit";
+        chrome.notifications.create(`paper-close-${t.id}`, {
+          type: "basic",
+          iconUrl: "/assets/icon-128.png",
+          title: `${verb} · ${t.symbol}`,
+          message: `${t.side} closed @ ₹${exit_price.toFixed(1)} · ${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(2)}% · qty ${t.qty}`,
+          priority: 2,
+        });
+      } catch { /* ignore notification errors */ }
+
+      return {
+        ...t,
+        status: "closed" as const,
+        exit_price,
+        exit_at: new Date().toISOString(),
+        notes: t.notes ? `${t.notes} · auto-${reason}` : `auto-${reason}`,
+      };
+    });
+
+    if (closedAny) {
+      await chrome.storage.local.set({ paperTrades: updated });
+    }
+  } catch (err) {
+    console.warn("[agentX SW] paper tracker error:", err);
+  }
 }
 
 async function getIntervalFromSettings(): Promise<number> {
@@ -145,6 +363,13 @@ async function pollSignals(force = false): Promise<void> {
         }
       } catch (tgErr) {
         console.warn("[agentX SW] Telegram forward failed:", tgErr);
+      }
+
+      // Auto-paper-trade high-conviction signals (opt-in feedback loop)
+      try {
+        await autoPaperFromSignals(trulyNew);
+      } catch (autoErr) {
+        console.warn("[agentX SW] auto-paper failed:", autoErr);
       }
     }
   } catch (err) {
@@ -270,6 +495,7 @@ chrome.runtime.onInstalled.addListener(async () => {
   console.log("[agentX SW] Installed");
   const interval = await getIntervalFromSettings();
   await registerAlarm(interval);
+  await registerPaperAlarm();
   // Run initial poll immediately
   await pollSignals();
 
@@ -326,10 +552,22 @@ chrome.notifications?.onClicked.addListener(async (notificationId) => {
 chrome.runtime.onStartup.addListener(async () => {
   const interval = await getIntervalFromSettings();
   await registerAlarm(interval);
+  await registerPaperAlarm();
 });
 
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name === ALARM_NAME) {
     await pollSignals();
+  } else if (alarm.name === PAPER_ALARM_NAME) {
+    await trackPaperTrades();
+  }
+});
+
+// Open the paper tab when the user clicks an auto-close notification.
+chrome.notifications?.onClicked.addListener(async (notificationId) => {
+  if (notificationId.startsWith("paper-close-")) {
+    await chrome.storage.local.set({ deepLinkTab: { tab: "tools", sub: "paper", ts: Date.now() } });
+    try { await (chrome.action as unknown as { openPopup: () => Promise<void> }).openPopup(); }
+    catch { /* unsupported */ }
   }
 });

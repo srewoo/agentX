@@ -3,6 +3,7 @@ import SignalCard from "../components/SignalCard";
 import { Disclaimer } from "../components/Disclaimer";
 import TodaysPlan from "../components/TodaysPlan";
 import NewsPanel from "../components/NewsPanel";
+import InsightsCard from "../components/InsightsCard";
 import { useSignals } from "../hooks/useSignals";
 import { useAudioAlerts } from "../hooks/useAudioAlerts";
 import { api } from "../../shared/api";
@@ -320,6 +321,9 @@ export default function Dashboard({ onSelectSymbol }: DashboardProps = {}) {
           )}
         </div>
       )}
+
+      {/* Agent insights — recommendations from the autonomous loop */}
+      <InsightsCard />
 
       {/* Today's plan card */}
       <TodaysPlan

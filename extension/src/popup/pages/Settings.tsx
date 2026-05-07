@@ -238,6 +238,45 @@ export default function Settings() {
               />
             </label>
 
+            <div className="border-t border-border pt-2">
+              <label className="flex items-center justify-between text-xs text-zinc-300">
+                <span>
+                  Autonomous paper trading
+                  <span className="text-[10px] text-zinc-600 block">
+                    Auto-open paper positions on high-strength signals; auto-close on SL/Target every 5 min during market hours
+                  </span>
+                </span>
+                <input
+                  type="checkbox"
+                  checked={!!settings.auto_paper_trade}
+                  onChange={(e) => set("auto_paper_trade", e.target.checked)}
+                  className="accent-brand"
+                />
+              </label>
+              {settings.auto_paper_trade && (
+                <div className="grid grid-cols-2 gap-2 mt-2">
+                  <div>
+                    <label className="text-xs text-zinc-400 block mb-1">Min strength</label>
+                    <input
+                      type="number" min={5} max={10}
+                      value={settings.auto_paper_min_strength ?? 8}
+                      onChange={(e) => set("auto_paper_min_strength", Number(e.target.value))}
+                      className="w-full bg-zinc-800 border border-border rounded px-2 py-1 text-xs text-zinc-100"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-xs text-zinc-400 block mb-1">Max open positions</label>
+                    <input
+                      type="number" min={1} max={50}
+                      value={settings.auto_paper_max_open ?? 10}
+                      onChange={(e) => set("auto_paper_max_open", Number(e.target.value))}
+                      className="w-full bg-zinc-800 border border-border rounded px-2 py-1 text-xs text-zinc-100"
+                    />
+                  </div>
+                </div>
+              )}
+            </div>
+
             <div>
               <label className="text-xs text-zinc-400 block mb-1">Round-trip cost (%)</label>
               <input

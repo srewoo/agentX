@@ -166,6 +166,13 @@ export interface AppSettings {
   roundtrip_cost_pct?: number;
   /** Collapse signals on the same (symbol, day, direction) into one card (default true). */
   dedupe_signals?: boolean;
+
+  /** Autonomous loop: auto-create paper trades from high-strength signals. Off by default. */
+  auto_paper_trade?: boolean;
+  /** Min signal strength to qualify for auto-paper-trade. */
+  auto_paper_min_strength?: number;
+  /** Cap on simultaneous open auto-paper positions (portfolio heat). */
+  auto_paper_max_open?: number;
 }
 
 export interface FundamentalsResponse {
@@ -280,6 +287,44 @@ export interface BlockDeal {
   price?: number;
   date?: string;
   side?: "buy" | "sell";
+}
+
+export type InsightSeverity = "warn" | "good" | "info";
+export type InsightKind = "drift" | "wow" | "recommended_mutes";
+
+export interface Insight {
+  kind: InsightKind;
+  severity: InsightSeverity;
+  title: string;
+  signal_type?: string;
+  direction?: string;
+  live_win_rate?: number;
+  baseline_win_rate?: number;
+  delta_pct?: number;
+  sample_size?: number;
+  signal_types?: string[];
+  current?: { wr: number | null; pnl: number | null; best: string | null; worst: string | null };
+  previous?: { wr: number | null; pnl: number | null };
+  action?: "mute" | "apply_mutes" | null;
+  action_label?: string | null;
+}
+
+export interface InsightsResponse {
+  insights: Insight[];
+  count: number;
+}
+
+export interface BacktestRun {
+  id: number;
+  run_at: string;
+  period: string;
+  eval_window_days: number;
+  stocks_count: number;
+  total_signals: number;
+  avg_pnl_pct: number | null;
+  directional_win_rate: number | null;
+  best_signal_type: string | null;
+  worst_signal_type: string | null;
 }
 
 export interface SignalEdgeRow {
