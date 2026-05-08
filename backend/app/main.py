@@ -117,6 +117,14 @@ async def lifespan(app: FastAPI):
     if seeded:
         logger.info("Dynamic signal weighting active: %d signal types loaded", seeded)
 
+    # Seed the recommendation engine's factor-edge cache too. After the cron
+    # accumulates outcomes this drives the dynamic factor weighting in
+    # `recommendation._score_all`.
+    from app.services.recommendation_tracker import seed_factor_edge_cache
+    factors_seeded = await seed_factor_edge_cache()
+    if factors_seeded:
+        logger.info("Dynamic factor weighting active: %d factors loaded", factors_seeded)
+
     await orchestrator.start()
     logger.info("StockPilot backend ready")
 

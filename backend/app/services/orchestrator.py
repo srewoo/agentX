@@ -579,6 +579,17 @@ async def run_scan_cycle() -> list[dict]:
     except Exception as e:
         logger.warning(f"Signal evaluation failed (non-critical): {e}")
 
+    # Same for recommendation outcomes — the multi-factor engine has its
+    # own self-improvement loop now; same cadence as signal_engine's so the
+    # two paths stay in sync.
+    try:
+        from app.services.recommendation_tracker import evaluate_recommendation_outcomes
+        rec_eval = await evaluate_recommendation_outcomes()
+        if rec_eval.get("evaluated"):
+            logger.info(f"Recommendation evaluation: {rec_eval}")
+    except Exception as e:
+        logger.warning(f"Recommendation evaluation failed (non-critical): {e}")
+
     # Cleanup old signals (non-blocking best-effort)
     try:
         from app.database import cleanup_old_signals

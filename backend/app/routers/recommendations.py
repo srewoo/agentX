@@ -43,6 +43,11 @@ logger = logging.getLogger(__name__)
 
 _MAX_LIMIT = 100
 _DEFAULT_LIMIT = 20
+# How many symbols we actually run the engine over. Each run costs an NSE
+# fetch + yfinance fallback + RS calc; 100 cold = 60s+ on first request.
+# 40 covers the common UI usage (top-N filter <= 40) and the orchestrator's
+# background pass keeps the cache warm for deeper queries.
+_UNIVERSE_PER_REQUEST = 40
 
 
 @router.get("", response_model=RecommendationListResponse)
@@ -57,7 +62,7 @@ async def list_recommendations(
     Filters apply *after* generation so cached entries stay re-usable.
     """
     horizon = _normalize_horizon(horizon)
-    universe = default_universe(limit=_MAX_LIMIT)
+    universe = default_universe(limit=_UNIVERSE_PER_REQUEST)
     started = datetime.now(timezone.utc)
     recs, errors = await generate_batch(universe, horizon=horizon)
 
@@ -88,7 +93,7 @@ async def list_sector_summaries(
 ) -> SectorListResponse:
     """Per-sector average conviction and top picks (top 3 by conviction)."""
     horizon = _normalize_horizon(horizon)
-    universe = default_universe(limit=_MAX_LIMIT)
+    universe = default_universe(limit=_UNIVERSE_PER_REQUEST)
     recs, errors = await generate_batch(universe, horizon=horizon)
 
     by_sector: dict[str, list[Recommendation]] = defaultdict(list)

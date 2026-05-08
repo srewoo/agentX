@@ -3,12 +3,16 @@ import Earnings from "./Earnings";
 import Sectors from "./Sectors";
 import Holdings from "./Holdings";
 import PaperTrades from "./PaperTrades";
+import Screener from "./Screener";
 
 interface Props { onSelectSymbol?: (symbol: string) => void; }
 
-type SubTab = "plan" | "sectors" | "earnings" | "holdings" | "paper";
+type SubTab = "screener" | "sectors" | "earnings" | "holdings" | "paper";
 
 const TABS: Array<{ id: SubTab; label: string; icon: string }> = [
+  // Screener owns the dividend / momentum / value / growth presets — that's
+  // where the legacy "dividend stocks" list lives.
+  { id: "screener", label: "Screener", icon: "📊" },
   { id: "sectors", label: "Sectors", icon: "🗺️" },
   { id: "earnings", label: "Earnings", icon: "📅" },
   { id: "holdings", label: "Holdings", icon: "💼" },
@@ -16,7 +20,7 @@ const TABS: Array<{ id: SubTab; label: string; icon: string }> = [
 ];
 
 export default function Tools({ onSelectSymbol }: Props) {
-  const [tab, setTab] = useState<SubTab>("sectors");
+  const [tab, setTab] = useState<SubTab>("screener");
 
   return (
     <div className="flex flex-col h-full">
@@ -35,6 +39,7 @@ export default function Tools({ onSelectSymbol }: Props) {
         ))}
       </div>
       <div className="flex-1 min-h-0">
+        {tab === "screener" && <Screener onSelectSymbol={onSelectSymbol} />}
         {tab === "sectors" && <Sectors />}
         {tab === "earnings" && <Earnings onSelectSymbol={onSelectSymbol} />}
         {tab === "holdings" && <Holdings onSelectSymbol={onSelectSymbol} />}

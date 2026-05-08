@@ -178,6 +178,47 @@ def _create_llm_usage_sql(dialect: str) -> str:
 
 
 # Backwards-compat constants — preserved so any external import still works.
+CREATE_RECOMMENDATION_OUTCOMES_TABLE = """
+CREATE TABLE IF NOT EXISTS recommendation_outcomes (
+    rec_id TEXT PRIMARY KEY,
+    symbol TEXT NOT NULL,
+    horizon TEXT NOT NULL,
+    action TEXT NOT NULL,           -- BUY / SELL (HOLD/AVOID never tracked)
+    conviction INTEGER NOT NULL,
+    entry REAL NOT NULL,
+    stoploss REAL NOT NULL,
+    target1 REAL NOT NULL,
+    timeframe_days INTEGER NOT NULL,
+    -- JSON-encoded signal contributions ({name, score, weight, ...}).
+    -- Persisting the contributions lets us compute factor edge later
+    -- without re-running the engine.
+    signals_json TEXT NOT NULL,
+    sector TEXT,
+    created_at TEXT NOT NULL,
+    -- Outcome (filled by evaluate_recommendation_outcomes cron):
+    outcome TEXT,                   -- 'win' | 'loss' | 'expired' | NULL
+    exit_price REAL,
+    exit_time TEXT,
+    pnl_pct REAL,
+    evaluated_at TEXT
+);
+"""
+
+CREATE_FACTOR_PERFORMANCE_TABLE = """
+CREATE TABLE IF NOT EXISTS factor_performance (
+    factor TEXT PRIMARY KEY,        -- 'trend' | 'momentum' | ... matches SignalContribution.name
+    -- Edge = mean P&L on recs where the factor's score was >0.3 in the
+    -- direction of the action, vs all directional recs. Updated after
+    -- every _recalculate_factor_performance() pass.
+    total_directional INTEGER DEFAULT 0,
+    aligned_count INTEGER DEFAULT 0,
+    aligned_avg_pnl REAL DEFAULT 0,
+    overall_avg_pnl REAL DEFAULT 0,
+    edge REAL DEFAULT 0,            -- aligned_avg_pnl - overall_avg_pnl
+    updated_at TEXT
+);
+"""
+
 CREATE_BACKTEST_RUNS_TABLE = _create_backtest_runs_sql("sqlite")
 CREATE_BACKTEST_RUNS_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_backtest_runs_run_at ON backtest_runs(run_at DESC);",
@@ -271,6 +312,8 @@ async def _init_db_sqlite() -> None:
         await db.execute(CREATE_SIGNAL_OUTCOMES_TABLE)
         await db.execute(CREATE_SIGNAL_PERFORMANCE_TABLE)
         await db.execute(CREATE_PRICE_ALERTS_TABLE)
+        await db.execute(CREATE_RECOMMENDATION_OUTCOMES_TABLE)
+        await db.execute(CREATE_FACTOR_PERFORMANCE_TABLE)
         await db.execute(_create_backtest_runs_sql("sqlite"))
         await db.execute(_create_llm_usage_sql("sqlite"))
 

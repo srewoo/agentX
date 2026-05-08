@@ -28,9 +28,18 @@ except Exception:
     openai = None  # type: ignore
 
 try:  # pragma: no cover
-    import google.generativeai as genai  # type: ignore
+    # Prefer the new `google.genai` SDK. The legacy `google.generativeai`
+    # package is officially deprecated and no longer receives updates.
+    from google import genai as _new_genai  # type: ignore
+    genai = _new_genai
+    _GENAI_FLAVOR = "new"
 except Exception:
-    genai = None  # type: ignore
+    try:
+        import google.generativeai as genai  # type: ignore
+        _GENAI_FLAVOR = "legacy"
+    except Exception:
+        genai = None  # type: ignore
+        _GENAI_FLAVOR = "none"
 
 try:  # pragma: no cover
     import anthropic  # type: ignore
@@ -494,26 +503,47 @@ async def _call_gemini(
     max_tokens: int,
 ) -> tuple[str, dict]:
     if genai is None:  # pragma: no cover
-        raise RuntimeError("google.generativeai SDK not installed")
-    genai.configure(api_key=api_key)
-    gmodel = genai.GenerativeModel(
-        model_name=model,
-        system_instruction=system_message,
-    )
+        raise RuntimeError("google.genai SDK not installed")
+
+    # Branch by SDK flavor — `google.genai` is the new SDK with
+    # `Client(...).aio.models.generate_content(...)`. The legacy
+    # `google.generativeai` exposes `GenerativeModel(...)` and is deprecated.
+    use_new = _GENAI_FLAVOR == "new"
+    if use_new:
+        client = genai.Client(api_key=api_key)
+        from google.genai import types as genai_types  # type: ignore
+        config = genai_types.GenerateContentConfig(
+            system_instruction=system_message,
+            temperature=0.2,
+            max_output_tokens=max_tokens,
+        )
+    else:
+        genai.configure(api_key=api_key)  # legacy
+        gmodel = genai.GenerativeModel(
+            model_name=model,
+            system_instruction=system_message,
+        )
 
     retryable_types = _gemini_retryable_exc_types()
 
     last_exc: Exception = RuntimeError("Gemini call not attempted")
     for attempt in range(_LLM_MAX_RETRIES + 1):
         try:
-            response = await gmodel.generate_content_async(
-                prompt,
-                generation_config={
-                    "temperature": 0.2,
-                    "max_output_tokens": max_tokens,
-                },
-            )
-            text = response.text.strip()
+            if use_new:
+                response = await client.aio.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                    config=config,
+                )
+            else:
+                response = await gmodel.generate_content_async(
+                    prompt,
+                    generation_config={
+                        "temperature": 0.2,
+                        "max_output_tokens": max_tokens,
+                    },
+                )
+            text = (response.text or "").strip()
             # Gemini exposes usage_metadata with prompt_token_count / candidates_token_count
             um = getattr(response, "usage_metadata", None)
             usage = {

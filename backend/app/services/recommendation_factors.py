@@ -132,6 +132,83 @@ def rs_score(rs_rank: Optional[int]) -> tuple[float, Optional[float], str]:
     return score, float(rs_rank), _direction(score)
 
 
+def news_sentiment_score(articles: list[dict[str, Any]]) -> tuple[float, Optional[float], str]:
+    """Mean sentiment across recent stock-specific news.
+
+    `articles` is the list returned by `get_stock_news(sym)` — each item has
+    a `sentiment_score` in [-1, 1]. Returns 0.0 cleanly when news coverage
+    is thin so we don't penalise unloved smallcaps.
+    """
+    if not articles:
+        return 0.0, None, "neutral"
+    scores = [a.get("sentiment_score") for a in articles if a.get("sentiment_score") is not None]
+    if not scores:
+        return 0.0, None, "neutral"
+    avg = sum(scores) / len(scores)
+    # Saturate around ±0.5 — news sentiment is noisy and shouldn't dominate.
+    s = clip(avg / 0.5)
+    return s, round(avg, 3), _direction(s)
+
+
+def fundamentals_score(fund: Optional[dict[str, Any]]) -> tuple[float, Optional[float], str]:
+    """Quality gate from PE / ROE / D/E. Independent of price action.
+
+    A great-technicals trade in a junk balance-sheet is still risky; this
+    factor pulls conviction down for that case and lifts conviction for
+    technically OK setups in compounders. None means we couldn't fetch any
+    fundamentals (rare since the fallback chain shipped) — score 0.
+    """
+    if not fund:
+        return 0.0, None, "neutral"
+    val = fund.get("valuation") or {}
+    prof = fund.get("profitability") or {}
+    fh = fund.get("financial_health") or {}
+
+    pe = val.get("pe")
+    roe = prof.get("roe")
+    de = fh.get("debt_to_equity")
+
+    score = 0.0
+    if pe is not None:
+        # 10–25 ideal, 25–40 OK, < 5 or > 60 penalised.
+        if 10 <= pe <= 25:
+            score += 0.4
+        elif 25 < pe <= 40:
+            score += 0.1
+        elif pe > 60 or pe <= 0:
+            score -= 0.4
+    if roe is not None:
+        if roe > 0.20:
+            score += 0.4
+        elif roe > 0.12:
+            score += 0.2
+        elif roe < 0:
+            score -= 0.4
+    if de is not None:
+        de_ratio = de / 100.0 if de > 10 else de  # screener ships %, yfinance ships ratio
+        if de_ratio < 0.5:
+            score += 0.2
+        elif de_ratio > 2.0:
+            score -= 0.3
+
+    score = clip(score)
+    # Headline value: composite "fundamental snapshot" — pick PE as the
+    # representative number for the radar tooltip.
+    return score, pe, _direction(score)
+
+
+def weekly_trend_score(weekly_tech: Optional[dict[str, Any]]) -> tuple[float, Optional[float], str]:
+    """Higher-timeframe (weekly) trend confirmation for swing/positional.
+
+    Weekly bars are computed by resampling the daily history. Returns 0
+    when not enough data to form a weekly view (e.g. < 12 weeks).
+    """
+    if not weekly_tech:
+        return 0.0, None, "neutral"
+    s, v, d = trend_score(weekly_tech)
+    return s, v, d
+
+
 def volatility_score(tech: dict[str, Any]) -> tuple[float, Optional[float], str]:
     # ATR % > 5 → very volatile, penalise (we want clean trends, not chop).
     atr_pct = tech.get("atr_pct")
