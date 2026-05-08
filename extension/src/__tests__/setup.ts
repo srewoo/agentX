@@ -67,6 +67,16 @@ const mockChrome = {
     clear: vi.fn(),
     onAlarm: { addListener: vi.fn(), removeListener: vi.fn() },
   },
+  scripting: {
+    executeScript: vi.fn(async () => []),
+  },
+  permissions: {
+    contains: vi.fn(async () => false),
+    request: vi.fn(async () => true),
+  },
+  tabs: {
+    onUpdated: { addListener: vi.fn(), removeListener: vi.fn() },
+  },
 };
 
 // Expose on global

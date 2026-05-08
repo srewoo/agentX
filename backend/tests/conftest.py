@@ -99,6 +99,23 @@ _SCHEMA_STATEMENTS = [
         note TEXT
     );
     """,
+    """
+    CREATE TABLE IF NOT EXISTS llm_usage (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        model TEXT NOT NULL,
+        request_id TEXT,
+        prompt_tokens INTEGER NOT NULL DEFAULT 0,
+        completion_tokens INTEGER NOT NULL DEFAULT 0,
+        cost_usd REAL NOT NULL DEFAULT 0,
+        cost_inr REAL NOT NULL DEFAULT 0,
+        route TEXT,
+        symbol TEXT,
+        success INTEGER NOT NULL DEFAULT 1
+    );
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_llm_usage_ts ON llm_usage(ts DESC);",
     "CREATE INDEX IF NOT EXISTS idx_signals_created ON signals(created_at DESC);",
     "CREATE INDEX IF NOT EXISTS idx_signals_symbol ON signals(symbol);",
     "CREATE INDEX IF NOT EXISTS idx_signals_unread ON signals(read, dismissed);",
@@ -157,6 +174,7 @@ async def db(tmp_db_path: str) -> aiosqlite.Connection:
             "signal_outcomes",
             "signal_performance",
             "price_alerts",
+            "llm_usage",
         ):
             await conn.execute(f"DELETE FROM {table}")
         await conn.commit()

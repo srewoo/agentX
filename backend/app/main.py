@@ -1,5 +1,16 @@
-"""agentX FastAPI application."""
+"""agentX FastAPI application.
+
+NOTE: The in-process rate limiter below (`_rate_buckets`) is only correct
+when the app runs as a SINGLE worker process. Each worker keeps its own
+bucket dict, so with N workers the effective limit is N x configured.
+For multi-worker / multi-replica deployments, replace the bucket store
+with Redis (INCR + EXPIRE) before relying on these limits for abuse
+control. The current limits are best-effort guardrails, not security.
+"""
+from __future__ import annotations
+
 import asyncio
+import ipaddress
 import logging
 import logging.handlers
 import os
@@ -14,10 +25,34 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.config import settings
-from app.database import init_db
+from app.database import init_db, migrate_plaintext_secrets
 from app.services.cache import cache_manager
 from app.services.orchestrator import orchestrator
 from app.routers import signals, watchlist, settings as settings_router, stocks, analysis, market, performance, alerts, screener, backtest
+
+# Newly added routers (integration sweep). Imported defensively so a
+# missing/broken module from another agent doesn't take down the whole app.
+try:
+    from app.routers import portfolio as portfolio_router  # noqa: F401
+except Exception as _portfolio_exc:  # pragma: no cover - import guard
+    portfolio_router = None
+    logging.getLogger(__name__).warning("portfolio router unavailable: %s", _portfolio_exc)
+
+try:
+    from app.routers import llm_usage as llm_usage_router  # noqa: F401
+except Exception as _llm_usage_exc:  # pragma: no cover - import guard
+    llm_usage_router = None
+    logging.getLogger(__name__).warning("llm_usage router unavailable: %s", _llm_usage_exc)
+
+try:
+    from app.routers import recommendations as recommendations_router  # noqa: F401
+except Exception as _rec_exc:  # pragma: no cover - import guard
+    recommendations_router = None
+
+try:
+    from app.routers import stream as stream_router  # noqa: F401
+except Exception as _stream_exc:  # pragma: no cover - import guard
+    stream_router = None
 
 # ── Logging setup: console + rotating file ───────────────────
 _LOG_FORMAT = "%(asctime)s %(levelname)-5s [%(name)s] %(message)s"
@@ -64,6 +99,16 @@ async def lifespan(app: FastAPI):
     # Startup
     logger.info("StockPilot backend starting...")
     await init_db()
+    # Seal any plaintext API keys / tokens still in the settings table.
+    # Idempotent — already-encrypted rows are skipped. Raises
+    # SecretsKeyMissing if no master key is configured outside dev mode.
+    try:
+        sealed = await migrate_plaintext_secrets()
+        if sealed:
+            logger.info("Sealed %d plaintext secret(s) on startup", sealed)
+    except Exception as exc:
+        logger.error("Secrets migration failed: %s", exc)
+        raise
     await cache_manager.connect(settings.redis_url)
 
     # Seed dynamic signal weighting cache from existing performance data
@@ -106,18 +151,32 @@ app.add_middleware(
 
 # --- Rate limiter (in-memory, per-IP) with periodic cleanup ---
 _rate_buckets: dict[str, list[float]] = defaultdict(list)
-_RATE_LIMITS = {
-    "/api/stocks/{symbol}/ai-analysis": (15, 60),   # 15 req/min
-    "/api/scan/trigger": (5, 60),                    # 5 req/min
-    "/api/screener": (20, 60),                       # 20 req/min
-    "/api/backtest/": (60, 60),                       # 60 req/min (backtests are sequential, one per symbol)
-    "default": (120, 60),                            # 120 req/min global
-}
+
+# Ordered route-pattern table. First match wins.
+# Each entry: (bucket_id, prefix, suffix_or_None, limit, window_secs)
+# - prefix: path must start with this (after normalisation)
+# - suffix: if not None, path must also end with it
+# This avoids the previous greedy `pattern in path` bug where any path
+# containing "/api/stocks/" inherited the AI-analysis limit, e.g.
+# `/api/stocks/RELIANCE/technicals` was incorrectly capped at 15/min.
+_ROUTE_RATE_LIMITS: list[tuple[str, str, str | None, int, int]] = [
+    ("ai_analysis",  "/api/stocks/", "/ai-analysis", 15, 60),
+    ("scan_trigger", "/api/scan/trigger", None,       5, 60),
+    ("screener",     "/api/screener",    None,       20, 60),
+    ("backtest",     "/api/backtest/",   None,       60, 60),
+]
+_DEFAULT_RATE_LIMIT = (120, 60)  # 120 req/min global
+
 _request_counter = 0
 _CLEANUP_EVERY_N_REQUESTS = 100
 
 # Request timeout (seconds)
 _REQUEST_TIMEOUT = 60
+
+# Trust X-Forwarded-For only when explicitly opted in. Default: off, so
+# clients can't spoof their IP by setting the header. Enable behind a
+# trusted reverse proxy (nginx, ALB, Cloudflare) that overrides XFF.
+_TRUST_FORWARDED = os.environ.get("TRUST_FORWARDED", "").strip() == "1"
 
 
 def _cleanup_stale_buckets() -> None:
@@ -134,19 +193,75 @@ def _cleanup_stale_buckets() -> None:
         logger.debug("Rate limiter cleanup: removed %d stale buckets", len(stale))
 
 
+def _match_route_limit(path: str) -> tuple[str, int, int]:
+    """Return (bucket_id, limit, window) for the given path.
+
+    Uses ordered prefix+suffix matching so that, e.g., `/api/stocks/X/technicals`
+    does NOT match the `/api/stocks/.../ai-analysis` rule.
+    """
+    for bucket_id, prefix, suffix, limit, window in _ROUTE_RATE_LIMITS:
+        if not path.startswith(prefix):
+            continue
+        if suffix is not None and not path.endswith(suffix):
+            continue
+        return bucket_id, limit, window
+    limit, window = _DEFAULT_RATE_LIMIT
+    return "default", limit, window
+
+
+def _is_public_ip(ip_str: str) -> bool:
+    """True if `ip_str` is a routable public IP. Private/loopback/link-local fail."""
+    try:
+        ip = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return False
+    return not (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
+
+
+def _client_ip(request: Request) -> str:
+    """Extract client IP. Honours X-Forwarded-For only when TRUST_FORWARDED=1
+    is set, picking the leftmost public IP from the chain. Falls back to the
+    direct socket peer (`request.client.host`) otherwise.
+    """
+    if _TRUST_FORWARDED:
+        xff = request.headers.get("x-forwarded-for", "")
+        if xff:
+            for raw in xff.split(","):
+                candidate = raw.strip()
+                if candidate and _is_public_ip(candidate):
+                    return candidate
+    if request.client and request.client.host:
+        return request.client.host
+    return "unknown"
+
+
+def verify_api_key(provided: str | None) -> bool:
+    """Validate an API key against ``settings.api_key`` using a timing-safe
+    comparison. This helper is the single source of truth for API-key auth and
+    is reused by non-HTTP entry points (e.g. WebSocket upgrades) that bypass
+    the HTTP middleware.
+
+    Returns ``True`` when the request should be allowed, ``False`` otherwise.
+
+    Auth is bypassed (returns ``True``) when:
+      * ``settings.api_key`` is empty (single-user / localhost mode), or
+      * the ``AGENTX_DEV`` env var is set to a truthy value.
+    """
+    if os.environ.get("AGENTX_DEV", "").strip() in ("1", "true", "True", "yes"):
+        return True
+    if not settings.api_key:
+        return True
+    if not provided:
+        return False
+    return secrets.compare_digest(provided, settings.api_key)
+
+
 def _check_rate_limit(ip: str, path: str) -> bool:
     """Returns True if request is allowed."""
     _cleanup_stale_buckets()
-    # Match specific path patterns
-    limit, window = _RATE_LIMITS.get("default", (60, 60))
-    for pattern, (l, w) in _RATE_LIMITS.items():
-        if pattern != "default" and pattern.split("{")[0] in path:
-            limit, window = l, w
-            break
-    # Safer key extraction
-    parts = path.strip("/").split("/")
-    bucket_suffix = parts[1] if len(parts) > 1 else path
-    key = f"{ip}:{bucket_suffix}"
+    bucket_id, limit, window = _match_route_limit(path)
+    key = f"{ip}:{bucket_id}"
     now = time.time()
     _rate_buckets[key] = [t for t in _rate_buckets[key] if now - t < window]
     if len(_rate_buckets[key]) >= limit:
@@ -161,7 +276,7 @@ async def request_logging_middleware(request: Request, call_next) -> Response:
     req_id = uuid.uuid4().hex[:8]
     path = request.url.path
     method = request.method
-    client_ip = request.client.host if request.client else "unknown"
+    client_ip = _client_ip(request)
     start = time.time()
 
     # Skip noisy health/docs endpoints from detailed logging
@@ -211,15 +326,13 @@ async def _handle_request(
             headers={"Retry-After": "60"},
         )
 
-    # API key auth (timing-safe comparison)
-    if settings.api_key:
-        provided = request.headers.get("X-API-Key", "")
-        if not secrets.compare_digest(provided, settings.api_key):
-            logger.warning("[%s] Auth failed from %s", req_id, client_ip)
-            return JSONResponse(
-                status_code=401,
-                content={"detail": "Invalid or missing X-API-Key header"},
-            )
+    # API key auth (timing-safe comparison via shared helper)
+    if not verify_api_key(request.headers.get("X-API-Key")):
+        logger.warning("[%s] Auth failed from %s", req_id, client_ip)
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "Invalid or missing X-API-Key header"},
+        )
 
     # Request timeout — prevent hung yfinance/LLM calls from blocking forever
     try:
@@ -243,6 +356,25 @@ app.include_router(performance.router)
 app.include_router(alerts.router)
 app.include_router(screener.router)
 app.include_router(backtest.router)
+
+# Newly added routers
+if portfolio_router is not None:
+    app.include_router(portfolio_router.router)
+if llm_usage_router is not None:
+    app.include_router(llm_usage_router.router)
+if recommendations_router is not None:
+    # Try common naming conventions
+    _r = getattr(recommendations_router, "router", None) or getattr(
+        recommendations_router, "recommendations_router", None
+    )
+    if _r is not None:
+        app.include_router(_r)
+if stream_router is not None:
+    _s = getattr(stream_router, "router", None) or getattr(
+        stream_router, "stream_router", None
+    )
+    if _s is not None:
+        app.include_router(_s)
 
 
 @app.get("/")

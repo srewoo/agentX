@@ -93,11 +93,16 @@ def _extract_fundamentals(info: dict[str, Any]) -> dict[str, Any]:
             "total_debt": total_debt,
             "total_cash": total_cash,
         },
+        # Wire-shape compatible with FundamentalsCard / FundamentalsResponse.
+        # The card reads `dividend_yield` / `dividend_rate`; older callers
+        # still relied on `yield`/`rate`, so we expose both for one release.
         "dividends": {
-            "yield": dividend_yield,
-            "rate": dividend_rate,
+            "dividend_yield": dividend_yield,
+            "dividend_rate": dividend_rate,
             "payout_ratio": payout_ratio,
             "five_yr_avg_yield": five_yr_avg_div_yield,
+            "yield": dividend_yield,
+            "rate": dividend_rate,
         },
         "ownership": {
             "insider_pct": insider_pct,
@@ -205,48 +210,119 @@ _YFINANCE_TIMEOUT = 30  # seconds — prevent yfinance from hanging indefinitely
 
 async def get_fundamentals(symbol: str) -> dict[str, Any]:
     """
-    Extract fundamental data from yfinance for a stock.
-    Returns a dict with fundamental metrics and a health score (0-10).
+    Extract fundamental data for a stock with a layered fallback chain:
+
+      1. yfinance (broadest coverage when Yahoo isn't throttling)
+      2. NSE quote (sector/symbol PE, industry — bulletproof but limited)
+      3. screener.in (full ratio set — primary fallback for ROE / D/E etc.)
+
+    Each later source only fills fields the earlier ones left empty.
+    Returns the canonical fundamentals dict + health score.
     """
     yf_symbol = _resolve_yf_symbol(symbol)
 
     loop = asyncio.get_event_loop()
+    info: dict[str, Any] = {}
+    # Two attempts with a short backoff. Yahoo 429s are transient; a single
+    # retry typically recovers without hammering the upstream further.
+    for attempt in (0, 1):
+        try:
+            info = await asyncio.wait_for(
+                loop.run_in_executor(None, _fetch_info_sync, yf_symbol),
+                timeout=_YFINANCE_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("yfinance info fetch timed out after %ds for %s", _YFINANCE_TIMEOUT, symbol)
+            info = {}
+        if info:
+            break
+        if attempt == 0:
+            await asyncio.sleep(0.8)
+
+    if info:
+        data = _extract_fundamentals(info)
+        score = _compute_health_score(data)
+        signal = _score_to_signal(score)
+        primary: dict[str, Any] = {
+            "symbol": symbol,
+            **data,
+            "sector": info.get("sector"),
+            "industry": info.get("industry"),
+            "health_score": score,
+            "signal": signal,
+            "fundamental_score": score,
+            "fundamental_signal": signal,
+        }
+    else:
+        logger.warning("Empty info dict for %s after retry, falling back", symbol)
+        primary = _empty_result(symbol)
+
+    # ── Fallback chain ────────────────────────────────────────────────
+    # Each fallback runs in a thread so we don't block the event loop.
+    from app.services.fundamentals_fallbacks import (
+        fetch_nse_quote,
+        fetch_screener_in,
+        merge_fundamentals,
+    )
+
+    nse_partial = None
+    screener_partial = None
     try:
-        info = await asyncio.wait_for(
-            loop.run_in_executor(None, _fetch_info_sync, yf_symbol),
-            timeout=_YFINANCE_TIMEOUT,
+        nse_partial = await asyncio.wait_for(
+            loop.run_in_executor(None, fetch_nse_quote, symbol),
+            timeout=10,
         )
-    except asyncio.TimeoutError:
-        logger.warning("yfinance info fetch timed out after %ds for %s", _YFINANCE_TIMEOUT, symbol)
-        return _empty_result(symbol)
+    except Exception as e:
+        logger.debug("nse_quote fallback skipped for %s: %s", symbol, e)
 
+    try:
+        screener_partial = await asyncio.wait_for(
+            loop.run_in_executor(None, fetch_screener_in, symbol),
+            timeout=15,
+        )
+    except Exception as e:
+        logger.debug("screener.in fallback skipped for %s: %s", symbol, e)
+
+    merged = merge_fundamentals(primary, nse_partial, screener_partial)
+
+    # Re-score against merged data — fallbacks may have populated PE / ROE /
+    # growth fields that the original score didn't see.
     if not info:
-        logger.warning("Empty info dict for %s, returning defaults", symbol)
-        return _empty_result(symbol)
+        try:
+            new_score = _compute_health_score(merged)
+            merged["health_score"] = new_score
+            merged["signal"] = _score_to_signal(new_score)
+            merged["fundamental_score"] = new_score
+            merged["fundamental_signal"] = _score_to_signal(new_score)
+        except Exception:
+            pass
+    if any((merged.get(n) or {}) for n in ("valuation", "profitability", "growth")):
+        merged.pop("error", None)
 
-    data = _extract_fundamentals(info)
-    score = _compute_health_score(data)
-    signal = _score_to_signal(score)
-
-    return {
-        "symbol": symbol,
-        **data,
-        "fundamental_score": score,
-        "fundamental_signal": signal,
-    }
+    return merged
 
 
 def _empty_result(symbol: str) -> dict[str, Any]:
-    """Return a zeroed-out fundamentals dict when data is unavailable."""
+    """Return a zeroed-out fundamentals dict when data is unavailable.
+
+    `error` is populated so the UI can distinguish "Yahoo upstream throttled
+    us" from "stock genuinely has no fundamentals" instead of just rendering
+    a wall of em-dashes.
+    """
     return {
         "symbol": symbol,
         "valuation": {"pe": None, "forward_pe": None, "pb": None, "ps": None, "ev_ebitda": None},
         "growth": {"revenue_growth": None, "earnings_growth": None, "quarterly_earnings_growth": None},
         "profitability": {"roe": None, "roa": None, "profit_margin": None, "operating_margin": None, "gross_margin": None},
         "financial_health": {"debt_to_equity": None, "current_ratio": None, "quick_ratio": None, "total_debt": None, "total_cash": None},
-        "dividends": {"yield": None, "rate": None, "payout_ratio": None, "five_yr_avg_yield": None},
+        "dividends": {"dividend_yield": None, "dividend_rate": None, "payout_ratio": None, "five_yr_avg_yield": None, "yield": None, "rate": None},
         "ownership": {"insider_pct": None, "institutional_pct": None},
         "earnings": {"revenue_per_share": None, "trailing_eps": None, "forward_eps": None},
+        "sector": None,
+        "industry": None,
+        "health_score": 0,
+        "signal": "Unavailable",
         "fundamental_score": 0,
         "fundamental_signal": "Poor",
+        "error": "Fundamentals upstream (Yahoo) is currently rate-limiting requests. Try again in a minute.",
     }

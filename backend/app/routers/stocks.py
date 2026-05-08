@@ -230,9 +230,17 @@ async def get_technicals(symbol: str):
 
 @router.get("/{symbol}/fundamentals")
 async def get_stock_fundamentals(symbol: str):
-    """Fundamentals snapshot (PE, ROE, D/E, margins, growth, dividend) + health score."""
+    """Fundamentals snapshot + health score.
+
+    Yahoo / yfinance throttles aggressively, so we (a) cache fresh data 6h,
+    (b) keep a 7-day "last-good" mirror and serve it with `stale=true` when
+    a fresh fetch comes back empty, and (c) preserve the upstream `error`
+    message so the UI shows the cause instead of a wall of em-dashes.
+    """
     symbol = sanitize_symbol(symbol)
     cache_key = make_cache_key("stock:fundamentals", symbol)
+    last_good_key = make_cache_key("stock:fundamentals:lastgood", symbol)
+
     cached = await cache_manager.get(cache_key)
     if cached:
         return cached
@@ -241,7 +249,23 @@ async def get_stock_fundamentals(symbol: str):
         data = await get_fundamentals(symbol)
     except Exception as e:
         logger.exception("Fundamentals fetch failed for %s: %s", symbol, e)
+        last_good = await cache_manager.get(last_good_key)
+        if last_good:
+            last_good["stale"] = True
+            return last_good
         raise HTTPException(status_code=502, detail="Fundamentals unavailable")
+
+    # Detect "empty" response (e.g. Yahoo 429) and serve stale cache instead.
+    is_empty = bool(data.get("error")) or (
+        data.get("valuation", {}).get("pe") is None
+        and data.get("profitability", {}).get("roe") is None
+        and data.get("growth", {}).get("revenue_growth") is None
+    )
+    if is_empty:
+        last_good = await cache_manager.get(last_good_key)
+        if last_good:
+            last_good["stale"] = True
+            return last_good
 
     # Attach sector medians for peer-relative comparison.
     from app.services.sector_medians import get_sector_medians
@@ -250,6 +274,8 @@ async def get_stock_fundamentals(symbol: str):
     if medians:
         data["sector_medians"] = medians
 
-    # Fundamentals don't change intraday — 6h cache.
+    # 6h fresh cache + 7-day last-good mirror.
     await cache_manager.set(cache_key, data, ttl=timedelta(hours=6))
+    if not is_empty:
+        await cache_manager.set(last_good_key, data, ttl=timedelta(days=7))
     return data

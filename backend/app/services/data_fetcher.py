@@ -12,6 +12,7 @@ thread executors. The orchestrator and routers call these functions.
 import asyncio
 import logging
 import random
+import warnings
 from typing import Any
 import pandas as pd
 import yfinance as yf
@@ -79,6 +80,7 @@ def _yfinance_fetch_sync(symbol: str, period: str = "6mo", interval: str = "1d")
 
 
 _YFINANCE_TIMEOUT = 30  # seconds — prevent yfinance from hanging indefinitely
+_YFINANCE_INFO_TIMEOUT = 8  # seconds — `.info` is metadata only; fail fast
 
 
 async def _yfinance_fetch(symbol: str, period: str, interval: str) -> pd.DataFrame:
@@ -139,9 +141,8 @@ async def async_fetch_history(symbol: str, period: str = "6mo", interval: str = 
 
 # ── Stock info ────────────────────────────────────────────────
 
-def get_stock_info(symbol: str) -> dict[str, Any]:
-    """Fetch stock metadata. Tries NSE quote first, yfinance fallback."""
-    # Check MAJOR_STOCKS index first (free, instant)
+def _stock_info_from_major(symbol: str) -> dict[str, Any] | None:
+    """Return cached metadata from MAJOR_STOCKS, or None if unknown."""
     for s in MAJOR_STOCKS:
         if s["symbol"] == symbol:
             return {
@@ -152,19 +153,80 @@ def get_stock_info(symbol: str) -> dict[str, Any]:
                 "market_cap": None,
                 "currency": "INR",
             }
+    return None
 
-    # yfinance fallback for unknown symbols
+
+def _yfinance_info_sync(symbol: str) -> dict[str, Any]:
+    """Sync yfinance `.info` lookup. Returns normalized dict; raises on failure."""
+    yf_sym = symbol if (symbol.startswith("^") or "." in symbol) else f"{symbol}.NS"
+    info = yf.Ticker(yf_sym).info
+    return {
+        "name": info.get("longName", symbol),
+        "sector": info.get("sector", "N/A"),
+        "industry": info.get("industry", "N/A"),
+        "pe_ratio": info.get("trailingPE"),
+        "market_cap": info.get("marketCap"),
+        "currency": info.get("currency", "INR"),
+    }
+
+
+def get_stock_info(symbol: str) -> dict[str, Any]:
+    """Fetch stock metadata. DEPRECATED — sync; blocks the event loop.
+
+    Use :func:`get_stock_info_async` from any async code path. This sync
+    variant is retained only for callers that have not yet migrated.
+    """
+    warnings.warn(
+        "get_stock_info is sync and blocks the event loop; use get_stock_info_async",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    cached = _stock_info_from_major(symbol)
+    if cached is not None:
+        return cached
+
     try:
-        yf_sym = symbol if (symbol.startswith("^") or "." in symbol) else f"{symbol}.NS"
-        info = yf.Ticker(yf_sym).info
-        return {
-            "name": info.get("longName", symbol),
-            "sector": info.get("sector", "N/A"),
-            "industry": info.get("industry", "N/A"),
-            "pe_ratio": info.get("trailingPE"),
-            "market_cap": info.get("marketCap"),
-            "currency": info.get("currency", "INR"),
-        }
+        return _yfinance_info_sync(symbol)
+    except Exception as e:
+        logger.debug("Could not fetch info for %s: %s", symbol, e)
+        return {"name": symbol, "sector": "N/A"}
+
+
+async def get_stock_info_async(
+    symbol: str,
+    *,
+    timeout: float = _YFINANCE_INFO_TIMEOUT,
+) -> dict[str, Any]:
+    """Async stock metadata fetch. NSE-cached entries first, yfinance fallback.
+
+    The yfinance call is offloaded to the default executor and bounded by
+    ``timeout`` seconds (default :data:`_YFINANCE_INFO_TIMEOUT`). On timeout
+    or upstream error a minimal stub ``{"name": symbol, "sector": "N/A"}`` is
+    returned so callers do not need to special-case failures.
+
+    Args:
+        symbol: NSE/BSE ticker (with or without ``.NS`` suffix) or index symbol.
+        timeout: Hard upper bound on the executor call, seconds.
+
+    Returns:
+        Normalized metadata dict — keys: name, sector, industry, pe_ratio,
+        market_cap, currency.
+    """
+    cached = _stock_info_from_major(symbol)
+    if cached is not None:
+        return cached
+
+    loop = asyncio.get_event_loop()
+    try:
+        return await asyncio.wait_for(
+            loop.run_in_executor(None, _yfinance_info_sync, symbol),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "yfinance .info timed out after %.1fs for %s", timeout, symbol,
+        )
+        return {"name": symbol, "sector": "N/A"}
     except Exception as e:
         logger.debug("Could not fetch info for %s: %s", symbol, e)
         return {"name": symbol, "sector": "N/A"}
@@ -240,23 +302,107 @@ async def get_delivery_volume(symbol: str) -> dict[str, Any]:
             "delivered_qty": None, "source": "unavailable"}
 
 
+_NSE_DELIVERY_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.nseindia.com/get-quotes/equity",
+}
+_NSE_HOMEPAGE = "https://www.nseindia.com"
+_NSE_DELIVERY_TIMEOUT = 12.0
+# Module-level session reused across calls so cookies persist between fetches.
+_nse_delivery_session: Any = None
+
+
+def _get_nse_delivery_session() -> Any:
+    """Return a shared `requests.Session` for the delivery endpoint.
+
+    Sessions are reused so NSE cookies (set on the homepage warm-up) survive
+    between calls. Created lazily to avoid importing `requests` at import time.
+    """
+    global _nse_delivery_session
+    if _nse_delivery_session is None:
+        import requests
+
+        _nse_delivery_session = requests.Session()
+        _nse_delivery_session.headers.update(_NSE_DELIVERY_HEADERS)
+    return _nse_delivery_session
+
+
+def _warm_nse_session(session: Any) -> None:
+    """Hit the NSE homepage so the session picks up the anti-bot cookies."""
+    try:
+        session.get(_NSE_HOMEPAGE, timeout=_NSE_DELIVERY_TIMEOUT)
+    except Exception as e:  # pragma: no cover - logged for diagnostics
+        logger.debug("NSE session warm-up failed: %s", e)
+
+
 async def _fetch_nse_delivery(symbol: str) -> dict[str, Any] | None:
-    """Fetch delivery data from NSE API."""
-    import urllib.request
+    """Fetch delivery data from NSE API.
+
+    Uses a shared `requests.Session` warmed against the NSE homepage so anti-
+    bot cookies persist between calls. On a 403 (cookies expired / IP throttle
+    suspected) the session is re-warmed once and the request is retried.
+    Returns ``None`` only after both attempts fail.
+    """
     import json
+
+    import requests
 
     loop = asyncio.get_event_loop()
 
     def _sync_fetch() -> dict[str, Any] | None:
-        url = f"https://www.nseindia.com/api/quote-equity?symbol={symbol}&section=trade_info"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-            "Accept": "application/json",
-            "Referer": "https://www.nseindia.com",
-        }
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read())
+        session = _get_nse_delivery_session()
+        url = (
+            f"https://www.nseindia.com/api/quote-equity"
+            f"?symbol={symbol}&section=trade_info"
+        )
+
+        def _do_request() -> requests.Response:
+            return session.get(url, timeout=_NSE_DELIVERY_TIMEOUT)
+
+        # First attempt — may 403 if cookies are stale.
+        try:
+            resp = _do_request()
+        except requests.RequestException as e:
+            logger.debug("NSE delivery request error for %s: %s", symbol, e)
+            return None
+
+        if resp.status_code == 403:
+            logger.info(
+                "NSE delivery 403 for %s; re-warming session and retrying once",
+                symbol,
+            )
+            _warm_nse_session(session)
+            try:
+                resp = _do_request()
+            except requests.RequestException as e:
+                logger.warning(
+                    "NSE delivery retry request error for %s: %s", symbol, e,
+                )
+                return None
+            if resp.status_code == 403:
+                logger.warning(
+                    "NSE delivery 403 for %s after session warm-up; giving up",
+                    symbol,
+                )
+                return None
+
+        if resp.status_code != 200:
+            logger.debug(
+                "NSE delivery non-200 for %s: %s", symbol, resp.status_code,
+            )
+            return None
+
+        try:
+            data = resp.json()
+        except (ValueError, json.JSONDecodeError) as e:
+            logger.debug("NSE delivery JSON parse failed for %s: %s", symbol, e)
+            return None
 
         # NSE trade_info has securityWiseDP which contains delivery data
         sec_dp = data.get("securityWiseDP", {})
@@ -300,12 +446,18 @@ async def _fetch_nse_delivery(symbol: str) -> dict[str, Any] | None:
 
         return None
 
+    # Two HTTP attempts (warm-up + retry) plus the warm-up GET — be generous.
+    overall_timeout = (_NSE_DELIVERY_TIMEOUT * 2) + _NSE_DELIVERY_TIMEOUT
     try:
         return await asyncio.wait_for(
             loop.run_in_executor(None, _sync_fetch),
-            timeout=12.0,
+            timeout=overall_timeout,
         )
-    except Exception:
+    except asyncio.TimeoutError:
+        logger.warning("NSE delivery fetch timed out for %s", symbol)
+        return None
+    except Exception as e:
+        logger.debug("NSE delivery fetch error for %s: %s", symbol, e)
         return None
 
 

@@ -4,7 +4,7 @@
  * Key MV3 constraint: service workers are EPHEMERAL — they can be killed after
  * 30 seconds of inactivity. Use chrome.alarms for periodic work, never setInterval.
  */
-import { getStoredSignals, setStoredSignals, getLastPollTime, setLastPollTime, getSettings, getBackendUrl } from "../shared/storage";
+import { getStoredSignals, setStoredSignals, getLastPollTime, setLastPollTime, getSettings, getBackendUrl, migrateSensitiveFromSync } from "../shared/storage";
 import type { Signal, PaperTrade, AppSettings } from "../shared/types";
 
 const ALARM_NAME = "stockpilot-scan";
@@ -272,6 +272,124 @@ async function getIntervalFromSettings(): Promise<number> {
   }
 }
 
+// ── Telegram forwarding ──────────────────────────────────────────────────────
+//
+// Sensitive values (telegram_bot_token, telegram_chat_id) are sourced from
+// getSettings() — which routes SENSITIVE_KEYS through chrome.storage.local
+// only. They MUST NEVER be read directly from chrome.storage.sync.
+
+/** Mask a secret for safe debug logging — keeps just enough to identify which key is set. */
+function maskSecret(s: string): string {
+  if (!s) return "";
+  if (s.length <= 6) return "***";
+  return `${s.slice(0, 3)}***${s.slice(-2)}`;
+}
+
+async function forwardSignalsToTelegram(trulyNew: Signal[]): Promise<void> {
+  const settingsAll = (await getSettings()) as Record<string, string | number | undefined>;
+  const tgToken = String(settingsAll.telegram_bot_token || "");
+  const tgChat = String(settingsAll.telegram_chat_id || "");
+  const minStrength = Number(settingsAll.telegram_min_strength ?? 8);
+  if (!tgToken || !tgChat) return;
+
+  const eligible = trulyNew.filter((s) => s.strength >= minStrength);
+  if (eligible.length === 0) return;
+
+  const baseUrl = await getBackendUrl();
+  const apiKey = String(settingsAll.api_key || "");
+
+  // Try backend delivery first (keeps secrets server-side, allows audit logging).
+  let backendOk = false;
+  try {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (apiKey) headers["X-API-Key"] = apiKey;
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 5_000);
+    try {
+      const res = await fetch(`${baseUrl}/api/alerts/test`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          channel: "telegram",
+          signals: eligible.map((s) => ({
+            id: s.id,
+            symbol: s.symbol,
+            direction: s.direction,
+            strength: s.strength,
+            reason: s.reason,
+            current_price: s.current_price,
+          })),
+        }),
+        signal: ctrl.signal,
+      });
+      backendOk = res.ok;
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch {
+    backendOk = false;
+  }
+
+  if (backendOk) {
+    console.log(`[agentX SW] Telegram via backend ok · token=${maskSecret(tgToken)} · n=${eligible.length}`);
+    return;
+  }
+
+  // Backend unreachable — fall back to direct Telegram call.
+  console.warn(`[agentX SW] backend unreachable, direct Telegram fallback · token=${maskSecret(tgToken)}`);
+  for (const sig of eligible) {
+    const action = sig.direction === "bullish" ? "BUY" : sig.direction === "bearish" ? "SELL" : "WATCH";
+    const text = `*agentX* ${action} ${sig.symbol} (${sig.strength}/10)\n${sig.reason}${sig.current_price ? `\nPrice: ₹${sig.current_price}` : ""}`;
+    fetch(`https://api.telegram.org/bot${encodeURIComponent(tgToken)}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: tgChat, text, parse_mode: "Markdown" }),
+    }).catch(() => {});
+  }
+}
+
+// ── Custom-domain runtime injection ──────────────────────────────────────────
+//
+// Power users can add their own finance domains via Settings.custom_content_domains
+// (string[] of host patterns like "https://*.example.com/*"). Because these are
+// not in the manifest, we inject the content script via chrome.scripting at
+// runtime — but only after asking the user to grant the host permission.
+
+async function injectIntoCustomDomains(tabId: number, url: string): Promise<void> {
+  try {
+    const settings = (await getSettings()) as Record<string, unknown>;
+    const customDomains = (settings.custom_content_domains as string[] | undefined) ?? [];
+    if (!customDomains.length) return;
+
+    const matches = customDomains.some((pattern) => {
+      // Convert "https://*.foo.com/*" → RegExp
+      const re = new RegExp(
+        "^" + pattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*") + "$"
+      );
+      return re.test(url);
+    });
+    if (!matches) return;
+
+    // Only inject if we have permission for this origin.
+    const origin = new URL(url).origin + "/*";
+    const granted = await chrome.permissions.contains({ origins: [origin] }).catch(() => false);
+    if (!granted) return;
+
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ["content/mount.js"],
+    });
+  } catch (e) {
+    console.warn("[agentX SW] custom domain injection failed:", e);
+  }
+}
+
+chrome.tabs?.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (changeInfo.status === "complete" && tab.url && /^https?:/.test(tab.url)) {
+    void injectIntoCustomDomains(tabId, tab.url);
+  }
+});
+
 // ── Signal fetching ───────────────────────────────────────────────────────────
 
 async function pollSignals(force = false): Promise<void> {
@@ -344,23 +462,13 @@ async function pollSignals(force = false): Promise<void> {
       // Notify popup/content scripts of new signals
       chrome.runtime.sendMessage({ type: "SIGNALS_UPDATED", count: unreadCount }).catch(() => {});
 
-      // Forward high-strength signals to Telegram if configured
+      // Forward high-strength signals to Telegram if configured.
+      // Secrets come from getSettings() which reads sensitive keys from
+      // chrome.storage.local only (never sync). Prefer backend delivery
+      // via /api/alerts/test; fall back to direct Telegram only when the
+      // backend is unreachable.
       try {
-        const settingsAll = await getSettings() as Record<string, string | number | undefined>;
-        const tgToken = String(settingsAll.telegram_bot_token || "");
-        const tgChat = String(settingsAll.telegram_chat_id || "");
-        const minStrength = Number(settingsAll.telegram_min_strength ?? 8);
-        if (tgToken && tgChat) {
-          for (const sig of trulyNew.filter((s) => s.strength >= minStrength)) {
-            const action = sig.direction === "bullish" ? "BUY" : sig.direction === "bearish" ? "SELL" : "WATCH";
-            const text = `*agentX* ${action} ${sig.symbol} (${sig.strength}/10)\n${sig.reason}${sig.current_price ? `\nPrice: ₹${sig.current_price}` : ""}`;
-            fetch(`https://api.telegram.org/bot${encodeURIComponent(tgToken)}/sendMessage`, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ chat_id: tgChat, text, parse_mode: "Markdown" }),
-            }).catch(() => {});
-          }
-        }
+        await forwardSignalsToTelegram(trulyNew);
       } catch (tgErr) {
         console.warn("[agentX SW] Telegram forward failed:", tgErr);
       }
@@ -493,6 +601,12 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
 chrome.runtime.onInstalled.addListener(async () => {
   console.log("[agentX SW] Installed");
+  // One-time migration: pull any sensitive keys out of sync into local.
+  try {
+    await migrateSensitiveFromSync();
+  } catch (e) {
+    console.warn("[agentX SW] sensitive-key migration failed:", e);
+  }
   const interval = await getIntervalFromSettings();
   await registerAlarm(interval);
   await registerPaperAlarm();

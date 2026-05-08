@@ -228,6 +228,7 @@ export interface FundamentalsResponse {
     earnings_growth?: number | null;
     dividend_yield?: number | null;
   };
+  error?: string;
 }
 
 export interface CustomScreenerPreset {

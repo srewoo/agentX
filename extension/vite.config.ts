@@ -32,6 +32,11 @@ function copyExtensionFiles() {
 export default defineConfig({
   plugins: [react(), copyExtensionFiles()],
   root: resolve(__dirname, "src"),
+  resolve: {
+    alias: {
+      "@": resolve(__dirname, "src/popup"),
+    },
+  },
   build: {
     outDir: resolve(__dirname, "dist"),
     emptyOutDir: true,

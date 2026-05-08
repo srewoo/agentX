@@ -107,6 +107,10 @@ do_start() {
   install_deps
   ensure_env
 
+  # Local-dev default: auto-generate a Fernet master key under ~/.agentx/secrets.key
+  # if AGENTX_SECRETS_KEY isn't already set. Override by exporting either var.
+  export AGENTX_DEV="${AGENTX_DEV:-1}"
+
   log "Starting agentX backend on http://localhost:$PORT ..."
   log "API docs: http://localhost:$PORT/docs"
   log "Health:   http://localhost:$PORT/api/health"

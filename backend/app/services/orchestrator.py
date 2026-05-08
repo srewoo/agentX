@@ -12,6 +12,7 @@ Architecture rules enforced here:
 import asyncio
 import json
 import logging
+from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
 
@@ -44,9 +45,31 @@ logger = logging.getLogger(__name__)
 # IST timezone offset
 IST = timezone(timedelta(hours=5, minutes=30))
 
-# State shared between orchestrator and API routes
+# State shared between orchestrator and API routes.
+#
+# `_ScanState` wraps the scan-cycle state in a dataclass guarded by an
+# `asyncio.Lock` so concurrent scan triggers cannot race on the writes at the
+# end of `run_scan_cycle`. The module-level `last_scan_time` /
+# `last_scan_signal_count` names are kept as read-only mirrors of the state
+# for existing importers (e.g. `app.routers.market`).
+@dataclass
+class _ScanState:
+    """Mutable scan-cycle state shared across scan triggers."""
+
+    last_scan_time: Optional[str] = None
+    last_scan_signal_count: int = 0
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+
+_scan_state = _ScanState()
 last_scan_time: Optional[str] = None
 last_scan_signal_count: int = 0
+
+
+# Concurrency cap for the weekly backtest fan-out. Tuned to keep yfinance /
+# NSE rate limits happy while still finishing ~50 symbols in reasonable time.
+_BACKTEST_CONCURRENCY = 5
+_BACKTEST_PER_SYMBOL_TIMEOUT = 30.0  # seconds — backtests that exceed this are skipped
 
 # Track symbols that consistently fail — skip them to avoid wasting time
 _bad_symbol_strikes: dict[str, int] = {}  # symbol → consecutive failure count
@@ -526,8 +549,14 @@ async def run_scan_cycle() -> list[dict]:
     await _store_signals(filtered)
 
     elapsed = (datetime.now(timezone.utc) - start_time).total_seconds()
-    last_scan_time = datetime.now(timezone.utc).isoformat()
-    last_scan_signal_count = len(filtered)
+    scan_ts = datetime.now(timezone.utc).isoformat()
+    signal_count = len(filtered)
+    async with _scan_state.lock:
+        _scan_state.last_scan_time = scan_ts
+        _scan_state.last_scan_signal_count = signal_count
+        # Mirror to module globals so existing importers keep working.
+        last_scan_time = scan_ts
+        last_scan_signal_count = signal_count
 
     # Trim bad symbol cache to prevent unbounded growth
     if len(_bad_symbol_strikes) > _BAD_SYMBOL_MAX_CACHE:
@@ -660,24 +689,49 @@ class SignalOrchestrator:
         type_pnl: dict[str, float] = {}
         type_count: dict[str, int] = {}
 
-        for sym in all_syms:
-            try:
-                r = await run_backtest(sym, period="1y", eval_windows=[1, 3, 5, 10])
-                per_symbol.append(r)
-                ov = r.get("overall", {})
-                if ov.get("avg_pnl_5d") is not None:
-                    all_pnl.append(ov["avg_pnl_5d"])
-                # Aggregate per-type
-                for stype, dirs in (r.get("by_signal_type") or {}).items():
-                    for direction, m in dirs.items():
-                        if m.get("is_neutral"): continue
-                        wins = m.get("wins_5d", 0); losses = m.get("losses_5d", 0)
-                        all_wins += wins; all_evaluated += wins + losses
-                        if m.get("avg_pnl_5d") is not None and m.get("total"):
-                            type_pnl[stype] = type_pnl.get(stype, 0.0) + m["avg_pnl_5d"] * m["total"]
-                            type_count[stype] = type_count.get(stype, 0) + m["total"]
-            except Exception as e:
-                logger.debug("Backtest failed for %s: %s", sym, e)
+        # Fan out backtests with bounded concurrency. Each task is wrapped in
+        # `asyncio.wait_for` so a single misbehaving symbol cannot stall the
+        # whole weekly run; results are gathered with `return_exceptions=True`
+        # and aggregated below.
+        sem = asyncio.Semaphore(_BACKTEST_CONCURRENCY)
+
+        async def _run_one(sym: str) -> dict:
+            async with sem:
+                return await asyncio.wait_for(
+                    run_backtest(sym, period="1y", eval_windows=[1, 3, 5, 10]),
+                    timeout=_BACKTEST_PER_SYMBOL_TIMEOUT,
+                )
+
+        tasks = [_run_one(sym) for sym in all_syms]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for sym, r in zip(all_syms, results):
+            if isinstance(r, asyncio.TimeoutError):
+                logger.warning(
+                    "Backtest timed out after %.0fs for %s; skipping",
+                    _BACKTEST_PER_SYMBOL_TIMEOUT, sym,
+                )
+                continue
+            if isinstance(r, BaseException):
+                logger.debug("Backtest failed for %s: %s", sym, r)
+                continue
+
+            per_symbol.append(r)
+            ov = r.get("overall", {})
+            if ov.get("avg_pnl_5d") is not None:
+                all_pnl.append(ov["avg_pnl_5d"])
+            # Aggregate per-type
+            for stype, dirs in (r.get("by_signal_type") or {}).items():
+                for direction, m in dirs.items():
+                    if m.get("is_neutral"):
+                        continue
+                    wins = m.get("wins_5d", 0)
+                    losses = m.get("losses_5d", 0)
+                    all_wins += wins
+                    all_evaluated += wins + losses
+                    if m.get("avg_pnl_5d") is not None and m.get("total"):
+                        type_pnl[stype] = type_pnl.get(stype, 0.0) + m["avg_pnl_5d"] * m["total"]
+                        type_count[stype] = type_count.get(stype, 0) + m["total"]
 
         avg_pnl = round(sum(all_pnl) / len(all_pnl), 4) if all_pnl else 0.0
         win_rate = round(all_wins / all_evaluated * 100, 2) if all_evaluated else 0.0

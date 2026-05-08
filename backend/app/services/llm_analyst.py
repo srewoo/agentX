@@ -443,6 +443,39 @@ async def run_analysis(
     except Exception:
         pass
 
+    # Sanitize ALL technical / S&R / fib / poc values before interpolation.
+    # Numerics: safe_float strips non-numeric junk. Strings (signals, labels):
+    # full _sanitize_for_prompt to neutralise control chars and injection phrases.
+    def _n(v: Any) -> str:  # numeric → "N/A" or stringified float
+        f = safe_float(v)
+        return "N/A" if f is None else str(f)
+
+    def _s(v: Any, max_len: int = 60) -> str:
+        return _sanitize_for_prompt(v, max_len=max_len)
+
+    rsi_v = _n(technicals.get("rsi"))
+    rsi_signal_v = _s(technicals.get("rsi_signal"))
+    adx_v = _n(technicals.get("adx"))
+    macd_line_v = _n(macd.get("macd_line"))
+    macd_signal_line_v = _n(macd.get("signal_line"))
+    macd_hist_v = _n(macd.get("histogram"))
+    macd_label_v = _s(macd.get("signal"))
+    sma20_v = _n(ma.get("sma20"))
+    sma50_v = _n(ma.get("sma50"))
+    sma200_v = _n(ma.get("sma200"))
+    bb_signal_v = _s(bb.get("signal"))
+    bb_upper_v = _n(bb.get("upper"))
+    bb_lower_v = _n(bb.get("lower"))
+    pivot_v = _n(sr.get("pivot"))
+    r1_v = _n(resistance.get("r1"))
+    r2_v = _n(resistance.get("r2"))
+    s1_v = _n(support.get("s1"))
+    s2_v = _n(support.get("s2"))
+    fib_382_v = _n(fib_levels.get("level_38_2"))
+    fib_500_v = _n(fib_levels.get("level_50_0"))
+    fib_618_v = _n(fib_levels.get("level_61_8"))
+    poc_v = _n(poc)
+
     prompt = f"""You are a senior Indian stock market analyst AI. Analyze this stock and provide insights for {timeframe_desc}.
 
 STOCK: {stock_name} ({sym})
@@ -450,16 +483,16 @@ Sector: {sector} | P/E: {pe_ratio} | Market Cap: {market_cap}
 Current Price: {current_price}
 
 TECHNICAL INDICATORS:
-- RSI(14): {technicals.get('rsi')} ({technicals.get('rsi_signal')})
-- ADX: {technicals.get('adx')} (trend strength)
-- MACD: Line={macd.get('macd_line')}, Signal={macd.get('signal_line')}, Histogram={macd.get('histogram')} → {macd.get('signal')}
-- SMA20={ma.get('sma20')}, SMA50={ma.get('sma50')}, SMA200={ma.get('sma200')}
-- Bollinger: {bb.get('signal')} (Upper={bb.get('upper')}, Lower={bb.get('lower')})
+- RSI(14): {rsi_v} ({rsi_signal_v})
+- ADX: {adx_v} (trend strength)
+- MACD: Line={macd_line_v}, Signal={macd_signal_line_v}, Histogram={macd_hist_v} → {macd_label_v}
+- SMA20={sma20_v}, SMA50={sma50_v}, SMA200={sma200_v}
+- Bollinger: {bb_signal_v} (Upper={bb_upper_v}, Lower={bb_lower_v})
 
 SUPPORT / RESISTANCE:
-- Pivot: {sr.get('pivot')}, R1={resistance.get('r1')}, R2={resistance.get('r2')}, S1={support.get('s1')}, S2={support.get('s2')}
-- Fibonacci 38.2%={fib_levels.get('level_38_2')}, 50%={fib_levels.get('level_50_0')}, 61.8%={fib_levels.get('level_61_8')}
-- Volume POC: {poc}
+- Pivot: {pivot_v}, R1={r1_v}, R2={r2_v}, S1={s1_v}, S2={s2_v}
+- Fibonacci 38.2%={fib_382_v}, 50%={fib_500_v}, 61.8%={fib_618_v}
+- Volume POC: {poc_v}
 
 FUNDAMENTALS:
 - P/E: {_sanitize_for_prompt(safe_float((fundamentals.get("valuation") or {}).get("pe")))} (Forward P/E: {_sanitize_for_prompt(safe_float((fundamentals.get("valuation") or {}).get("forward_pe")))})

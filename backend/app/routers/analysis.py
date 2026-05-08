@@ -15,7 +15,7 @@ from app.services.technicals import (
 from app.services.llm_analyst import run_analysis
 from app.services.fundamentals import get_fundamentals
 from app.services.cache import cache_manager, make_cache_key
-from app.database import DB_PATH
+from app.database import DB_PATH, _decrypt_settings_map
 from app.utils import sanitize_symbol
 import aiosqlite
 
@@ -24,12 +24,15 @@ logger = logging.getLogger(__name__)
 
 
 async def _get_settings() -> dict:
+    """Load settings for AI analysis. SECRET_KEYS are decrypted in-place so
+    `llm_analyst` receives the plaintext API key, not ciphertext."""
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
             async with db.execute("SELECT key, value FROM settings") as cursor:
                 rows = await cursor.fetchall()
-                return {row["key"]: row["value"] for row in rows}
+        raw = {row["key"]: row["value"] for row in rows}
+        return _decrypt_settings_map(raw)
     except Exception:
         return {}
 

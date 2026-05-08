@@ -175,8 +175,40 @@ async def get_options_analysis(symbol: str):
         analysis = await get_option_chain_analysis(symbol)
         if not analysis:
             return {"error": f"No options data for {symbol}. May not be FnO-eligible."}
-        await cache_manager.set(cache_key, analysis, ttl=timedelta(minutes=5))
-        return analysis
+
+        # Wire shape expected by OptionsPanel.tsx (`OptionsAnalysis` type):
+        # `pcr`, `spot`, `expiry`, and a flattened `unusual_oi` list with
+        # `{strike, type, change_oi, oi}`. Internal service uses richer
+        # names (`pcr_oi`, `underlying_value`, `nearest_expiry`, split
+        # CE/PE arrays) so we map here rather than couple the service to
+        # the UI contract.
+        unusual_oi: list[dict] = []
+        for u in analysis.get("unusual_ce_activity") or []:
+            unusual_oi.append({
+                "strike": u.get("strike"),
+                "type": "CE",
+                "change_oi": u.get("oi_change") or 0,
+                "oi": u.get("oi") or u.get("oi_change") or 0,
+            })
+        for u in analysis.get("unusual_pe_activity") or []:
+            unusual_oi.append({
+                "strike": u.get("strike"),
+                "type": "PE",
+                "change_oi": u.get("oi_change") or 0,
+                "oi": u.get("oi") or u.get("oi_change") or 0,
+            })
+
+        wire = {
+            "symbol": analysis.get("symbol", symbol),
+            "pcr": analysis.get("pcr_oi"),
+            "max_pain": analysis.get("max_pain"),
+            "unusual_oi": unusual_oi,
+            "sentiment": analysis.get("pcr_description"),
+            "expiry": analysis.get("nearest_expiry"),
+            "spot": analysis.get("underlying_value"),
+        }
+        await cache_manager.set(cache_key, wire, ttl=timedelta(minutes=5))
+        return wire
     except Exception as e:
         logger.error("Options analysis error for %s: %s", symbol, e)
         return {"error": str(e)}

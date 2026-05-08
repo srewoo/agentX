@@ -6,14 +6,25 @@
   "permissions": [
     "storage",
     "alarms",
-    "activeTab",
     "scripting",
+    "activeTab",
     "notifications",
     "contextMenus"
   ],
   "host_permissions": [
     "http://localhost:8020/*",
-    "http://127.0.0.1:8020/*"
+    "http://127.0.0.1:8020/*",
+    "https://*.moneycontrol.com/*",
+    "https://*.tickertape.in/*",
+    "https://*.tradingview.com/*",
+    "https://*.screener.in/*",
+    "https://*.nseindia.com/*",
+    "https://*.bseindia.com/*",
+    "https://*.zerodha.com/*",
+    "https://*.kite.zerodha.com/*",
+    "https://*.upstox.com/*",
+    "https://*.groww.in/*",
+    "https://*.angelone.in/*"
   ],
   "background": {
     "service_worker": "background/service-worker.js",
@@ -22,7 +33,17 @@
   "content_scripts": [
     {
       "matches": [
-        "<all_urls>"
+        "https://*.moneycontrol.com/*",
+        "https://*.tickertape.in/*",
+        "https://*.tradingview.com/*",
+        "https://*.screener.in/*",
+        "https://*.nseindia.com/*",
+        "https://*.bseindia.com/*",
+        "https://*.zerodha.com/*",
+        "https://*.kite.zerodha.com/*",
+        "https://*.upstox.com/*",
+        "https://*.groww.in/*",
+        "https://*.angelone.in/*"
       ],
       "js": [
         "content/mount.js"

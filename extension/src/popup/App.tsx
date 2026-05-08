@@ -1,45 +1,66 @@
-import { useState, useEffect, useCallback } from "react";
-import Dashboard from "./pages/Dashboard";
-import Search from "./pages/Search";
-import Screener from "./pages/Screener";
-import Watchlist from "./pages/Watchlist";
-import Alerts from "./pages/Alerts";
-import Settings from "./pages/Settings";
-import Tools from "./pages/Tools";
-import Onboarding from "./components/Onboarding";
+import { lazy, useCallback, useEffect, useState } from "react";
 import { ErrorBoundary } from "./components/ErrorBoundary";
+import Onboarding from "./components/Onboarding";
+import { Header } from "./layout/Header";
+import { BottomNav, type NavItem } from "./layout/BottomNav";
+import { TabPanel } from "./layout/TabPanel";
+import { ThemeProvider, type ThemeMode } from "./theme/ThemeProvider";
 import { getSettings } from "../shared/storage";
 import { deepLink } from "../shared/localStore";
 import type { AppSettings } from "../shared/types";
+import type { Exchange } from "./lib/types";
+import "./theme/tokens.css";
 
-type Tab = "dashboard" | "search" | "screener" | "watchlist" | "alerts" | "tools" | "settings";
+// Lazy-loaded tab views — keeps the popup chunk small and the
+// initial paint fast (only the active tab is parsed/executed).
+const LiveView = lazy(() => import("./pages/Dashboard"));
+const ToolsView = lazy(() => import("./pages/Tools"));
+const SearchView = lazy(() => import("./pages/Search"));
+const WatchlistView = lazy(() => import("./pages/Watchlist"));
+const PortfolioView = lazy(() => import("./views/PortfolioView"));
+const AlertsView = lazy(() => import("./pages/Alerts"));
+const SettingsView = lazy(() => import("./views/SettingsView"));
 
-const TABS: { id: Tab; label: string; icon: string }[] = [
-  { id: "dashboard", label: "Signals", icon: "⚡" },
+type TabId =
+  | "live"
+  | "search"
+  | "tools"
+  | "watchlist"
+  | "portfolio"
+  | "alerts"
+  | "settings";
+
+// "Live" carries indices (NIFTY/SENSEX/BANKNIFTY) + recommendations, "Tools"
+// owns sectors/earnings/holdings/paper-trading. Portfolio is its own tab now
+// that the type-shape mismatch is resolved. Watchlist/Alerts use the legacy
+// pages so the existing add/remove flows continue to work.
+const TABS: ReadonlyArray<NavItem<TabId>> = [
+  { id: "live", label: "Live", icon: "◉" },
   { id: "search", label: "Search", icon: "🔍" },
-  { id: "screener", label: "Screener", icon: "📊" },
-  { id: "watchlist", label: "Watchlist", icon: "★" },
-  { id: "alerts", label: "Alerts", icon: "🔔" },
   { id: "tools", label: "Tools", icon: "🧰" },
+  { id: "watchlist", label: "Watchlist", icon: "★" },
+  { id: "portfolio", label: "Portfolio", icon: "◧" },
+  { id: "alerts", label: "Alerts", icon: "🔔" },
   { id: "settings", label: "Settings", icon: "⚙" },
 ];
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<Tab>("dashboard");
-  const [searchSymbol, setSearchSymbol] = useState<string | null>(null);
-  // Default to *not* showing onboarding — flip to true only after we confirm
-  // first-run state. This lets the main UI render synchronously (and keeps
-  // existing tests that render <App /> and immediately assert on tabs working).
-  const [showOnboarding, setShowOnboarding] = useState<boolean>(false);
-  const [theme, setTheme] = useState<"dark" | "light">("dark");
+  const [active, setActive] = useState<TabId>("live");
+  const [exchange, setExchange] = useState<Exchange>("NSE");
+  const [showOnboarding, setShowOnboarding] = useState(false);
+  const [themeMode, setThemeMode] = useState<ThemeMode>("dark");
+  // Symbol carried into the Search tab from a deep-link or a click in
+  // Live/Signals/Watchlist. Cleared once the Search page consumes it.
+  const [searchSeed, setSearchSeed] = useState<string | null>(null);
 
-  const handleScreenerSelect = useCallback((symbol: string) => {
-    setSearchSymbol(symbol);
-    setActiveTab("search");
+  const handleSelectSymbol = useCallback((symbol: string) => {
+    setSearchSeed(symbol);
+    setActive("search");
   }, []);
 
-  const isStandalone = typeof window !== "undefined"
-    && new URLSearchParams(window.location.search).get("standalone") === "1";
+  const isStandalone =
+    typeof window !== "undefined" &&
+    new URLSearchParams(window.location.search).get("standalone") === "1";
 
   const handlePopOut = useCallback(() => {
     const url = chrome.runtime.getURL("popup/index.html") + "?standalone=1";
@@ -51,101 +72,96 @@ export default function App() {
     window.close();
   }, []);
 
-  // First-run check + deep-link consumption + theme
+  // Load settings (theme, onboarding, deep-link) on mount.
   useEffect(() => {
+    let cancelled = false;
     (async () => {
-      const settings = (await getSettings()) as Partial<AppSettings>;
-      setShowOnboarding(!settings.onboarding_complete);
-      setTheme(settings.theme === "light" ? "light" : "dark");
-
-      // Deep-link from right-click menu or content script
-      const dl = await deepLink.consume();
-      if (dl) {
-        setSearchSymbol(dl);
-        setActiveTab("search");
+      try {
+        const settings = (await getSettings()) as Partial<AppSettings>;
+        if (cancelled) return;
+        setShowOnboarding(!settings.onboarding_complete);
+        if (settings.theme === "light" || settings.theme === "dark") {
+          setThemeMode(settings.theme);
+        }
+        const dl = await deepLink.consume();
+        if (!cancelled && dl) {
+          setSearchSeed(dl);
+          setActive("search");
+        }
+      } catch {
+        // Storage may be unavailable in odd test contexts — fail open.
       }
     })();
 
-    // Listen for theme changes broadcast from settings
-    const onChange = (changes: { [k: string]: chrome.storage.StorageChange }, area: string) => {
-      if (area !== "sync") return;
-      if (changes.settings) {
-        const s = (changes.settings.newValue as Partial<AppSettings>) || {};
-        if (s.theme) setTheme(s.theme === "light" ? "light" : "dark");
-      }
+    const onChange = (
+      changes: { [k: string]: chrome.storage.StorageChange },
+      area: string,
+    ) => {
+      if (area !== "sync" || !changes.settings) return;
+      const next = (changes.settings.newValue as Partial<AppSettings>) || {};
+      if (next.theme === "light" || next.theme === "dark") setThemeMode(next.theme);
     };
-    chrome.storage.onChanged.addListener(onChange);
-    return () => chrome.storage.onChanged.removeListener(onChange);
+    chrome.storage?.onChanged?.addListener(onChange);
+    return () => {
+      cancelled = true;
+      chrome.storage?.onChanged?.removeListener(onChange);
+    };
   }, []);
 
-  // Apply theme class on document
-  useEffect(() => {
-    document.documentElement.dataset.theme = theme;
-  }, [theme]);
+  const sizeStyle = isStandalone
+    ? { width: "100%", height: "100%", overflow: "hidden" as const }
+    : { width: 527, height: 600, maxHeight: 600, overflow: "hidden" as const };
 
   return (
-    <div
-      className="relative flex flex-col bg-surface text-zinc-100"
-      style={
-        isStandalone
-          ? { width: "100%", height: "100%", overflow: "hidden" }
-          : { width: 527, height: 600, maxHeight: 600, overflow: "hidden" }
-      }
-      data-theme={theme}
-    >
-      {/* Header */}
-      <div className="flex-shrink-0 flex items-center justify-between px-4 py-2 border-b border-border bg-panel">
-        <div className="flex items-center gap-2">
-          <span className="text-brand text-lg">📈</span>
-          <span className="font-semibold text-sm text-zinc-100">agentX</span>
-        </div>
-        <div className="flex items-center gap-3">
-          <span className="text-xs text-zinc-500">NSE/BSE Copilot</span>
-          {!isStandalone && (
-            <button
-              onClick={handlePopOut}
-              title="Pop out to a standalone window"
-              aria-label="Pop out to a standalone window"
-              className="text-zinc-400 hover:text-brand-light text-base leading-none px-1"
-            >
-              ⛶
-            </button>
-          )}
-        </div>
-      </div>
+    <ThemeProvider mode={themeMode} onModeChange={setThemeMode}>
+      <div
+        className="relative flex flex-col"
+        style={{
+          ...sizeStyle,
+          background: "var(--bg-app)",
+          color: "var(--text-primary)",
+        }}
+      >
+        <Header
+          exchange={exchange}
+          onExchangeChange={setExchange}
+          showPopOut={!isStandalone}
+          onPopOut={handlePopOut}
+        />
 
-      {/* Content */}
-      <div className="flex-1 overflow-hidden min-h-0">
-        <ErrorBoundary key={activeTab}>
-          {activeTab === "dashboard" && <Dashboard onSelectSymbol={handleScreenerSelect} />}
-          {activeTab === "search" && <Search initialSymbol={searchSymbol} onSymbolConsumed={() => setSearchSymbol(null)} />}
-          {activeTab === "screener" && <Screener onSelectSymbol={handleScreenerSelect} />}
-          {activeTab === "watchlist" && <Watchlist onSelectSymbol={handleScreenerSelect} />}
-          {activeTab === "alerts" && <Alerts />}
-          {activeTab === "tools" && <Tools onSelectSymbol={handleScreenerSelect} />}
-          {activeTab === "settings" && <Settings />}
-        </ErrorBoundary>
-      </div>
+        <main className="flex-1 overflow-hidden min-h-0">
+          <ErrorBoundary key={active}>
+            <TabPanel id="live" active={active === "live"}>
+              <LiveView onSelectSymbol={handleSelectSymbol} />
+            </TabPanel>
+            <TabPanel id="search" active={active === "search"}>
+              <SearchView
+                initialSymbol={searchSeed}
+                onSymbolConsumed={() => setSearchSeed(null)}
+              />
+            </TabPanel>
+            <TabPanel id="tools" active={active === "tools"}>
+              <ToolsView onSelectSymbol={handleSelectSymbol} />
+            </TabPanel>
+            <TabPanel id="watchlist" active={active === "watchlist"}>
+              <WatchlistView onSelectSymbol={handleSelectSymbol} />
+            </TabPanel>
+            <TabPanel id="portfolio" active={active === "portfolio"}>
+              <PortfolioView />
+            </TabPanel>
+            <TabPanel id="alerts" active={active === "alerts"}>
+              <AlertsView />
+            </TabPanel>
+            <TabPanel id="settings" active={active === "settings"}>
+              <SettingsView />
+            </TabPanel>
+          </ErrorBoundary>
+        </main>
 
-      {/* Bottom Tab Bar */}
-      <div className="flex-shrink-0 flex border-t border-border bg-panel">
-        {TABS.map((tab) => (
-          <button
-            key={tab.id}
-            onClick={() => setActiveTab(tab.id)}
-            className={`tab-btn flex-1 flex flex-col items-center gap-0.5 py-2 text-[10px]
-              ${activeTab === tab.id
-                ? "text-brand-light border-t-2 border-brand"
-                : "text-zinc-500 border-t-2 border-transparent hover:text-zinc-300"
-              }`}
-          >
-            <span className="text-base leading-none">{tab.icon}</span>
-            <span>{tab.label}</span>
-          </button>
-        ))}
-      </div>
+        <BottomNav items={TABS} active={active} onChange={setActive} />
 
-      {showOnboarding && <Onboarding onDone={() => setShowOnboarding(false)} />}
-    </div>
+        {showOnboarding && <Onboarding onDone={() => setShowOnboarding(false)} />}
+      </div>
+    </ThemeProvider>
   );
 }

@@ -1,0 +1,100 @@
+/**
+ * Design tokens — single source of truth for color, spacing, radii.
+ * Dark is the default. `[data-theme="light"]` swaps the palette.
+ *
+ * Indian-market accent palette:
+ *   --accent-saffron #FF9933   (brand)
+ *   --color-profit   #16A34A   (deep green for gains)
+ *   --color-loss     #DC2626   (deep red for losses)
+ */
+
+:root,
+:root[data-theme="dark"] {
+  --accent-saffron: #ff9933;
+  --accent-saffron-soft: rgba(255, 153, 51, 0.12);
+  --accent-indigo: #6366f1;
+
+  --color-profit: #16a34a;
+  --color-profit-soft: rgba(22, 163, 74, 0.14);
+  --color-loss: #dc2626;
+  --color-loss-soft: rgba(220, 38, 38, 0.14);
+  --color-warn: #f59e0b;
+
+  --bg-app: #0b0b0d;
+  --bg-surface: #18181b;
+  --bg-panel: #1f1f23;
+  --bg-panel-hover: #26262b;
+  --bg-elevated: #2d2d33;
+
+  --border-default: #2f2f35;
+  --border-strong: #3f3f46;
+
+  --text-primary: #f4f4f5;
+  --text-secondary: #a1a1aa;
+  --text-muted: #71717a;
+
+  --focus-ring: 0 0 0 2px rgba(255, 153, 51, 0.6);
+
+  --radius-sm: 4px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+}
+
+:root[data-theme="light"] {
+  --accent-saffron: #e8852a;
+  --accent-saffron-soft: rgba(232, 133, 42, 0.12);
+  --accent-indigo: #4f46e5;
+
+  --color-profit: #15803d;
+  --color-profit-soft: rgba(21, 128, 61, 0.10);
+  --color-loss: #b91c1c;
+  --color-loss-soft: rgba(185, 28, 28, 0.10);
+  --color-warn: #b45309;
+
+  --bg-app: #fafafa;
+  --bg-surface: #ffffff;
+  --bg-panel: #f4f4f5;
+  --bg-panel-hover: #e4e4e7;
+  --bg-elevated: #ffffff;
+
+  --border-default: #e4e4e7;
+  --border-strong: #d4d4d8;
+
+  --text-primary: #18181b;
+  --text-secondary: #52525b;
+  --text-muted: #71717a;
+}
+
+/* Token-driven utility surfaces (used alongside Tailwind). */
+.tk-bg-app { background-color: var(--bg-app); }
+.tk-bg-surface { background-color: var(--bg-surface); }
+.tk-bg-panel { background-color: var(--bg-panel); }
+.tk-bg-elevated { background-color: var(--bg-elevated); }
+.tk-border { border-color: var(--border-default); }
+.tk-border-strong { border-color: var(--border-strong); }
+.tk-text { color: var(--text-primary); }
+.tk-text-secondary { color: var(--text-secondary); }
+.tk-text-muted { color: var(--text-muted); }
+.tk-accent { color: var(--accent-saffron); }
+.tk-bg-accent { background-color: var(--accent-saffron); }
+.tk-bg-accent-soft { background-color: var(--accent-saffron-soft); }
+
+.tk-profit { color: var(--color-profit); }
+.tk-loss { color: var(--color-loss); }
+.tk-bg-profit-soft { background-color: var(--color-profit-soft); }
+.tk-bg-loss-soft { background-color: var(--color-loss-soft); }
+
+/* Focus visible — keyboard users see a clear ring everywhere. */
+:where(button, [role="button"], a, [tabindex]):focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+  border-radius: var(--radius-sm);
+}
+
+/* Reduced motion — respect system preference. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

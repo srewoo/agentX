@@ -83,7 +83,14 @@ export default function FundamentalsCard({ symbol }: Props) {
       if (!data && !loading) {
         setLoading(true);
         api.getFundamentals(symbol)
-          .then(setData)
+          .then((d) => {
+            // Backend returns 200 with an `error` field when yfinance is
+            // rate-limited or returned an empty info dict — surface that
+            // as a visible message instead of a wall of em-dashes.
+            const err = (d as { error?: string })?.error;
+            if (err) setError(err);
+            else setData(d);
+          })
           .catch((e) => setError(e instanceof Error ? e.message : "Fundamentals unavailable"))
           .finally(() => setLoading(false));
       }

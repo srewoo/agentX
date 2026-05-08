@@ -227,12 +227,16 @@ def _sync_analyze_option_chain(symbol: str) -> Optional[dict]:
             if ce_oi_chg > total_ce_oi * 0.05 and ce_oi_chg > 0:  # >5% of total OI
                 unusual_ce_strikes.append({
                     "strike": ce.get("strikePrice"),
+                    # `oi` is current open interest at the strike; `oi_change`
+                    # is today's delta. Two different signals — keep both.
+                    "oi": ce.get("openInterest") or 0,
                     "oi_change": ce.get("changeinOpenInterest"),
                     "iv": ce.get("impliedVolatility"),
                 })
             if pe_oi_chg > total_pe_oi * 0.05 and pe_oi_chg > 0:
                 unusual_pe_strikes.append({
                     "strike": pe.get("strikePrice"),
+                    "oi": pe.get("openInterest") or 0,
                     "oi_change": pe.get("changeinOpenInterest"),
                     "iv": pe.get("impliedVolatility"),
                 })
