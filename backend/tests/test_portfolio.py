@@ -192,3 +192,51 @@ async def test_ensure_schema_is_idempotent(tmp_db_path: str, monkeypatch) -> Non
         ) as cur:
             names = {row[0] for row in await cur.fetchall()}
     assert names == {"holdings", "transactions", "benchmarks"}
+
+
+@pytest.mark.asyncio
+async def test_portfolio_recommendation_context_blocks_concentrated_buy(
+    tmp_db_path: str, monkeypatch
+) -> None:
+    monkeypatch.setattr(svc, "DB_PATH", tmp_db_path)
+    await svc.ensure_schema()
+    await svc.insert_transaction(
+        symbol="RELIANCE",
+        side="BUY",
+        qty=100,
+        price=1000.0,
+        ts="2026-01-01T09:15:00+00:00",
+    )
+
+    ctx = await svc.portfolio_recommendation_context(
+        symbol="RELIANCE",
+        sector="Energy",
+        action="BUY",
+    )
+    assert ctx["available"] is True
+    assert ctx["decision"] == "block_add"
+    assert ctx["action_adjustment"] < 0
+    assert ctx["symbol_weight_pct"] == pytest.approx(100.0)
+
+
+@pytest.mark.asyncio
+async def test_portfolio_recommendation_context_boosts_existing_sell(
+    tmp_db_path: str, monkeypatch
+) -> None:
+    monkeypatch.setattr(svc, "DB_PATH", tmp_db_path)
+    await svc.ensure_schema()
+    await svc.insert_transaction(
+        symbol="RELIANCE",
+        side="BUY",
+        qty=10,
+        price=1000.0,
+        ts="2026-01-01T09:15:00+00:00",
+    )
+
+    ctx = await svc.portfolio_recommendation_context(
+        symbol="RELIANCE",
+        sector="Energy",
+        action="SELL",
+    )
+    assert ctx["decision"] == "existing_position_exit"
+    assert ctx["action_adjustment"] > 0

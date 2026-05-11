@@ -63,3 +63,35 @@ def test_paper_trade_gate_allows_positive_edge_signal():
         {"signal_type": "gap_up", "direction": "bullish", "metadata": {}}
     )
     assert gate == {"allowed": True, "reason": "passed_edge_gate"}
+
+
+@pytest.mark.asyncio
+async def test_create_close_list_and_summary_paper_trade(paper_db):
+    trade = await paper_trading.create_paper_trade(
+        symbol="RELIANCE",
+        direction="bullish",
+        signal_type="gap_up",
+        strength=8,
+        entry_price=100.0,
+        shares=10,
+    )
+    assert trade["status"] == "open"
+
+    listed = await paper_trading.list_paper_trades(status="open")
+    assert listed["count"] == 1
+    assert listed["trades"][0]["trade_id"] == trade["trade_id"]
+
+    closed = await paper_trading.close_paper_trade(
+        trade["trade_id"],
+        exit_price=110.0,
+        exit_reason="target_hit",
+    )
+    assert closed is not None
+    assert closed["status"] == "closed"
+    assert closed["pnl_pct"] == pytest.approx(10.0)
+    assert closed["pnl_amount"] == pytest.approx(100.0)
+
+    summary = await paper_trading.paper_trade_summary()
+    assert summary["closed"] == 1
+    assert summary["wins"] == 1
+    assert summary["win_rate"] == 100.0

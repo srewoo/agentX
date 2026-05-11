@@ -320,6 +320,11 @@ export default function SignalCard({ recommendation: r, onSelect, className }: S
           {r.calibrationNote}
         </p>
       )}
+      {r.portfolioContext?.notes && r.portfolioContext.notes.length > 0 && (
+        <p className="mt-1 text-[10px] leading-snug text-rec-fg-muted">
+          Portfolio: {r.portfolioContext.notes[0]}
+        </p>
+      )}
 
       {/* Quick actions row — `stopPropagation` so the button click doesn't
        *  trigger the card's onSelect navigation. */}

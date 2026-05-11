@@ -39,6 +39,7 @@ from typing import Any, Iterable, Optional
 import aiosqlite
 
 from app.database import DB_PATH
+from app.services.data_fetcher import MAJOR_STOCKS
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +52,10 @@ CONCENTRATION_FLAG_PCT: float = 20.0   # single-position warning
 SECTOR_CONCENTRATION_FLAG_PCT: float = 35.0
 DEFAULT_PAGE_LIMIT: int = 100
 MAX_PAGE_LIMIT: int = 500
+PORTFOLIO_POSITION_WARN_PCT: float = 15.0
+PORTFOLIO_POSITION_BLOCK_PCT: float = 25.0
+PORTFOLIO_SECTOR_WARN_PCT: float = 25.0
+PORTFOLIO_SECTOR_BLOCK_PCT: float = 40.0
 
 _MIGRATION_PATH: str = os.path.join(
     os.path.dirname(os.path.dirname(__file__)),
@@ -543,6 +548,96 @@ async def build_summary(risk_free_rate: float = DEFAULT_RISK_FREE_RATE) -> dict[
         "open_positions": len(positions),
         "concentration_flags": flags,
         "risk_free_rate": risk_free_rate,
+    }
+
+
+def _static_sector_for(symbol: str) -> str:
+    for item in MAJOR_STOCKS:
+        if item.get("symbol") == symbol:
+            return item.get("sector") or "Unknown"
+    return "Unknown"
+
+
+async def portfolio_recommendation_context(
+    *,
+    symbol: str,
+    sector: str,
+    action: str,
+) -> dict[str, Any]:
+    """Portfolio-aware adjustment for a fresh recommendation.
+
+    Uses the transaction ledger only, not live quotes, so recommendation
+    generation does not depend on extra market-data calls. Values are based on
+    open-lot cost basis, which is stable enough for concentration gating.
+    """
+    try:
+        await ensure_schema()
+        txs = await fetch_all_transactions_chronological()
+        fifo = compute_fifo(txs)
+    except Exception as exc:
+        logger.debug("portfolio recommendation context unavailable: %s", exc)
+        return {
+            "available": False,
+            "action_adjustment": 0,
+            "notes": ["Portfolio context unavailable."],
+        }
+
+    open_lots = fifo.open_lots
+    position_cost: dict[str, float] = {
+        sym: sum(lot.qty * lot.price for lot in lots)
+        for sym, lots in open_lots.items()
+    }
+    total_cost = sum(position_cost.values())
+    symbol_cost = position_cost.get(symbol, 0.0)
+    symbol_weight = (symbol_cost / total_cost * 100.0) if total_cost > 0 else 0.0
+
+    sector_cost = 0.0
+    for sym, cost in position_cost.items():
+        if _static_sector_for(sym) == sector:
+            sector_cost += cost
+    sector_weight = (sector_cost / total_cost * 100.0) if total_cost > 0 else 0.0
+
+    notes: list[str] = []
+    adjustment = 0
+    decision = "neutral"
+
+    if action == "BUY":
+        if symbol_weight >= PORTFOLIO_POSITION_BLOCK_PCT:
+            adjustment -= 25
+            decision = "block_add"
+            notes.append(f"Already {symbol_weight:.1f}% allocated to {symbol}.")
+        elif symbol_weight >= PORTFOLIO_POSITION_WARN_PCT:
+            adjustment -= 10
+            decision = "reduce_size"
+            notes.append(f"{symbol} is already {symbol_weight:.1f}% of portfolio.")
+
+        if sector_weight >= PORTFOLIO_SECTOR_BLOCK_PCT:
+            adjustment -= 20
+            decision = "block_add"
+            notes.append(f"{sector} exposure is already {sector_weight:.1f}%.")
+        elif sector_weight >= PORTFOLIO_SECTOR_WARN_PCT:
+            adjustment -= 8
+            if decision == "neutral":
+                decision = "reduce_size"
+            notes.append(f"{sector} exposure is elevated at {sector_weight:.1f}%.")
+
+    elif action == "SELL":
+        if symbol_cost > 0:
+            adjustment += 8
+            decision = "existing_position_exit"
+            notes.append(f"Existing {symbol} position found; sell signal is portfolio-relevant.")
+        else:
+            notes.append("No existing position found; treat SELL as watchlist/short-bias signal.")
+
+    return {
+        "available": True,
+        "total_cost_basis": round(total_cost, 2),
+        "symbol_cost_basis": round(symbol_cost, 2),
+        "symbol_weight_pct": round(symbol_weight, 2),
+        "sector_weight_pct": round(sector_weight, 2),
+        "action_adjustment": adjustment,
+        "decision": decision,
+        "notes": notes,
     }
 
 

@@ -19,6 +19,7 @@ import time
 import uuid
 from collections import defaultdict
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -99,6 +100,14 @@ async def lifespan(app: FastAPI):
     # Startup
     logger.info("StockPilot backend starting...")
     await init_db()
+    try:
+        from app.services.paper_trading import import_paper_trades_csv
+        paper_csv = Path(__file__).resolve().parents[1] / "paper_trades" / "trades.csv"
+        imported = await import_paper_trades_csv(paper_csv)
+        if imported.get("imported"):
+            logger.info("Paper trades synced from CSV: %s", imported)
+    except Exception as exc:
+        logger.warning("Paper trade CSV sync skipped: %s", exc)
     # Seal any plaintext API keys / tokens still in the settings table.
     # Idempotent — already-encrypted rows are skipped. Raises
     # SecretsKeyMissing if no master key is configured outside dev mode.

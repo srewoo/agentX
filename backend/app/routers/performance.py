@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, Field
 
 from app.services.signal_edge import (
     EDGE_META,
@@ -25,13 +26,39 @@ from app.services.recommendation_tracker import (
     get_factor_edge_snapshot,
 )
 from app.services.recommendation_calibration import run_large_scale_calibration
-from app.services.paper_trading import import_paper_trades_csv
+from app.services.paper_trading import (
+    close_paper_trade,
+    create_paper_trade,
+    import_paper_trades_csv,
+    list_paper_trades,
+    paper_trade_summary,
+)
 
 router = APIRouter(prefix="/api/performance", tags=["performance"])
 logger = logging.getLogger(__name__)
 
 _CALIBRATION_JOBS: dict[str, dict[str, Any]] = {}
 _MAX_CALIBRATION_JOBS = 20
+
+
+class CreatePaperTradeRequest(BaseModel):
+    symbol: str = Field(min_length=1, max_length=20)
+    direction: str = Field(pattern="^(bullish|bearish)$")
+    signal_type: str = Field(min_length=1, max_length=80)
+    strength: int = Field(ge=1, le=10)
+    entry_price: float = Field(gt=0)
+    entry_date: Optional[str] = Field(default=None, max_length=40)
+    stop_loss: Optional[float] = None
+    target: Optional[float] = None
+    position_size: Optional[float] = None
+    shares: Optional[int] = None
+    trailing_stop: Optional[float] = None
+
+
+class ClosePaperTradeRequest(BaseModel):
+    exit_price: float = Field(gt=0)
+    exit_date: Optional[str] = Field(default=None, max_length=40)
+    exit_reason: str = Field(default="manual", max_length=80)
 
 
 def _validate_calibration_request(
@@ -344,6 +371,52 @@ async def import_paper_trades():
     except Exception as e:
         logger.exception("Paper trade import failed: %s", e)
         raise HTTPException(status_code=500, detail="Failed to import paper trades")
+
+
+@router.get("/paper-trades")
+async def get_paper_trades(
+    status: Optional[str] = None,
+    symbol: Optional[str] = None,
+    limit: int = 100,
+):
+    try:
+        return {"data": await list_paper_trades(status=status, symbol=symbol, limit=limit)}
+    except Exception as e:
+        logger.exception("Paper trade list failed: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to list paper trades")
+
+
+@router.get("/paper-trades/summary")
+async def get_paper_trade_summary():
+    try:
+        return {"data": await paper_trade_summary()}
+    except Exception as e:
+        logger.exception("Paper trade summary failed: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to summarize paper trades")
+
+
+@router.post("/paper-trades", status_code=201)
+async def post_paper_trade(body: CreatePaperTradeRequest):
+    try:
+        trade = await create_paper_trade(**body.model_dump())
+        return {"data": trade, "message": "Paper trade created"}
+    except Exception as e:
+        logger.exception("Paper trade create failed: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to create paper trade")
+
+
+@router.post("/paper-trades/{trade_id}/close")
+async def post_close_paper_trade(trade_id: str, body: ClosePaperTradeRequest):
+    try:
+        trade = await close_paper_trade(trade_id, **body.model_dump())
+        if not trade:
+            raise HTTPException(status_code=404, detail="Paper trade not found")
+        return {"data": trade, "message": "Paper trade closed"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Paper trade close failed: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to close paper trade")
 
 
 @router.post("/calibrate-recommendations")

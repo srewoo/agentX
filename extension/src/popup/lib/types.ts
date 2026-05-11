@@ -42,6 +42,14 @@ export interface Recommendation {
   factorAgreement?: number | null;
   calibrationNote?: string | null;
   dataQuality?: string | null;
+  portfolioContext?: {
+    available?: boolean;
+    symbolWeightPct?: number;
+    sectorWeightPct?: number;
+    actionAdjustment?: number;
+    decision?: string;
+    notes?: string[];
+  } | null;
   advisoryDisclaimer?: string;
   signals?: ReadonlyArray<{
     name: string;

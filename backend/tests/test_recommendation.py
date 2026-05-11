@@ -255,6 +255,9 @@ def patch_external_io(monkeypatch):
     async def _rs(syms, period="3mo"):
         return {"nifty_return": 5.0, "rankings": {s: {"rs_rank": 85, "rs_ratio": 1.5, "return_pct": 7} for s in syms}}
 
+    async def _portfolio_context(**_kwargs):
+        return {"available": True, "action_adjustment": 0, "notes": [], "decision": "neutral"}
+
     monkeypatch.setattr(rec_mod.cache_manager, "get", _no_cache_get)
     monkeypatch.setattr(rec_mod.cache_manager, "set", _no_cache_set)
     monkeypatch.setattr(rec_mod, "get_stock_quote", _quote)
@@ -262,6 +265,8 @@ def patch_external_io(monkeypatch):
     monkeypatch.setattr(rec_mod, "get_fii_dii_data", _fii)
     monkeypatch.setattr(rec_mod, "get_option_chain_analysis", _options)
     monkeypatch.setattr(rec_mod, "compute_relative_strength", _rs)
+    import app.services.portfolio as portfolio_mod
+    monkeypatch.setattr(portfolio_mod, "portfolio_recommendation_context", _portfolio_context)
 
 
 @pytest.mark.asyncio

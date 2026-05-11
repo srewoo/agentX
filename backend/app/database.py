@@ -284,6 +284,15 @@ DEFAULT_SETTINGS = {
     "price_spike_pct": "3.0",
     "volume_spike_ratio": "2.0",
     "breakout_min_score": "4",
+    # Weekly recommendation calibration. Runs in the background from the
+    # orchestrator and writes factor_performance for swing/positional scoring.
+    "recommendation_calibration_enabled": "true",
+    "recommendation_calibration_universe": "nifty100",
+    "recommendation_calibration_horizons": "swing,positional",
+    "recommendation_calibration_period": "5y",
+    "recommendation_calibration_stride": "5",
+    "recommendation_calibration_concurrency": "3",
+    "recommendation_calibration_apply": "true",
 }
 
 # Max age for signals before archival

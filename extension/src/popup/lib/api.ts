@@ -216,6 +216,8 @@ type RawRecommendation = Partial<{
   calibrationNote: string | null;
   data_quality: string | null;
   dataQuality: string | null;
+  portfolio_context: Recommendation["portfolioContext"];
+  portfolioContext: Recommendation["portfolioContext"];
   advisory_disclaimer: string;
   advisoryDisclaimer: string;
   signals: RawFactor[];
@@ -242,6 +244,31 @@ function normalizeFactorDirection(d: RawFactor["direction"]): "pos" | "neg" | "n
   if (d === "bullish" || d === "pos") return "pos";
   if (d === "bearish" || d === "neg") return "neg";
   return "neu";
+}
+
+function normalizePortfolioContext(v: Recommendation["portfolioContext"] | undefined) {
+  if (!v || typeof v !== "object") return null;
+  const raw = v as Record<string, unknown>;
+  return {
+    available: Boolean(raw.available),
+    symbolWeightPct: typeof raw.symbolWeightPct === "number"
+      ? raw.symbolWeightPct
+      : typeof raw.symbol_weight_pct === "number"
+        ? raw.symbol_weight_pct
+        : undefined,
+    sectorWeightPct: typeof raw.sectorWeightPct === "number"
+      ? raw.sectorWeightPct
+      : typeof raw.sector_weight_pct === "number"
+        ? raw.sector_weight_pct
+        : undefined,
+    actionAdjustment: typeof raw.actionAdjustment === "number"
+      ? raw.actionAdjustment
+      : typeof raw.action_adjustment === "number"
+        ? raw.action_adjustment
+        : undefined,
+    decision: typeof raw.decision === "string" ? raw.decision : undefined,
+    notes: Array.isArray(raw.notes) ? raw.notes.filter((n): n is string => typeof n === "string") : [],
+  };
 }
 
 function normalizeRecommendation(raw: unknown): Recommendation {
@@ -281,6 +308,7 @@ function normalizeRecommendation(raw: unknown): Recommendation {
     factorAgreement: raw.factorAgreement ?? raw.factor_agreement ?? null,
     calibrationNote: raw.calibrationNote ?? raw.calibration_note ?? null,
     dataQuality: raw.dataQuality ?? raw.data_quality ?? null,
+    portfolioContext: normalizePortfolioContext(raw.portfolioContext ?? raw.portfolio_context),
     advisoryDisclaimer:
       raw.advisoryDisclaimer ??
       raw.advisory_disclaimer ??

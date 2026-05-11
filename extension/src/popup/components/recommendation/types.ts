@@ -53,6 +53,7 @@ export interface RecommendationView extends BaseRecommendation {
   factorAgreement?: number | null;
   calibrationNote?: string | null;
   dataQuality?: string | null;
+  portfolioContext?: BaseRecommendation["portfolioContext"];
   advisoryDisclaimer?: string;
 }
 

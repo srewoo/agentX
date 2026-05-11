@@ -39,6 +39,7 @@ from app.services.market_data import (
     get_option_chain_analysis, refresh_earnings_calendar,
 )
 from app.services.market_regime import detect_market_regime
+from app.services.recommendation_calibration import run_large_scale_calibration
 
 logger = logging.getLogger(__name__)
 
@@ -608,6 +609,7 @@ class SignalOrchestrator:
     def __init__(self):
         self._task: Optional[asyncio.Task] = None
         self._backtest_task: Optional[asyncio.Task] = None
+        self._calibration_task: Optional[asyncio.Task] = None
         self._running = False
 
     async def start(self) -> None:
@@ -616,11 +618,13 @@ class SignalOrchestrator:
         self._running = True
         self._task = asyncio.create_task(self._loop())
         self._backtest_task = asyncio.create_task(self._backtest_loop())
-        logger.info("Signal orchestrator started (scan + weekly backtest)")
+        self._calibration_task = asyncio.create_task(self._calibration_loop())
+        await asyncio.sleep(0)
+        logger.info("Signal orchestrator started (scan + weekly backtest + calibration)")
 
     async def stop(self) -> None:
         self._running = False
-        for t in (self._task, self._backtest_task):
+        for t in (self._task, self._backtest_task, self._calibration_task):
             if t:
                 t.cancel()
                 try:
@@ -682,6 +686,74 @@ class SignalOrchestrator:
             except Exception as e:
                 logger.error("Weekly backtest loop error: %s", e)
                 await asyncio.sleep(3600)  # back off 1h on unexpected errors
+
+    async def _calibration_loop(self) -> None:
+        """Weekly large-scale recommendation calibration.
+
+        The manual API still exists for ad-hoc runs. This loop makes the
+        production path end-to-end: evaluate outcomes, calibrate factors over
+        free EOD data, persist factor_performance, and seed the in-memory cache.
+        """
+        await asyncio.sleep(600)
+
+        while self._running:
+            try:
+                next_run = _next_weekly_calibration_dt()
+                wait_s = max(60, (next_run - datetime.now(timezone.utc)).total_seconds())
+                logger.info(
+                    "Next recommendation calibration at %s UTC (in %.1fh)",
+                    next_run.isoformat(),
+                    wait_s / 3600,
+                )
+                await asyncio.sleep(wait_s)
+                if not self._running:
+                    break
+                await self._run_weekly_calibration()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("Recommendation calibration loop error: %s", e)
+                await asyncio.sleep(3600)
+
+    async def _run_weekly_calibration(self) -> None:
+        db_settings = await _get_settings()
+        enabled = str(db_settings.get("recommendation_calibration_enabled", "true")).lower()
+        if enabled not in {"1", "true", "yes", "on"}:
+            logger.info("Recommendation calibration disabled by settings")
+            return
+
+        universe = db_settings.get("recommendation_calibration_universe", "nifty100")
+        horizons = [
+            h.strip()
+            for h in db_settings.get("recommendation_calibration_horizons", "swing,positional").split(",")
+            if h.strip()
+        ]
+        period = db_settings.get("recommendation_calibration_period", "5y") or None
+        stride = int(db_settings.get("recommendation_calibration_stride", "5"))
+        concurrency = int(db_settings.get("recommendation_calibration_concurrency", "3"))
+        apply = str(db_settings.get("recommendation_calibration_apply", "true")).lower() in {
+            "1", "true", "yes", "on",
+        }
+
+        try:
+            from app.services.recommendation_tracker import evaluate_recommendation_outcomes
+            await evaluate_recommendation_outcomes()
+        except Exception as e:
+            logger.debug("Pre-calibration recommendation evaluation skipped: %s", e)
+
+        logger.info(
+            "Weekly recommendation calibration starting: universe=%s horizons=%s period=%s stride=%s concurrency=%s apply=%s",
+            universe, horizons, period, stride, concurrency, apply,
+        )
+        result = await run_large_scale_calibration(
+            universe=universe,  # type: ignore[arg-type]
+            horizons=horizons,  # type: ignore[arg-type]
+            period=period,
+            stride=stride,
+            concurrency=concurrency,
+            apply=apply,
+        )
+        logger.info("Weekly recommendation calibration complete: %s", result.get("summary"))
 
     async def _run_weekly_backtest(self) -> None:
         """Execute the weekly backtest and persist the result row."""
@@ -781,6 +853,18 @@ def _next_weekly_backtest_dt() -> datetime:
     now_ist = now_utc + IST_OFFSET
     days_until_sun = (6 - now_ist.weekday()) % 7  # Mon=0, Sun=6
     target_ist = (now_ist + timedelta(days=days_until_sun)).replace(hour=18, minute=0, second=0, microsecond=0)
+    if days_until_sun == 0 and now_ist >= target_ist:
+        target_ist += timedelta(days=7)
+    return (target_ist - IST_OFFSET).replace(tzinfo=timezone.utc)
+
+
+def _next_weekly_calibration_dt() -> datetime:
+    """Return next Sunday 21:00 IST in UTC, after the weekly backtest slot."""
+    IST_OFFSET = timedelta(hours=5, minutes=30)
+    now_utc = datetime.now(timezone.utc)
+    now_ist = now_utc + IST_OFFSET
+    days_until_sun = (6 - now_ist.weekday()) % 7
+    target_ist = (now_ist + timedelta(days=days_until_sun)).replace(hour=21, minute=0, second=0, microsecond=0)
     if days_until_sun == 0 and now_ist >= target_ist:
         target_ist += timedelta(days=7)
     return (target_ist - IST_OFFSET).replace(tzinfo=timezone.utc)

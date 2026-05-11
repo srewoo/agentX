@@ -194,6 +194,7 @@ def _avoid(
         factor_agreement=0.0,
         calibration_note="No directional signal: liquidity, event, or data-quality gate blocked this setup.",
         data_quality="limited",
+        portfolio_context=None,
         generated_at=datetime.now(timezone.utc),
     )
 
@@ -492,6 +493,27 @@ async def generate_recommendation(
         action = "HOLD"
         calibration_note += " Directional call demoted to HOLD because calibrated conviction is below 45."
 
+    portfolio_context = None
+    if action in ("BUY", "SELL"):
+        try:
+            from app.services.portfolio import portfolio_recommendation_context
+            portfolio_context = await portfolio_recommendation_context(
+                symbol=symbol,
+                sector=sector,
+                action=action,
+            )
+            adjustment = int(portfolio_context.get("action_adjustment") or 0)
+            if adjustment:
+                conviction = max(0, min(100, conviction + adjustment))
+                calibration_note += f" Portfolio adjustment applied ({adjustment:+d} conviction)."
+            for note in portfolio_context.get("notes") or []:
+                calibration_note += f" {note}"
+            if action == "BUY" and portfolio_context.get("decision") == "block_add":
+                action = "HOLD"
+                calibration_note += " BUY demoted to HOLD because portfolio concentration is already high."
+        except Exception as e:
+            logger.debug("portfolio context skipped for %s: %s", symbol, e)
+
     data_quality = "eod_verified"
     if horizon == "intraday":
         data_quality = "delayed_intraday"
@@ -515,6 +537,7 @@ async def generate_recommendation(
         factor_agreement=agreement,
         calibration_note=calibration_note,
         data_quality=data_quality,
+        portfolio_context=portfolio_context,
         generated_at=datetime.now(timezone.utc),
     )
     await cache_manager.set(cache_key, rec.model_dump(mode="json"), ttl=_HORIZON_TTL[horizon])
