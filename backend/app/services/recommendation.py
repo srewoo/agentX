@@ -34,7 +34,9 @@ from app.services.data_fetcher import (
     get_stock_quote,
 )
 from app.services.fii_dii import get_fii_dii_data
+from app.services.fundamental_valuation import analyze_fundamental_valuation
 from app.services.market_data import get_corporate_actions, get_option_chain_analysis
+from app.services.recommendation_ensemble import build_recommendation_ensemble
 from app.services.recommendation_factors import (
     entry_sl_targets,
     fii_dii_score,
@@ -346,6 +348,8 @@ async def generate_recommendation(
     fii_dii_ctx: Optional[dict[str, Any]] = None,
     corp_actions_ctx: Optional[list[dict]] = None,
     rs_ctx: Optional[dict[str, Any]] = None,
+    use_llm_judge: bool = False,
+    reasoning_effort: str = "medium",
 ) -> Optional[Recommendation]:
     """Build a single recommendation. Returns None on hard failure (no data).
 
@@ -354,7 +358,7 @@ async def generate_recommendation(
     `fii_dii_ctx` / `corp_actions_ctx` are optional pre-fetched globals —
     `generate_batch` passes them in once so we don't hammer NSE 100×.
     """
-    cache_key = make_cache_key("rec", symbol, horizon=horizon)
+    cache_key = make_cache_key("rec", symbol, horizon=horizon, llm_judge=1 if use_llm_judge else 0)
     cached = await cache_manager.get(cache_key)
     if cached:
         try:
@@ -475,6 +479,10 @@ async def generate_recommendation(
     weights = _select_weights(india_vix, regime)
     sector = _sector_for(symbol)
 
+    fundamental_valuation = analyze_fundamental_valuation(fundamentals, sector=sector)
+    if fundamentals is not None:
+        fundamentals = {**fundamentals, "fundamental_valuation": fundamental_valuation}
+
     contributions, fno_sig, fii_sig = _score_all(
         tech, delivery_pct, fii_dii, options, rs_rank, pchg_1d,
         news=news, fundamentals=fundamentals, weekly_tech=weekly_tech,
@@ -520,6 +528,22 @@ async def generate_recommendation(
     elif len(df) < 120:
         data_quality = "limited_history"
 
+    ensemble = build_recommendation_ensemble(
+        action=action,
+        weighted_score=weighted,
+        calibrated_conviction=conviction,
+        factor_agreement=agreement,
+        risk_reward=rr,
+        regime=regime,
+        contributions=contributions,
+        fundamental_valuation=fundamental_valuation,
+        portfolio_context=portfolio_context,
+        data_quality=data_quality,
+    )
+    if action in {"BUY", "SELL", "HOLD"}:
+        action = ensemble["suggested_action"]
+        conviction = ensemble["final_conviction"]
+
     rec = Recommendation(
         symbol=symbol, exchange="NSE", horizon=horizon, action=action,
         conviction=conviction, entry=round(entry, 2), stoploss=round(sl, 2),
@@ -538,8 +562,49 @@ async def generate_recommendation(
         calibration_note=calibration_note,
         data_quality=data_quality,
         portfolio_context=portfolio_context,
+        fundamental_valuation=fundamental_valuation,
+        ensemble=ensemble,
+        llm_judge=None,
         generated_at=datetime.now(timezone.utc),
     )
+
+    if use_llm_judge and horizon != "intraday" and action != "AVOID":
+        try:
+            from app.services.recommendation_llm_judge import judge_recommendation
+            judge = await judge_recommendation(
+                rec,
+                evidence={
+                    "fundamental_valuation": fundamental_valuation,
+                    "market_regime": regime,
+                    "factor_agreement": agreement,
+                    "risk_reward": rr,
+                    "data_quality": data_quality,
+                },
+                reasoning_effort=reasoning_effort,
+            )
+            ensemble = build_recommendation_ensemble(
+                action=action,
+                weighted_score=weighted,
+                calibrated_conviction=conviction,
+                factor_agreement=agreement,
+                risk_reward=rr,
+                regime=regime,
+                contributions=contributions,
+                fundamental_valuation=fundamental_valuation,
+                portfolio_context=portfolio_context,
+                data_quality=data_quality,
+                llm_judge=judge,
+            )
+            rec = rec.model_copy(update={
+                "action": ensemble["suggested_action"],
+                "conviction": ensemble["final_conviction"],
+                "ensemble": ensemble,
+                "llm_judge": judge,
+                "calibration_note": f"{calibration_note} LLM judge: {judge.get('summary', '')}".strip(),
+            })
+        except Exception as e:
+            logger.debug("llm judge skipped for %s: %s", symbol, e)
+
     await cache_manager.set(cache_key, rec.model_dump(mode="json"), ttl=_HORIZON_TTL[horizon])
     # Persist to the outcome tracker (no-op for HOLD/AVOID). Fire-and-forget
     # — tracker failures must not break the recommendation surface.

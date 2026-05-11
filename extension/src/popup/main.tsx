@@ -3,6 +3,16 @@ import { createRoot } from "react-dom/client";
 import App from "./App";
 import "./index.css";
 
+window.addEventListener("unhandledrejection", (event) => {
+  const reason = event.reason;
+  const message =
+    reason instanceof Error ? reason.message : typeof reason === "string" ? reason : "";
+  if (message.includes("Request timed out after")) {
+    console.warn("[agentX] Background request timed out:", message);
+    event.preventDefault();
+  }
+});
+
 // When opened as a standalone tab/window (?standalone=1), let the UI fill the viewport.
 if (new URLSearchParams(window.location.search).get("standalone") === "1") {
   document.documentElement.classList.add("standalone");

@@ -128,6 +128,10 @@ export default function SignalCard({ recommendation: r, onSelect, className }: S
 
   const lastPrice = r.lastPrice ?? r.entryPrice ?? null;
   const sectorLabel = r.sector ?? "Sector unknown";
+  const fv = r.fundamentalValuation;
+  const fvRedFlags = fv ? ((fv.redFlags ?? fv.red_flags ?? []) as string[]) : [];
+  const ensemble = r.ensemble;
+  const llmJudge = r.llmJudge;
 
   return (
     <div
@@ -308,6 +312,37 @@ export default function SignalCard({ recommendation: r, onSelect, className }: S
               Agreement {Math.round(r.factorAgreement * 100)}%
             </span>
           )}
+          {fv && typeof fv.score === "number" && (
+            <span
+              className={[
+                "px-1.5 py-0.5 rounded border",
+                fv.score >= 65
+                  ? "border-rec-success/30 text-rec-success"
+                  : fv.score < 45
+                    ? "border-rec-danger/30 text-rec-danger"
+                    : "border-rec-border",
+              ].join(" ")}
+              title={fvRedFlags[0] ?? fv.reasons?.[0] ?? "Fundamental valuation score"}
+            >
+              FV {fv.grade ?? "N/A"} {Math.round(fv.score)}
+            </span>
+          )}
+          {ensemble && typeof (ensemble.finalConviction ?? ensemble.final_conviction) === "number" && (
+            <span
+              className="px-1.5 py-0.5 rounded border border-rec-border"
+              title={(ensemble.blockers?.[0] ?? ensemble.notes?.[0]) || "Ensemble calibrated conviction"}
+            >
+              Ensemble {Math.round((ensemble.finalConviction ?? ensemble.final_conviction) as number)}
+            </span>
+          )}
+          {llmJudge?.verdict && (
+            <span
+              className="px-1.5 py-0.5 rounded border border-rec-info/30 text-rec-info"
+              title={llmJudge.summary ?? "LLM judge verdict"}
+            >
+              LLM {llmJudge.verdict}
+            </span>
+          )}
         </div>
       )}
 
@@ -323,6 +358,16 @@ export default function SignalCard({ recommendation: r, onSelect, className }: S
       {r.portfolioContext?.notes && r.portfolioContext.notes.length > 0 && (
         <p className="mt-1 text-[10px] leading-snug text-rec-fg-muted">
           Portfolio: {r.portfolioContext.notes[0]}
+        </p>
+      )}
+      {fvRedFlags.length > 0 && (
+        <p className="mt-1 text-[10px] leading-snug text-rec-danger">
+          Fundamentals: {fvRedFlags[0]}
+        </p>
+      )}
+      {llmJudge?.summary && (
+        <p className="mt-1 text-[10px] leading-snug text-rec-fg-muted">
+          LLM judge: {llmJudge.summary}
         </p>
       )}
 

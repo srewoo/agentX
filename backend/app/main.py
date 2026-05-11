@@ -187,8 +187,16 @@ _DEFAULT_RATE_LIMIT = (120, 60)  # 120 req/min global
 _request_counter = 0
 _CLEANUP_EVERY_N_REQUESTS = 100
 
-# Request timeout (seconds)
+# Request timeout (seconds). Some analytics endpoints are expected to be slow
+# on cold cache because they hit EOD data, fundamentals, and/or an LLM.
 _REQUEST_TIMEOUT = 60
+_ROUTE_TIMEOUTS: list[tuple[str, str | None, int]] = [
+    ("/api/stocks/", "/ai-analysis", 120),
+    ("/api/recommendations", None, 90),
+    ("/api/market/context", None, 45),
+    ("/api/scan/trigger", None, 120),
+    ("/api/backtest/", None, 120),
+]
 
 # Trust X-Forwarded-For only when explicitly opted in. Default: off, so
 # clients can't spoof their IP by setting the header. Enable behind a
@@ -224,6 +232,16 @@ def _match_route_limit(path: str) -> tuple[str, int, int]:
         return bucket_id, limit, window
     limit, window = _DEFAULT_RATE_LIMIT
     return "default", limit, window
+
+
+def _route_timeout(path: str) -> int:
+    for prefix, suffix, timeout in _ROUTE_TIMEOUTS:
+        if not path.startswith(prefix):
+            continue
+        if suffix is not None and not path.endswith(suffix):
+            continue
+        return timeout
+    return _REQUEST_TIMEOUT
 
 
 def _is_public_ip(ip_str: str) -> bool:
@@ -352,13 +370,14 @@ async def _handle_request(
         )
 
     # Request timeout — prevent hung yfinance/LLM calls from blocking forever
+    timeout = _route_timeout(path)
     try:
-        return await asyncio.wait_for(call_next(request), timeout=_REQUEST_TIMEOUT)
+        return await asyncio.wait_for(call_next(request), timeout=timeout)
     except asyncio.TimeoutError:
-        logger.error("[%s] TIMEOUT after %ds: %s", req_id, _REQUEST_TIMEOUT, path)
+        logger.error("[%s] TIMEOUT after %ds: %s", req_id, timeout, path)
         return JSONResponse(
             status_code=504,
-            content={"detail": f"Request timed out after {_REQUEST_TIMEOUT}s"},
+            content={"detail": f"Request timed out after {timeout}s"},
         )
 
 

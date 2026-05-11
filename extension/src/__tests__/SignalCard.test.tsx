@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from "vitest";
 import { render, screen, fireEvent } from "@testing-library/react";
 import SignalCard from "../popup/components/SignalCard";
 import type { Signal } from "../shared/types";
+import { api } from "../shared/api";
 
 // Mock the MiniChart component (uses lightweight-charts which needs canvas)
 vi.mock("../popup/components/MiniChart", () => ({
@@ -14,6 +15,23 @@ vi.mock("../shared/api", () => ({
     markRead: vi.fn(async () => ({ ok: true })),
     getTechnicals: vi.fn(async () => ({ atr: null })),
     getHistory: vi.fn(async () => ({ history: [] })),
+    deepSignalAnalysis: vi.fn(async () => ({
+      data: {
+        verdict: "WATCH",
+        confidence: 68,
+        summary: "Constructive, but wait for confirmation.",
+        bull_case: ["Trend is improving."],
+        bear_case: ["Historical edge is still thin."],
+        invalidations: ["Close below support."],
+        portfolio_note: "No concentration issue.",
+        risk_controls: ["Use a predefined stop."],
+        data_gaps: ["No order book."],
+        not_advice: "Research signal only, not investment advice.",
+        engine: "openai_responses",
+        symbol: "RELIANCE",
+        reasoning_effort: "medium",
+      },
+    })),
   },
 }));
 
@@ -113,6 +131,16 @@ describe("SignalCard", () => {
     render(<SignalCard signal={makeSignal()} onRead={onRead} onDismiss={onDismiss} />);
     fireEvent.click(screen.getByRole("button"));
     expect(screen.getByText(/Price spikes can reverse quickly/)).toBeInTheDocument();
+  });
+
+  it("should run thinking analysis from the expanded card", async () => {
+    render(<SignalCard signal={makeSignal()} onRead={onRead} onDismiss={onDismiss} />);
+    fireEvent.click(screen.getByRole("button"));
+    fireEvent.click(screen.getByText("Think"));
+
+    expect(api.deepSignalAnalysis).toHaveBeenCalledWith("sig-001", "medium");
+    expect(await screen.findByText("Thinking review")).toBeInTheDocument();
+    expect(screen.getByText(/Constructive, but wait for confirmation/)).toBeInTheDocument();
   });
 
   it("should call onRead when unread card is expanded", () => {

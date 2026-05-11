@@ -222,6 +222,8 @@ export default function Dashboard({ onSelectSymbol }: DashboardProps = {}) {
       await api.triggerScan();
       setCleared(false);
       await reload();
+    } catch (e) {
+      console.warn("[agentX] Scan request failed:", e instanceof Error ? e.message : e);
     } finally {
       setScanning(false);
     }

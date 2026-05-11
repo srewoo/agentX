@@ -120,6 +120,22 @@ export interface AIAnalysisResponse {
   analysis: AIAnalysis;
 }
 
+export interface DeepSignalAnalysis {
+  verdict: "ACT" | "WATCH" | "AVOID" | "EXIT_REVIEW";
+  confidence: number;
+  summary: string;
+  bull_case: string[];
+  bear_case: string[];
+  invalidations: string[];
+  portfolio_note: string;
+  risk_controls: string[];
+  data_gaps: string[];
+  not_advice: string;
+  engine: string;
+  symbol: string;
+  reasoning_effort: string | null;
+}
+
 export interface WatchlistItem {
   symbol: string;
   name: string;

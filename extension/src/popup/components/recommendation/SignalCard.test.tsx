@@ -73,6 +73,23 @@ describe("SignalCard (recommendation)", () => {
     expect(screen.getByLabelText(/F and O: Long Buildup/i)).toBeInTheDocument();
   });
 
+  it("renders fundamental valuation, ensemble, and LLM judge chips", () => {
+    render(
+      <SignalCard
+        recommendation={makeRec({
+          fundamentalValuation: { score: 72, grade: "B", reasons: ["ROE is strong."] },
+          ensemble: { final_conviction: 74, suggested_action: "BUY", notes: ["Good agreement."] },
+          llmJudge: { verdict: "CONFIRM", confidence_adjustment: 2, summary: "Evidence is aligned." },
+          dataQuality: "eod_verified",
+        })}
+      />
+    );
+    expect(screen.getByText("FV B 72")).toBeInTheDocument();
+    expect(screen.getByText("Ensemble 74")).toBeInTheDocument();
+    expect(screen.getByText("LLM CONFIRM")).toBeInTheDocument();
+    expect(screen.getByText(/LLM judge: Evidence is aligned/)).toBeInTheDocument();
+  });
+
   it("omits flows / F&O / delivery chips when not provided", () => {
     render(
       <SignalCard

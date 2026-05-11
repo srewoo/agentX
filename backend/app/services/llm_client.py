@@ -290,6 +290,72 @@ async def call_llm(
     ) from last_exc
 
 
+async def call_openai_responses_json(
+    *,
+    model: str,
+    api_key: str,
+    prompt: str,
+    schema: dict,
+    system_message: str,
+    reasoning_effort: str = "medium",
+    max_output_tokens: int = 2500,
+    route: Optional[str] = None,
+    symbol: Optional[str] = None,
+) -> str:
+    """Call OpenAI Responses API with reasoning effort and structured output.
+
+    This is intentionally separate from `call_llm`, which preserves the legacy
+    Chat Completions path for fast signal narratives and non-OpenAI providers.
+    """
+    if not api_key:
+        raise ValueError("No OpenAI API key configured.")
+    _validate_provider_model("openai", model)
+    await _enforce_daily_cap()
+    if openai is None:  # pragma: no cover
+        raise RuntimeError("openai SDK not installed")
+
+    client = openai.AsyncOpenAI(api_key=api_key)
+    try:
+        response = await client.responses.create(
+            model=model,
+            reasoning={"effort": reasoning_effort},
+            input=[
+                {"role": "developer", "content": system_message},
+                {"role": "user", "content": prompt},
+            ],
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": "deep_signal_analysis",
+                    "strict": True,
+                    "schema": schema,
+                }
+            },
+            max_output_tokens=max_output_tokens,
+        )
+        text = getattr(response, "output_text", None)
+        if not text:
+            chunks: list[str] = []
+            for item in getattr(response, "output", []) or []:
+                for content in getattr(item, "content", []) or []:
+                    if getattr(content, "type", None) in {"output_text", "text"}:
+                        chunks.append(getattr(content, "text", "") or "")
+            text = "".join(chunks).strip()
+
+        usage_obj = getattr(response, "usage", None)
+        usage = {
+            "prompt_tokens": getattr(usage_obj, "input_tokens", 0) or 0,
+            "completion_tokens": getattr(usage_obj, "output_tokens", 0) or 0,
+            "request_id": getattr(response, "id", None),
+        }
+        await _record_success("openai", model, usage, route=route, symbol=symbol)
+        return (text or "").strip()
+    except Exception as exc:
+        await _record_failure("openai", model, route=route, symbol=symbol)
+        logger.error("OpenAI Responses call failed: %s", exc)
+        raise RuntimeError(f"OpenAI Responses error: {exc}") from exc
+
+
 # ─────────────────────────────────────────────
 # Usage recording helpers
 # ─────────────────────────────────────────────

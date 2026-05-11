@@ -9,6 +9,7 @@ from fastapi import APIRouter, HTTPException
 
 from app.database import DB_PATH
 from app.services.orchestrator import run_scan_cycle
+from app.services.thinking_analyst import analyze_signal_deep
 
 router = APIRouter(prefix="/api/signals", tags=["signals"])
 logger = logging.getLogger(__name__)
@@ -73,6 +74,21 @@ async def dismiss_signal(signal_id: str):
         await db.execute("UPDATE signals SET dismissed = 1 WHERE id = ?", (signal_id,))
         await db.commit()
     return {"ok": True}
+
+
+@router.post("/{signal_id}/deep-analysis")
+async def deep_signal_analysis(signal_id: str, reasoning_effort: str = "medium"):
+    """Run on-demand thinking-model review for one signal card."""
+    if reasoning_effort not in {"low", "medium", "high"}:
+        raise HTTPException(status_code=400, detail="reasoning_effort must be low, medium, or high")
+    try:
+        result = await analyze_signal_deep(signal_id, reasoning_effort=reasoning_effort)
+        return {"data": result}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.exception("Deep signal analysis failed for %s: %s", signal_id, e)
+        raise HTTPException(status_code=500, detail="Failed to run deep signal analysis")
 
 
 @router.post("/read-all")

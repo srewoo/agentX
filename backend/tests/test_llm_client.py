@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.services.llm_client import (
     call_llm,
+    call_openai_responses_json,
     SUPPORTED_MODELS,
     _is_openai_reasoning,
     _validate_provider_model,
@@ -195,6 +196,43 @@ class TestCallOpenAI:
             mock_openai.AsyncOpenAI.return_value = mock_client
             with pytest.raises(RuntimeError, match="OpenAI error"):
                 await call_llm("openai", "gpt-5", "key123", "prompt")
+
+
+class TestCallOpenAIResponses:
+    @pytest.mark.asyncio
+    async def test_responses_api_uses_reasoning_and_schema(self):
+        fake_resp = MagicMock()
+        fake_resp.output_text = '{"verdict":"WATCH"}'
+        fake_resp.usage = MagicMock(input_tokens=10, output_tokens=20)
+        fake_resp.id = "resp_123"
+        mock_client = MagicMock()
+        mock_client.responses.create = AsyncMock(return_value=fake_resp)
+
+        schema = {
+            "type": "object",
+            "properties": {"verdict": {"type": "string"}},
+            "required": ["verdict"],
+            "additionalProperties": False,
+        }
+        with patch("app.services.llm_client.openai") as mock_openai:
+            mock_openai.AsyncOpenAI.return_value = mock_client
+            result = await call_openai_responses_json(
+                model="gpt-5",
+                api_key="key123",
+                prompt="prompt",
+                schema=schema,
+                system_message="sys",
+                reasoning_effort="high",
+                route="test",
+                symbol="RELIANCE",
+            )
+
+        assert result == '{"verdict":"WATCH"}'
+        kwargs = mock_client.responses.create.call_args.kwargs
+        assert kwargs["reasoning"] == {"effort": "high"}
+        assert kwargs["text"]["format"]["type"] == "json_schema"
+        assert kwargs["text"]["format"]["schema"] == schema
+        assert kwargs["input"][0]["role"] == "developer"
 
 
 # ─────────────────────────────────────────────

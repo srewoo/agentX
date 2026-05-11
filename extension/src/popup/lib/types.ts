@@ -50,6 +50,29 @@ export interface Recommendation {
     decision?: string;
     notes?: string[];
   } | null;
+  fundamentalValuation?: {
+    score?: number;
+    grade?: string;
+    reasons?: string[];
+    red_flags?: string[];
+    redFlags?: string[];
+  } | null;
+  ensemble?: {
+    final_conviction?: number;
+    finalConviction?: number;
+    suggested_action?: Direction;
+    suggestedAction?: Direction;
+    notes?: string[];
+    blockers?: string[];
+  } | null;
+  llmJudge?: {
+    verdict?: string;
+    confidence_adjustment?: number;
+    confidenceAdjustment?: number;
+    summary?: string;
+    risk_flags?: string[];
+    riskFlags?: string[];
+  } | null;
   advisoryDisclaimer?: string;
   signals?: ReadonlyArray<{
     name: string;

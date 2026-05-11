@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import type { Signal, AppSettings, PaperTrade, SignalEdgeRow } from "../../shared/types";
+import type { Signal, AppSettings, PaperTrade, SignalEdgeRow, DeepSignalAnalysis } from "../../shared/types";
 import { SIGNAL_TYPE_LABELS, DIRECTION_ACTION, ACTION_COLORS, getSignalTimeframe } from "../../shared/constants";
 import { api } from "../../shared/api";
 import { getSettings, saveSettings } from "../../shared/storage";
@@ -118,6 +118,9 @@ export default function SignalCard({ signal, onRead, onDismiss }: Props) {
   );
   const [settings, setSettings] = useState<Partial<AppSettings>>({});
   const [edge, setEdge] = useState<SignalEdgeRow | null>(null);
+  const [deepAnalysis, setDeepAnalysis] = useState<DeepSignalAnalysis | null>(null);
+  const [thinking, setThinking] = useState(false);
+  const [thinkingError, setThinkingError] = useState<string | null>(null);
 
   // Load advisor settings + lazy-fetch ATR on first expand if not in metadata
   useEffect(() => {
@@ -171,6 +174,19 @@ export default function SignalCard({ signal, onRead, onDismiss }: Props) {
     await paperTrades.add(t);
     setTradeAdded(true);
     setTimeout(() => setTradeAdded(false), 2500);
+  };
+
+  const runThinkingAnalysis = async () => {
+    setThinking(true);
+    setThinkingError(null);
+    try {
+      const response = await api.deepSignalAnalysis(signal.id, "medium");
+      setDeepAnalysis(response.data);
+    } catch (err) {
+      setThinkingError(err instanceof Error ? err.message : "Thinking analysis failed");
+    } finally {
+      setThinking(false);
+    }
   };
 
   const handleExpand = () => {
@@ -343,6 +359,32 @@ export default function SignalCard({ signal, onRead, onDismiss }: Props) {
               {signal.llm_summary}
             </div>
           )}
+          {deepAnalysis && (
+            <div className="text-xs text-zinc-200 leading-relaxed bg-violet-500/10 border border-violet-500/20 rounded-lg p-2.5 space-y-1.5">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-brand-light font-semibold">Thinking review</span>
+                <span className="text-[10px] text-zinc-400">
+                  {deepAnalysis.verdict} · {deepAnalysis.confidence}%
+                </span>
+              </div>
+              <p>{deepAnalysis.summary}</p>
+              {deepAnalysis.bear_case.length > 0 && (
+                <p className="text-zinc-300">
+                  <span className="font-semibold">Watch: </span>{deepAnalysis.bear_case[0]}
+                </p>
+              )}
+              {deepAnalysis.risk_controls.length > 0 && (
+                <p className="text-zinc-400">
+                  <span className="font-semibold">Control: </span>{deepAnalysis.risk_controls[0]}
+                </p>
+              )}
+            </div>
+          )}
+          {thinkingError && (
+            <div className="text-[10px] text-loss bg-red-500/10 rounded p-2">
+              {thinkingError}
+            </div>
+          )}
           {signal.risk && (
             <div className="text-xs text-warn leading-relaxed bg-warn/5 rounded-lg p-2">
               <span className="font-semibold">⚠ Risk: </span>{signal.risk}
@@ -404,6 +446,11 @@ export default function SignalCard({ signal, onRead, onDismiss }: Props) {
                   Take this trade
                 </button>
               )}
+              <button onClick={(e) => { e.stopPropagation(); runThinkingAnalysis(); }}
+                disabled={thinking}
+                className="px-2 py-0.5 rounded border border-violet-500/30 text-violet-300 hover:bg-violet-500/10 disabled:opacity-60">
+                {thinking ? "Thinking..." : "Think"}
+              </button>
               <button onClick={(e) => { e.stopPropagation(); muteSymbol(); }}
                 className="px-2 py-0.5 rounded border border-zinc-700 text-zinc-400 hover:text-zinc-100">
                 Mute {signal.symbol}

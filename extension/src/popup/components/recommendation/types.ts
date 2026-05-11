@@ -54,6 +54,9 @@ export interface RecommendationView extends BaseRecommendation {
   calibrationNote?: string | null;
   dataQuality?: string | null;
   portfolioContext?: BaseRecommendation["portfolioContext"];
+  fundamentalValuation?: BaseRecommendation["fundamentalValuation"];
+  ensemble?: BaseRecommendation["ensemble"];
+  llmJudge?: BaseRecommendation["llmJudge"];
   advisoryDisclaimer?: string;
 }
 

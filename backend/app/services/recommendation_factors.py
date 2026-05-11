@@ -160,6 +160,10 @@ def fundamentals_score(fund: Optional[dict[str, Any]]) -> tuple[float, Optional[
     """
     if not fund:
         return 0.0, None, "neutral"
+    enhanced = fund.get("fundamental_valuation") if isinstance(fund, dict) else None
+    if isinstance(enhanced, dict) and enhanced.get("available"):
+        score = clip(float(enhanced.get("normalized_score") or 0.0))
+        return score, float(enhanced.get("score") or 50), _direction(score)
     val = fund.get("valuation") or {}
     prof = fund.get("profitability") or {}
     fh = fund.get("financial_health") or {}

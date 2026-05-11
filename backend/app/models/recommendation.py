@@ -61,6 +61,9 @@ class Recommendation(BaseModel):
     calibration_note: Optional[str] = None
     data_quality: Optional[str] = None
     portfolio_context: Optional[dict] = None
+    fundamental_valuation: Optional[dict] = None
+    ensemble: Optional[dict] = None
+    llm_judge: Optional[dict] = None
     advisory_disclaimer: str = (
         "Research signal only, not investment advice. Validate independently "
         "and use your own risk controls."

@@ -2,7 +2,7 @@ import { getBackendUrl, getSettings } from "./storage";
 import type {
   Signal, StockQuote, TechnicalsResponse, AIAnalysisResponse, WatchlistItem, AppSettings, HealthResponse,
   NewsItem, CorporateAction, OptionsAnalysis, BlockDeal, BacktestResult, ScreenerParams, FundamentalsResponse,
-  SignalEdgeResponse, InsightsResponse, BacktestRun,
+  SignalEdgeResponse, InsightsResponse, BacktestRun, DeepSignalAnalysis,
 } from "./types";
 
 const DEFAULT_TIMEOUT_MS = 30_000; // 30 seconds
@@ -55,6 +55,12 @@ export const api = {
   markRead: (id: string) => request<{ ok: boolean }>(`/api/signals/${id}/read`, { method: "POST" }),
   dismissSignal: (id: string) => request<{ ok: boolean }>(`/api/signals/${id}/dismiss`, { method: "POST" }),
   markAllRead: () => request<{ ok: boolean }>("/api/signals/read-all", { method: "POST" }),
+  deepSignalAnalysis: (id: string, reasoningEffort: "low" | "medium" | "high" = "medium") =>
+    request<{ data: DeepSignalAnalysis }>(
+      `/api/signals/${encodeURIComponent(id)}/deep-analysis?reasoning_effort=${reasoningEffort}`,
+      { method: "POST" },
+      90_000,
+    ),
 
   // Stocks
   search: (q: string) =>
@@ -70,7 +76,7 @@ export const api = {
     request<AIAnalysisResponse>(`/api/stocks/${symbol}/ai-analysis`, {
       method: "POST",
       body: JSON.stringify({ timeframe }),
-    }, 60_000),  // AI analysis can take 10-30s
+    }, 120_000),  // AI analysis can be slow on cold fundamentals/LLM cache
 
   // Watchlist
   getWatchlist: () => request<{ watchlist: WatchlistItem[] }>("/api/watchlist"),
@@ -88,7 +94,7 @@ export const api = {
     fii_dii: { fii_net: number | null; dii_net: number | null; sentiment: string; source: string } | null;
     india_vix: number | null;
     market_regime: { regime: string; confidence: number; description: string } | null;
-  }>("/api/market/context", {}, 60_000),
+  }>("/api/market/context", {}, 45_000),
 
   // Settings
   getSettings: () => request<{ settings: AppSettings }>("/api/settings"),

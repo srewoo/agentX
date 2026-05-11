@@ -218,6 +218,11 @@ type RawRecommendation = Partial<{
   dataQuality: string | null;
   portfolio_context: Recommendation["portfolioContext"];
   portfolioContext: Recommendation["portfolioContext"];
+  fundamental_valuation: Recommendation["fundamentalValuation"];
+  fundamentalValuation: Recommendation["fundamentalValuation"];
+  ensemble: Recommendation["ensemble"];
+  llm_judge: Recommendation["llmJudge"];
+  llmJudge: Recommendation["llmJudge"];
   advisory_disclaimer: string;
   advisoryDisclaimer: string;
   signals: RawFactor[];
@@ -309,6 +314,9 @@ function normalizeRecommendation(raw: unknown): Recommendation {
     calibrationNote: raw.calibrationNote ?? raw.calibration_note ?? null,
     dataQuality: raw.dataQuality ?? raw.data_quality ?? null,
     portfolioContext: normalizePortfolioContext(raw.portfolioContext ?? raw.portfolio_context),
+    fundamentalValuation: raw.fundamentalValuation ?? raw.fundamental_valuation ?? null,
+    ensemble: raw.ensemble ?? null,
+    llmJudge: raw.llmJudge ?? raw.llm_judge ?? null,
     advisoryDisclaimer:
       raw.advisoryDisclaimer ??
       raw.advisory_disclaimer ??

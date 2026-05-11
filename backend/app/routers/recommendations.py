@@ -126,13 +126,20 @@ async def list_sector_summaries(
 async def get_recommendation(
     symbol: str,
     horizon: HorizonQuery = "swing",
+    llm_judge: bool = False,
+    reasoning_effort: Literal["low", "medium", "high"] = "medium",
 ):
     """Single-symbol recommendation. 404 when no data is available."""
     horizon = _normalize_horizon(horizon)
     sym = symbol.strip().upper()
     if not sym or len(sym) > 25:
         raise HTTPException(status_code=400, detail="Invalid symbol")
-    rec = await generate_recommendation(sym, horizon=horizon)
+    rec = await generate_recommendation(
+        sym,
+        horizon=horizon,
+        use_llm_judge=llm_judge,
+        reasoning_effort=reasoning_effort,
+    )
     if rec is None:
         raise HTTPException(
             status_code=404,
