@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from app.services import technicals as technicals_mod
 from app.services.technicals import (
     compute_fibonacci_levels,
     compute_support_resistance,
@@ -26,6 +27,7 @@ class TestComputeTechnicals:
         expected_keys = {
             "rsi", "adx", "macd", "vwap", "stochastic", "obv", "atr",
             "ichimoku", "cci", "williams_r", "mfi",
+            "indicator_backend", "candlestick_patterns",
         }
         for key in expected_keys:
             assert key in result, f"Missing key: {key}"
@@ -140,6 +142,24 @@ class TestComputeTechnicals:
         result = compute_technicals(df)
         assert isinstance(result, dict)
         assert len(result) > 0
+        assert result["adx"] is None
+
+    def test_given_27_rows_when_computed_then_adx_skips_without_error(self):
+        rng = np.random.default_rng(321)
+        n = 27
+        closes = np.cumsum(rng.normal(0, 1, n)) + 1000
+        df = pd.DataFrame(
+            {
+                "Open": closes - rng.uniform(0, 2, n),
+                "High": closes + rng.uniform(1, 5, n),
+                "Low": closes - rng.uniform(1, 5, n),
+                "Close": closes,
+                "Volume": rng.uniform(500_000, 2_000_000, n),
+            }
+        )
+        result = compute_technicals(df)
+        assert isinstance(result, dict)
+        assert result["adx"] is None
 
     def test_given_100_row_df_when_computed_then_obv_trend_present(self, sample_ohlcv_100):
         result = compute_technicals(sample_ohlcv_100)
@@ -151,6 +171,88 @@ class TestComputeTechnicals:
         assert "current_price" in result
         assert result["current_price"] is not None
         assert result["current_price"] > 0
+
+    def test_given_100_row_df_when_computed_then_reports_indicator_backend(self, sample_ohlcv_100):
+        result = compute_technicals(sample_ohlcv_100)
+
+        assert result["indicator_backend"] in {"ta", "talib"}
+        assert isinstance(result["candlestick_patterns"], dict)
+
+    def test_given_talib_available_when_computed_then_uses_talib_backend(
+        self, sample_ohlcv_100, monkeypatch
+    ):
+        class FakeTalib:
+            @staticmethod
+            def RSI(close, timeperiod=14):
+                return np.full(len(close), 55.0)
+
+            @staticmethod
+            def MACD(close, fastperiod=12, slowperiod=26, signalperiod=9):
+                return (
+                    np.full(len(close), 2.0),
+                    np.full(len(close), 1.0),
+                    np.full(len(close), 1.0),
+                )
+
+            @staticmethod
+            def ADX(high, low, close, timeperiod=14):
+                return np.full(len(close), 25.0)
+
+            @staticmethod
+            def SMA(close, timeperiod=20):
+                return np.full(len(close), 100.0)
+
+            @staticmethod
+            def EMA(close, timeperiod=20):
+                return np.full(len(close), 101.0)
+
+            @staticmethod
+            def BBANDS(close, timeperiod=20, nbdevup=2, nbdevdn=2, matype=0):
+                return (
+                    np.full(len(close), 110.0),
+                    np.full(len(close), 100.0),
+                    np.full(len(close), 90.0),
+                )
+
+            @staticmethod
+            def STOCH(*args, **kwargs):
+                length = len(args[2])
+                return np.full(length, 70.0), np.full(length, 60.0)
+
+            @staticmethod
+            def OBV(close, volume):
+                return np.arange(len(close), dtype=float)
+
+            @staticmethod
+            def ATR(high, low, close, timeperiod=14):
+                return np.full(len(close), 3.0)
+
+            @staticmethod
+            def CCI(high, low, close, timeperiod=20):
+                return np.full(len(close), 10.0)
+
+            @staticmethod
+            def WILLR(high, low, close, timeperiod=14):
+                return np.full(len(close), -40.0)
+
+            @staticmethod
+            def MFI(high, low, close, volume, timeperiod=14):
+                return np.full(len(close), 50.0)
+
+            @staticmethod
+            def CDLDOJI(open_, high, low, close):
+                out = np.zeros(len(close))
+                out[-1] = 100
+                return out
+
+        monkeypatch.setattr(technicals_mod, "_talib", FakeTalib)
+
+        result = compute_technicals(sample_ohlcv_100)
+
+        assert result["indicator_backend"] == "talib"
+        assert result["rsi"] == 55.0
+        assert result["macd"]["signal"] == "Bullish"
+        assert result["candlestick_patterns"]["doji"]["signal"] == "bullish"
 
 
 # ---------------------------------------------------------------------------

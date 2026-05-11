@@ -85,7 +85,53 @@ describe("api client", () => {
     await apiClient.getRecommendations({ horizon: "swing", minConviction: 0.7 });
     const url = fetchSpy.mock.calls[0][0] as string;
     expect(url).toContain("horizon=swing");
-    expect(url).toContain("minConviction=0.7");
+    expect(url).toContain("min_conviction=70");
+  });
+
+  it("normalizes backend recommendation fields for the popup", async () => {
+    mockJson({
+      data: [{
+        symbol: "reliance",
+        exchange: "NSE",
+        horizon: "positional",
+        action: "BUY",
+        conviction: 78,
+        entry: 2500,
+        stoploss: 2400,
+        target1: 2700,
+        target2: 2850,
+        risk_reward: 2,
+        reasons: ["Trend strongly bullish."],
+        sector: "Energy",
+        market_cap_band: "LARGE",
+        last_price: 2520,
+        price_change_pct_1d: 1.2,
+        delivery_pct: 48,
+        fii_dii_signal: "INFLOW",
+        f_and_o_signal: "LONG_BUILDUP",
+        generated_at: "2026-05-08T04:30:00.000Z",
+        signals: [{ name: "trend", weight: 0.16, score: 0.8, direction: "bullish" }],
+      }],
+    });
+    const [rec] = await apiClient.getRecommendations();
+    expect(rec).toMatchObject({
+      symbol: "RELIANCE",
+      horizon: "long",
+      direction: "BUY",
+      conviction: 0.78,
+      entryPrice: 2500,
+      stopLoss: 2400,
+      target: 2700,
+      riskReward: 2,
+      rationale: ["Trend strongly bullish."],
+      marketCapBand: "LARGE",
+      lastPrice: 2520,
+      priceChangePct1d: 1.2,
+      deliveryPct: 48,
+      fiiDiiSignal: "INFLOW",
+      fAndOSignal: "LONG_BUILDUP",
+    });
+    expect(rec.signals?.[0]).toEqual({ name: "trend", weight: 0.16, value: 0.8, direction: "pos" });
   });
 
   it("times out and throws ApiError(TIMEOUT)", async () => {

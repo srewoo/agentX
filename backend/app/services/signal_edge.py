@@ -108,6 +108,24 @@ RECOMMENDED_MUTES: list[str] = [
     "hammer",
 ]
 
+# Backtest-driven execution policy. These setups are allowed as information,
+# but should not become trade/paper-trade candidates unless other independent
+# evidence confirms them.
+HARD_CONFIRMATION_REQUIRED: set[tuple[str, str]] = {
+    ("cup_and_handle", "bullish"),
+    ("hammer", "bullish"),
+    ("head_and_shoulders", "bearish"),
+}
+
+SOFT_CONFIRMATION_REQUIRED: set[tuple[str, str]] = {
+    ("rsi_extreme", "bullish"),
+    ("bearish_engulfing", "bearish"),
+    ("double_bottom", "bullish"),
+    ("confluence", "bullish"),
+}
+
+WEAK_DIRECTIONAL_SETUPS = HARD_CONFIRMATION_REQUIRED | SOFT_CONFIRMATION_REQUIRED
+
 # Methodology metadata so the UI can disclose what it's looking at.
 EDGE_META = {
     "source": "internal_backtest_2026-05-07",
@@ -122,6 +140,24 @@ EDGE_META = {
 def get_edge(signal_type: str, direction: str) -> Optional[dict]:
     """Look up edge for a (signal_type, direction) pair. Returns None if unknown."""
     return SIGNAL_EDGE.get((signal_type, direction))
+
+
+def has_positive_edge(signal_type: str, direction: str, min_trades: int = 50) -> bool:
+    """True when the cold-start backtest says the setup has positive expectancy."""
+    edge = get_edge(signal_type, direction)
+    if not edge:
+        return False
+    return edge.get("trades", 0) >= min_trades and edge.get("avg_pnl", 0.0) > 0
+
+
+def requires_confirmation(signal_type: str, direction: str) -> str | None:
+    """Return the required policy for a weak setup: hard, soft, or None."""
+    key = (signal_type, direction)
+    if key in HARD_CONFIRMATION_REQUIRED:
+        return "hard"
+    if key in SOFT_CONFIRMATION_REQUIRED:
+        return "soft"
+    return None
 
 
 def get_family(signal_type: str) -> str:

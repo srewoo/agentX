@@ -162,17 +162,158 @@ type RawLlmUsageResp = Partial<{
 
 const asArray = <T>(v: unknown): T[] => (Array.isArray(v) ? (v as T[]) : []);
 
+type RawFactor = {
+  name?: string;
+  weight?: number;
+  value?: number | null;
+  score?: number;
+  direction?: "bullish" | "bearish" | "neutral" | "pos" | "neg" | "neu";
+};
+
+type RawRecommendation = Partial<{
+  id: string;
+  symbol: string;
+  name: string;
+  exchange: "NSE" | "BSE";
+  horizon: "intraday" | "swing" | "positional" | "long";
+  action: "BUY" | "SELL" | "HOLD" | "AVOID";
+  direction: "BUY" | "SELL" | "HOLD" | "AVOID";
+  conviction: number;
+  entry: number;
+  entryPrice: number;
+  stoploss: number;
+  stopLoss: number;
+  target1: number;
+  target: number;
+  target2: number | null;
+  risk_reward: number;
+  riskReward: number;
+  timeframe_days: number;
+  timeframeDays: number;
+  reasons: string[];
+  rationale: string[];
+  sector: string | null;
+  market_cap_band: Recommendation["marketCapBand"];
+  marketCapBand: Recommendation["marketCapBand"];
+  last_price: number;
+  lastPrice: number;
+  price_change_pct_1d: number;
+  priceChangePct1d: number;
+  delivery_pct: number | null;
+  deliveryPct: number | null;
+  fii_dii_signal: Recommendation["fiiDiiSignal"];
+  fiiDiiSignal: Recommendation["fiiDiiSignal"];
+  f_and_o_signal: Recommendation["fAndOSignal"];
+  fAndOSignal: Recommendation["fAndOSignal"];
+  generated_at: string;
+  generatedAt: string;
+  regime: string | null;
+  weighted_score: number | null;
+  weightedScore: number | null;
+  factor_agreement: number | null;
+  factorAgreement: number | null;
+  calibration_note: string | null;
+  calibrationNote: string | null;
+  data_quality: string | null;
+  dataQuality: string | null;
+  advisory_disclaimer: string;
+  advisoryDisclaimer: string;
+  signals: RawFactor[];
+}>;
+
+function looksLikeRecommendation(v: unknown): v is RawRecommendation {
+  if (!v || typeof v !== "object") return false;
+  const r = v as RawRecommendation;
+  return typeof r.symbol === "string" && (
+    typeof r.action === "string" ||
+    typeof r.direction === "string" ||
+    typeof r.generated_at === "string" ||
+    typeof r.entry === "number" ||
+    typeof r.entryPrice === "number"
+  );
+}
+
+function normalizeConviction(v: number | undefined): number {
+  if (typeof v !== "number" || Number.isNaN(v)) return 0;
+  return v > 1 ? v / 100 : v;
+}
+
+function normalizeFactorDirection(d: RawFactor["direction"]): "pos" | "neg" | "neu" {
+  if (d === "bullish" || d === "pos") return "pos";
+  if (d === "bearish" || d === "neg") return "neg";
+  return "neu";
+}
+
+function normalizeRecommendation(raw: unknown): Recommendation {
+  if (!looksLikeRecommendation(raw)) return raw as Recommendation;
+
+  const action = raw.action ?? raw.direction ?? "HOLD";
+  const horizon = raw.horizon === "positional" ? "long" : (raw.horizon ?? "swing");
+  const generatedAt = raw.generatedAt ?? raw.generated_at ?? new Date().toISOString();
+  const symbol = (raw.symbol ?? "").toUpperCase();
+
+  return {
+    id: raw.id ?? `${symbol}:${horizon}:${generatedAt}`,
+    symbol,
+    name: raw.name ?? symbol,
+    exchange: raw.exchange ?? "NSE",
+    sector: raw.sector ?? null,
+    horizon,
+    direction: action,
+    action,
+    conviction: normalizeConviction(raw.conviction),
+    rationale: raw.rationale ?? raw.reasons ?? [],
+    entryPrice: raw.entryPrice ?? raw.entry ?? null,
+    stopLoss: raw.stopLoss ?? raw.stoploss ?? null,
+    target: raw.target ?? raw.target1 ?? null,
+    target2: raw.target2 ?? null,
+    riskReward: raw.riskReward ?? raw.risk_reward,
+    generatedAt,
+    marketCapBand: raw.marketCapBand ?? raw.market_cap_band,
+    lastPrice: raw.lastPrice ?? raw.last_price,
+    priceChangePct1d: raw.priceChangePct1d ?? raw.price_change_pct_1d,
+    deliveryPct: raw.deliveryPct ?? raw.delivery_pct ?? null,
+    fiiDiiSignal: raw.fiiDiiSignal ?? raw.fii_dii_signal ?? null,
+    fAndOSignal: raw.fAndOSignal ?? raw.f_and_o_signal ?? null,
+    timeframeDays: raw.timeframeDays ?? raw.timeframe_days,
+    regime: raw.regime ?? null,
+    weightedScore: raw.weightedScore ?? raw.weighted_score ?? null,
+    factorAgreement: raw.factorAgreement ?? raw.factor_agreement ?? null,
+    calibrationNote: raw.calibrationNote ?? raw.calibration_note ?? null,
+    dataQuality: raw.dataQuality ?? raw.data_quality ?? null,
+    advisoryDisclaimer:
+      raw.advisoryDisclaimer ??
+      raw.advisory_disclaimer ??
+      "Research signal only, not investment advice. Validate independently and use your own risk controls.",
+    signals: Array.isArray(raw.signals)
+      ? raw.signals.map((s) => ({
+          name: s.name ?? "factor",
+          weight: typeof s.weight === "number" ? s.weight : 0,
+          value: typeof s.score === "number"
+            ? Math.abs(s.score)
+            : typeof s.value === "number"
+              ? Math.abs(s.value)
+              : 0,
+          direction: normalizeFactorDirection(s.direction),
+        }))
+      : [],
+  };
+}
+
 export const apiClient = {
   async getRecommendations(filters: RecommendationFilters = {}, signal?: AbortSignal): Promise<Recommendation[]> {
     const r = await request<unknown>("/api/recommendations", {
       query: {
         horizon: filters.horizon,
         sector: filters.sector,
-        minConviction: filters.minConviction,
+        min_conviction:
+          typeof filters.minConviction === "number"
+            ? Math.round(filters.minConviction <= 1 ? filters.minConviction * 100 : filters.minConviction)
+            : undefined,
       },
       signal,
     });
-    return asArray<Recommendation>(r);
+    return asArray<unknown>(r).map(normalizeRecommendation);
   },
 
   async getPortfolio(signal?: AbortSignal): Promise<PortfolioSummary> {
@@ -309,4 +450,3 @@ export const api = apiClient;
 
 // Re-export the live-quote hook so `import { useStreamQuote } from "@/lib/api"` works.
 export { useStreamQuote } from "../hooks/useStreamQuote";
-

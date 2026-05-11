@@ -109,7 +109,7 @@ async def async_fetch_history(symbol: str, period: str = "6mo", interval: str = 
     is_index = symbol.startswith("^")
     is_intraday = interval not in ("1d", "1wk", "1mo")
 
-    # Intraday or index data — yfinance is better for these
+    # Intraday or index data — NSE does not provide this endpoint here.
     if is_intraday or is_index:
         try:
             hist = await _retry_async(_yfinance_fetch, symbol, period, interval, max_retries=1)

@@ -47,8 +47,8 @@ function sectorMatches(rec: Recommendation, filter: string): boolean {
  *  - Filters: horizon, sector, min conviction (in 0..100)
  *  - Lightweight windowing when items > 50 (no extra deps)
  *
- * The minimum-conviction slider is in 0..100 (display units) but the backend
- * filter is sent as a 0..1 fraction.
+ * The minimum-conviction slider is in 0..100 display units. The API adapter
+ * converts it to the backend's 0..100 `min_conviction` query.
  */
 export default function RecommendationList({
   recommendations,

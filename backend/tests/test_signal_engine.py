@@ -21,6 +21,7 @@ from app.services.signal_engine import (
     detect_volume_spike,
     filter_by_risk_mode,
     scan_symbol,
+    _apply_backtest_edge_filters,
 )
 
 
@@ -466,3 +467,61 @@ class TestFilterByRiskMode:
         ]
         filtered = filter_by_risk_mode(signals, "conservative")
         assert len(filtered) == 0
+
+
+class TestBacktestEdgeFilters:
+
+    def test_hard_weak_pattern_is_blocked_without_confirmation(self):
+        signals = [
+            {
+                "symbol": "RELIANCE",
+                "signal_type": "cup_and_handle",
+                "direction": "bullish",
+                "strength": 8,
+                "reason": "pattern",
+                "risk": "",
+                "metadata": {},
+            }
+        ]
+        assert _apply_backtest_edge_filters(signals) == []
+
+    def test_soft_weak_pattern_is_downgraded_without_confirmation(self):
+        signals = [
+            {
+                "symbol": "RELIANCE",
+                "signal_type": "double_bottom",
+                "direction": "bullish",
+                "strength": 9,
+                "reason": "pattern",
+                "risk": "",
+                "metadata": {},
+            }
+        ]
+        filtered = _apply_backtest_edge_filters(signals)
+        assert len(filtered) == 1
+        assert filtered[0]["strength"] <= 4
+        assert filtered[0]["metadata"]["downgraded_by_edge_filter"] is True
+
+    def test_weak_pattern_passes_with_independent_positive_confirmation(self):
+        weak = {
+            "symbol": "RELIANCE",
+            "signal_type": "double_bottom",
+            "direction": "bullish",
+            "strength": 9,
+            "reason": "pattern",
+            "risk": "",
+            "metadata": {},
+        }
+        confirmer = {
+            "symbol": "RELIANCE",
+            "signal_type": "gap_up",
+            "direction": "bullish",
+            "strength": 7,
+            "reason": "gap",
+            "risk": "",
+            "metadata": {},
+        }
+        filtered = _apply_backtest_edge_filters([weak, confirmer])
+        weak_after = next(s for s in filtered if s["signal_type"] == "double_bottom")
+        assert weak_after["strength"] == 9
+        assert weak_after["metadata"]["edge_confirmed"] is True

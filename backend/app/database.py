@@ -200,7 +200,15 @@ CREATE TABLE IF NOT EXISTS recommendation_outcomes (
     exit_price REAL,
     exit_time TEXT,
     pnl_pct REAL,
-    evaluated_at TEXT
+    evaluated_at TEXT,
+    max_favorable_pct REAL,
+    max_adverse_pct REAL,
+    bars_held INTEGER,
+    outcome_reason TEXT,
+    regime TEXT,
+    weighted_score REAL,
+    factor_agreement REAL,
+    data_quality TEXT
 );
 """
 
@@ -219,9 +227,40 @@ CREATE TABLE IF NOT EXISTS factor_performance (
 );
 """
 
+CREATE_PAPER_TRADES_TABLE = """
+CREATE TABLE IF NOT EXISTS paper_trades (
+    trade_id TEXT PRIMARY KEY,
+    symbol TEXT NOT NULL,
+    direction TEXT NOT NULL,
+    signal_type TEXT NOT NULL,
+    strength INTEGER NOT NULL,
+    entry_price REAL NOT NULL,
+    entry_date TEXT NOT NULL,
+    stop_loss REAL,
+    target REAL,
+    position_size REAL,
+    shares INTEGER,
+    status TEXT NOT NULL,
+    exit_price REAL,
+    exit_date TEXT,
+    pnl_pct REAL,
+    pnl_amount REAL,
+    exit_reason TEXT,
+    trailing_stop REAL,
+    source TEXT DEFAULT 'csv_import',
+    created_at TEXT,
+    updated_at TEXT
+);
+"""
+
 CREATE_BACKTEST_RUNS_TABLE = _create_backtest_runs_sql("sqlite")
 CREATE_BACKTEST_RUNS_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_backtest_runs_run_at ON backtest_runs(run_at DESC);",
+]
+CREATE_PAPER_TRADES_INDEXES = [
+    "CREATE INDEX IF NOT EXISTS idx_paper_trades_status ON paper_trades(status);",
+    "CREATE INDEX IF NOT EXISTS idx_paper_trades_symbol ON paper_trades(symbol);",
+    "CREATE INDEX IF NOT EXISTS idx_paper_trades_entry_date ON paper_trades(entry_date DESC);",
 ]
 CREATE_LLM_USAGE_TABLE = _create_llm_usage_sql("sqlite")
 CREATE_LLM_USAGE_INDEXES = [
@@ -314,6 +353,7 @@ async def _init_db_sqlite() -> None:
         await db.execute(CREATE_PRICE_ALERTS_TABLE)
         await db.execute(CREATE_RECOMMENDATION_OUTCOMES_TABLE)
         await db.execute(CREATE_FACTOR_PERFORMANCE_TABLE)
+        await db.execute(CREATE_PAPER_TRADES_TABLE)
         await db.execute(_create_backtest_runs_sql("sqlite"))
         await db.execute(_create_llm_usage_sql("sqlite"))
 
@@ -322,6 +362,8 @@ async def _init_db_sqlite() -> None:
         for idx_sql in CREATE_PRICE_ALERTS_INDEXES:
             await db.execute(idx_sql)
         for idx_sql in CREATE_BACKTEST_RUNS_INDEXES:
+            await db.execute(idx_sql)
+        for idx_sql in CREATE_PAPER_TRADES_INDEXES:
             await db.execute(idx_sql)
         for idx_sql in CREATE_LLM_USAGE_INDEXES:
             await db.execute(idx_sql)
@@ -347,11 +389,15 @@ def _init_db_sqlalchemy() -> None:
         CREATE_SIGNAL_OUTCOMES_TABLE,
         CREATE_SIGNAL_PERFORMANCE_TABLE,
         CREATE_PRICE_ALERTS_TABLE,
+        CREATE_RECOMMENDATION_OUTCOMES_TABLE,
+        CREATE_FACTOR_PERFORMANCE_TABLE,
+        CREATE_PAPER_TRADES_TABLE,
         _create_backtest_runs_sql(dialect),
         _create_llm_usage_sql(dialect),
         *CREATE_SIGNALS_INDEXES,
         *CREATE_PRICE_ALERTS_INDEXES,
         *CREATE_BACKTEST_RUNS_INDEXES,
+        *CREATE_PAPER_TRADES_INDEXES,
         *CREATE_LLM_USAGE_INDEXES,
     ]
     with eng.begin() as conn:

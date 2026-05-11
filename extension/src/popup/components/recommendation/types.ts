@@ -43,11 +43,17 @@ export interface RecommendationView extends BaseRecommendation {
   marketCapBand?: MarketCapBand;
   lastPrice?: number;
   priceChangePct1d?: number;
-  deliveryPct?: number;
-  fiiDiiSignal?: FiiDiiSignal;
-  fAndOSignal?: FAndOSignal;
+  deliveryPct?: number | null;
+  fiiDiiSignal?: FiiDiiSignal | null;
+  fAndOSignal?: FAndOSignal | null;
   signals?: readonly FactorSignal[];
   timeframeDays?: number;
+  regime?: string | null;
+  weightedScore?: number | null;
+  factorAgreement?: number | null;
+  calibrationNote?: string | null;
+  dataQuality?: string | null;
+  advisoryDisclaimer?: string;
 }
 
 /**

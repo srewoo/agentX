@@ -125,7 +125,19 @@ class QuoteHub:
             if self._source is None:
                 self._source = _build_default_source()
                 self._source.set_callback(self._on_tick)
-            await self._source.start()
+            try:
+                await self._source.start()
+            except Exception:
+                logger.warning(
+                    "%s failed to start; falling back to polling",
+                    type(self._source).__name__,
+                    exc_info=True,
+                )
+                from app.services.streaming.poll_fallback import PollingQuoteSource
+
+                self._source = PollingQuoteSource()
+                self._source.set_callback(self._on_tick)
+                await self._source.start()
             # Attach redis if available — best effort.
             try:
                 from app.services.cache import cache_manager
@@ -227,7 +239,7 @@ def _normalise(symbol: str) -> str:
 
 
 def _build_default_source() -> QuoteSource:
-    """Pick :class:`KiteQuoteSource` when broker creds are set, else polling."""
+    """Pick a broker WebSocket when configured, else polling."""
     has_kite = bool(os.environ.get("KITE_API_KEY")) and bool(
         os.environ.get("KITE_ACCESS_TOKEN")
     )

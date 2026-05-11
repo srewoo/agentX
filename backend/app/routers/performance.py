@@ -1,7 +1,11 @@
 from __future__ import annotations
 """Performance tracking endpoints — win/loss stats for signal outcomes."""
+import asyncio
 import logging
-from typing import Optional
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException
 
@@ -16,9 +20,109 @@ from app.services.signal_tracker import (
     get_performance_summary,
     get_signal_accuracy,
 )
+from app.services.recommendation_tracker import (
+    evaluate_recommendation_outcomes,
+    get_factor_edge_snapshot,
+)
+from app.services.recommendation_calibration import run_large_scale_calibration
+from app.services.paper_trading import import_paper_trades_csv
 
 router = APIRouter(prefix="/api/performance", tags=["performance"])
 logger = logging.getLogger(__name__)
+
+_CALIBRATION_JOBS: dict[str, dict[str, Any]] = {}
+_MAX_CALIBRATION_JOBS = 20
+
+
+def _validate_calibration_request(
+    universe: str,
+    horizons: str,
+    max_symbols: Optional[int],
+    stride: int,
+    concurrency: int,
+    min_conviction: int,
+) -> list[str]:
+    allowed_universe = {"nifty50", "nifty100", "nifty500", "curated"}
+    if universe not in allowed_universe:
+        raise HTTPException(
+            status_code=400,
+            detail=f"universe must be one of {sorted(allowed_universe)}",
+        )
+    parsed_horizons = [h.strip() for h in horizons.split(",") if h.strip()]
+    allowed_horizons = {"swing", "positional"}
+    if not parsed_horizons or any(h not in allowed_horizons for h in parsed_horizons):
+        raise HTTPException(status_code=400, detail="horizons must be swing,positional")
+    if stride < 1 or stride > 30:
+        raise HTTPException(status_code=400, detail="stride must be 1..30")
+    if concurrency < 1 or concurrency > 10:
+        raise HTTPException(status_code=400, detail="concurrency must be 1..10")
+    if max_symbols is not None and (max_symbols < 1 or max_symbols > 500):
+        raise HTTPException(status_code=400, detail="max_symbols must be 1..500")
+    if min_conviction < 0 or min_conviction > 100:
+        raise HTTPException(status_code=400, detail="min_conviction must be 0..100")
+    return parsed_horizons
+
+
+def _trim_calibration_jobs() -> None:
+    if len(_CALIBRATION_JOBS) <= _MAX_CALIBRATION_JOBS:
+        return
+    completed = [
+        (job_id, job)
+        for job_id, job in _CALIBRATION_JOBS.items()
+        if job.get("status") in {"completed", "failed"}
+    ]
+    completed.sort(key=lambda item: item[1].get("updated_at") or "")
+    for job_id, _job in completed[: max(0, len(_CALIBRATION_JOBS) - _MAX_CALIBRATION_JOBS)]:
+        _CALIBRATION_JOBS.pop(job_id, None)
+
+
+async def _run_calibration_job(
+    job_id: str,
+    *,
+    universe: str,
+    horizons: list[str],
+    period: Optional[str],
+    max_symbols: Optional[int],
+    stride: int,
+    concurrency: int,
+    min_conviction: int,
+    apply: bool,
+) -> None:
+    job = _CALIBRATION_JOBS[job_id]
+    now = datetime.now(timezone.utc).isoformat()
+    job.update({"status": "running", "started_at": now, "updated_at": now})
+    try:
+        result = await run_large_scale_calibration(
+            universe=universe,  # type: ignore[arg-type]
+            horizons=horizons,  # type: ignore[arg-type]
+            period=period,
+            max_symbols=max_symbols,
+            stride=stride,
+            concurrency=concurrency,
+            min_conviction=min_conviction,
+            apply=apply,
+        )
+        now = datetime.now(timezone.utc).isoformat()
+        job.update(
+            {
+                "status": "completed",
+                "updated_at": now,
+                "finished_at": now,
+                "result": result,
+                "summary": result.get("summary", {}),
+            }
+        )
+    except Exception as exc:
+        logger.exception("Recommendation calibration job %s failed: %s", job_id, exc)
+        now = datetime.now(timezone.utc).isoformat()
+        job.update(
+            {
+                "status": "failed",
+                "updated_at": now,
+                "finished_at": now,
+                "error": str(exc),
+            }
+        )
 
 
 @router.get("/edge")
@@ -32,6 +136,18 @@ async def signal_edge():
         "meta": EDGE_META,
         "recommended_mutes": RECOMMENDED_MUTES,
         "rows": all_edge_rows(),
+    }
+
+
+@router.get("/recommendation-calibration")
+async def recommendation_calibration():
+    """Current learned factor-edge multipliers for the recommendation engine."""
+    snapshot = get_factor_edge_snapshot()
+    return {
+        "data": {
+            "factors": snapshot,
+            "sample_policy": "Factors are only seeded on startup after the minimum sample threshold; fresh runs are conservative.",
+        }
     }
 
 
@@ -205,3 +321,146 @@ async def trigger_evaluation():
     except Exception as e:
         logger.error(f"Error during manual evaluation: {e}")
         raise HTTPException(status_code=500, detail="Failed to evaluate signals")
+
+
+@router.post("/evaluate-recommendations")
+async def trigger_recommendation_evaluation():
+    """Manually evaluate stored BUY/SELL recommendation outcomes."""
+    try:
+        result = await evaluate_recommendation_outcomes()
+        return {"data": result, "message": "Recommendation evaluation complete"}
+    except Exception as e:
+        logger.error("Error during recommendation evaluation: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to evaluate recommendations")
+
+
+@router.post("/paper-trades/import-csv")
+async def import_paper_trades():
+    """Import legacy local paper_trades/trades.csv into SQLite."""
+    csv_path = Path(__file__).resolve().parents[2] / "paper_trades" / "trades.csv"
+    try:
+        result = await import_paper_trades_csv(csv_path)
+        return {"data": result, "message": "Paper trades imported"}
+    except Exception as e:
+        logger.exception("Paper trade import failed: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to import paper trades")
+
+
+@router.post("/calibrate-recommendations")
+async def calibrate_recommendations(
+    universe: str = "nifty100",
+    horizons: str = "swing,positional",
+    period: Optional[str] = None,
+    max_symbols: Optional[int] = None,
+    stride: int = 5,
+    concurrency: int = 3,
+    min_conviction: int = 0,
+    apply: bool = True,
+):
+    """Run large-scale recommendation calibration over free EOD data.
+
+    `universe`: nifty50 | nifty100 | nifty500 | curated. Nifty500 currently
+    means the largest curated repo universe available locally.
+    """
+    parsed_horizons = _validate_calibration_request(
+        universe, horizons, max_symbols, stride, concurrency, min_conviction,
+    )
+
+    try:
+        result = await run_large_scale_calibration(
+            universe=universe,  # type: ignore[arg-type]
+            horizons=parsed_horizons,  # type: ignore[arg-type]
+            period=period,
+            max_symbols=max_symbols,
+            stride=stride,
+            concurrency=concurrency,
+            min_conviction=min_conviction,
+            apply=apply,
+        )
+        return {"data": result, "message": "Recommendation calibration complete"}
+    except Exception as e:
+        logger.exception("Recommendation calibration failed: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to calibrate recommendations")
+
+
+@router.post("/calibrate-recommendations/jobs")
+async def start_calibration_job(
+    universe: str = "nifty100",
+    horizons: str = "swing,positional",
+    period: Optional[str] = None,
+    max_symbols: Optional[int] = None,
+    stride: int = 5,
+    concurrency: int = 3,
+    min_conviction: int = 0,
+    apply: bool = True,
+):
+    """Start recommendation calibration in the background.
+
+    Use this for Nifty100/Nifty500 or 5-year runs. The synchronous endpoint is
+    still useful for small smoke tests, but the app-level request timeout is 60s.
+    """
+    parsed_horizons = _validate_calibration_request(
+        universe, horizons, max_symbols, stride, concurrency, min_conviction,
+    )
+    running = [
+        job_id
+        for job_id, job in _CALIBRATION_JOBS.items()
+        if job.get("status") == "running"
+    ]
+    if running:
+        raise HTTPException(
+            status_code=409,
+            detail={"message": "A calibration job is already running", "job_id": running[0]},
+        )
+
+    _trim_calibration_jobs()
+    job_id = uuid.uuid4().hex[:12]
+    now = datetime.now(timezone.utc).isoformat()
+    _CALIBRATION_JOBS[job_id] = {
+        "job_id": job_id,
+        "status": "queued",
+        "created_at": now,
+        "updated_at": now,
+        "params": {
+            "universe": universe,
+            "horizons": parsed_horizons,
+            "period": period,
+            "max_symbols": max_symbols,
+            "stride": stride,
+            "concurrency": concurrency,
+            "min_conviction": min_conviction,
+            "apply": apply,
+        },
+    }
+    task = asyncio.create_task(
+        _run_calibration_job(
+            job_id,
+            universe=universe,
+            horizons=parsed_horizons,
+            period=period,
+            max_symbols=max_symbols,
+            stride=stride,
+            concurrency=concurrency,
+            min_conviction=min_conviction,
+            apply=apply,
+        )
+    )
+    _CALIBRATION_JOBS[job_id]["task"] = task
+    return {
+        "job_id": job_id,
+        "status": "queued",
+        "status_url": f"/api/performance/calibrate-recommendations/jobs/{job_id}",
+        "message": "Recommendation calibration started",
+    }
+
+
+@router.get("/calibrate-recommendations/jobs/{job_id}")
+async def get_calibration_job(job_id: str):
+    job = _CALIBRATION_JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Calibration job not found")
+    return {
+        key: value
+        for key, value in job.items()
+        if key != "task"
+    }

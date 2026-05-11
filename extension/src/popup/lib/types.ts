@@ -6,7 +6,7 @@
  */
 
 export type Horizon = "intraday" | "swing" | "long";
-export type Direction = "BUY" | "SELL" | "HOLD";
+export type Direction = "BUY" | "SELL" | "HOLD" | "AVOID";
 export type Exchange = "NSE" | "BSE";
 
 export interface Recommendation {
@@ -26,12 +26,35 @@ export interface Recommendation {
   target: number | null;
   /** ISO timestamp. */
   generatedAt: string;
+  /** Canonical backend action, kept when available for richer cards. */
+  action?: Direction;
+  riskReward?: number;
+  target2?: number | null;
+  marketCapBand?: "LARGE" | "MID" | "SMALL" | "MICRO";
+  lastPrice?: number;
+  priceChangePct1d?: number;
+  deliveryPct?: number | null;
+  fiiDiiSignal?: "INFLOW" | "OUTFLOW" | "NEUTRAL" | null;
+  fAndOSignal?: "LONG_BUILDUP" | "SHORT_BUILDUP" | "LONG_UNWINDING" | "SHORT_COVERING" | null;
+  timeframeDays?: number;
+  regime?: string | null;
+  weightedScore?: number | null;
+  factorAgreement?: number | null;
+  calibrationNote?: string | null;
+  dataQuality?: string | null;
+  advisoryDisclaimer?: string;
+  signals?: ReadonlyArray<{
+    name: string;
+    weight: number;
+    value: number;
+    direction: "pos" | "neg" | "neu";
+  }>;
 }
 
 export interface RecommendationFilters {
   horizon?: Horizon;
   sector?: string;
-  /** 0..1 inclusive. */
+  /** UI value; accepts either 0..1 or 0..100. */
   minConviction?: number;
 }
 
@@ -188,4 +211,3 @@ export interface TransactionsPage {
 
 /** Friendlier alias for sibling code. */
 export type PortfolioSummaryData = PortfolioSummary;
-

@@ -89,23 +89,42 @@ for _w in (WEIGHTS_CALM, WEIGHTS_RISK_OFF):
 FACTOR_WEIGHTS = WEIGHTS_CALM
 
 
-def _select_weights(india_vix: Optional[float]) -> dict[str, float]:
+def _market_regime(india_vix: Optional[float], weekly_tech: Optional[dict[str, Any]] = None) -> str:
+    """Coarse regime label used for swing/positional calibration."""
+    if india_vix is not None and india_vix > 18.0:
+        return "risk_off"
+    if weekly_tech:
+        ma = weekly_tech.get("moving_averages") or {}
+        price = weekly_tech.get("current_price")
+        sma20 = ma.get("sma20")
+        adx = weekly_tech.get("adx")
+        if price and sma20 and adx and adx >= 25:
+            return "trend_up" if price > sma20 else "trend_down"
+    return "neutral"
+
+
+def _select_weights(india_vix: Optional[float], regime: Optional[str] = None) -> dict[str, float]:
     """India VIX > 18 ≈ historically elevated fear. Above that we treat the
     regime as risk-off and the defensive weight profile takes over."""
-    if india_vix is not None and india_vix > 18.0:
+    if regime == "risk_off" or (india_vix is not None and india_vix > 18.0):
         return WEIGHTS_RISK_OFF
     return WEIGHTS_CALM
 
 _HORIZON_TO_DAYS: dict[Horizon, int] = {"intraday": 1, "swing": 10, "positional": 60}
-_HORIZON_TO_PERIOD: dict[Horizon, str] = {"intraday": "1mo", "swing": "6mo", "positional": "1y"}
+_HORIZON_TO_PERIOD: dict[Horizon, str] = {"intraday": "5d", "swing": "6mo", "positional": "1y"}
+_HORIZON_TO_INTERVAL: dict[Horizon, str] = {"intraday": "5m", "swing": "1d", "positional": "1d"}
 _HORIZON_TTL: dict[Horizon, timedelta] = {
-    "intraday": timedelta(minutes=5),
+    "intraday": timedelta(minutes=2),
     "swing": timedelta(hours=1),
     "positional": timedelta(days=1),
 }
 
 _PENNY_PRICE = 20.0
-_MIN_AVG_VOLUME = 50_000
+_MIN_AVG_VOLUME_BY_HORIZON: dict[Horizon, int] = {
+    "intraday": 10_000,      # average 5-minute volume
+    "swing": 50_000,         # average daily volume
+    "positional": 50_000,    # average daily volume
+}
 # Bumped from 5 → 15: NSE/yfinance handle this comfortably and the previous
 # value made cold batches sequential at 5-symbols-per-tick = 60s+ for 100
 # symbols. Per-symbol `wait_for(20s)` still bounds the worst-case tail.
@@ -170,6 +189,11 @@ def _avoid(
         market_cap_band=_classify_market_cap(symbol),
         last_price=p, price_change_pct_1d=round(pchg_1d, 2),
         delivery_pct=delivery_pct, fii_dii_signal=None, f_and_o_signal=None,
+        regime="blocked",
+        weighted_score=0.0,
+        factor_agreement=0.0,
+        calibration_note="No directional signal: liquidity, event, or data-quality gate blocked this setup.",
+        data_quality="limited",
         generated_at=datetime.now(timezone.utc),
     )
 
@@ -181,6 +205,10 @@ def _score_all(
     fundamentals: Optional[dict[str, Any]] = None,
     weekly_tech: Optional[dict[str, Any]] = None,
     weights: Optional[dict[str, float]] = None,
+    use_learned_edge: bool = True,
+    regime: Optional[str] = None,
+    sector: Optional[str] = None,
+    horizon: Optional[Horizon] = None,
 ) -> tuple[list[SignalContribution], Optional[FnoSignal], Optional[FiiDiiSignal]]:
     w = weights or FACTOR_WEIGHTS
     s_t, v_t, d_t = trend_score(tech)
@@ -199,7 +227,12 @@ def _score_all(
     from app.services.recommendation_tracker import factor_edge_multiplier
     def _w(name: str) -> float:
         base = w[name]
-        adj = base * factor_edge_multiplier(name)
+        adj = base * (
+            factor_edge_multiplier(
+                name, regime=regime, sector=sector, horizon=horizon,
+            )
+            if use_learned_edge else 1.0
+        )
         # Pydantic guards: weight must stay in [0,1]. The multiplier can push
         # base × 1.5 above 1.0 only for factors whose base is already > 0.66
         # (which we don't have today), but clamp defensively anyway.
@@ -261,10 +294,46 @@ def conviction_from_score(weighted: float) -> int:
     return max(0, min(100, int(round(abs(weighted) * 100))))
 
 
-def action_from_score(weighted: float) -> Action:
-    if weighted > 0.15:
+def calibrated_conviction(
+    weighted: float,
+    contributions: list[SignalContribution],
+    *,
+    risk_reward: float,
+    regime: str,
+) -> tuple[int, float, str]:
+    """Convert score to conviction with agreement/regime/risk calibration."""
+    base = conviction_from_score(weighted)
+    direction = 1 if weighted >= 0 else -1
+    directional = [c for c in contributions if abs(c.score) >= 0.15]
+    if directional:
+        aligned = sum(1 for c in directional if c.score * direction > 0)
+        agreement = aligned / len(directional)
+    else:
+        agreement = 0.0
+
+    multiplier = 0.75 + 0.35 * agreement
+    if risk_reward < 1.5:
+        multiplier *= 0.85
+    elif risk_reward >= 2.0:
+        multiplier *= 1.05
+    if regime == "risk_off":
+        multiplier *= 0.90
+    elif regime in {"trend_up", "trend_down"}:
+        multiplier *= 1.05
+
+    conviction = max(0, min(100, int(round(base * multiplier))))
+    note = (
+        f"Calibrated from raw score {base}/100 using "
+        f"{agreement:.0%} factor agreement, R:R {risk_reward:.2f}, regime {regime}."
+    )
+    return conviction, round(agreement, 3), note
+
+
+def action_from_score(weighted: float, *, regime: str = "neutral") -> Action:
+    threshold = 0.20 if regime == "risk_off" else 0.15
+    if weighted > threshold:
         return "BUY"
-    if weighted < -0.15:
+    if weighted < -threshold:
         return "SELL"
     return "HOLD"
 
@@ -292,7 +361,11 @@ async def generate_recommendation(
         except Exception:
             logger.debug("Stale cache shape for %s, regenerating", cache_key)
 
-    df = await async_fetch_history(symbol, period=_HORIZON_TO_PERIOD[horizon], interval="1d")
+    df = await async_fetch_history(
+        symbol,
+        period=_HORIZON_TO_PERIOD[horizon],
+        interval=_HORIZON_TO_INTERVAL[horizon],
+    )
     if df is None or df.empty or len(df) < 30:
         return None
 
@@ -380,7 +453,7 @@ async def generate_recommendation(
     delivery_pct = delivery.get("delivery_pct")
     avg_vol = tech.get("volume_avg_20") or 0
 
-    if price < _PENNY_PRICE or avg_vol < _MIN_AVG_VOLUME:
+    if price < _PENNY_PRICE or avg_vol < _MIN_AVG_VOLUME_BY_HORIZON[horizon]:
         return _avoid(
             symbol, horizon, price, pchg_1d, delivery_pct,
             "Below liquidity / price floor — too risky for a recommendation.",
@@ -396,23 +469,34 @@ async def generate_recommendation(
 
     rs_rank = (rs.get("rankings", {}) or {}).get(symbol, {}).get("rs_rank")
 
-    # Regime-aware weighting — high India VIX flips us into the defensive
-    # profile that emphasises delivery, fundamentals, and FII flows.
     india_vix = (fii_dii or {}).get("india_vix") if isinstance(fii_dii, dict) else None
-    weights = _select_weights(india_vix)
+    regime = _market_regime(india_vix, weekly_tech)
+    weights = _select_weights(india_vix, regime)
+    sector = _sector_for(symbol)
 
     contributions, fno_sig, fii_sig = _score_all(
         tech, delivery_pct, fii_dii, options, rs_rank, pchg_1d,
         news=news, fundamentals=fundamentals, weekly_tech=weekly_tech,
-        weights=weights,
+        weights=weights, regime=regime, sector=sector, horizon=horizon,
     )
     weighted = sum(c.score * c.weight for c in contributions)
-    conviction = conviction_from_score(weighted)
-    action = action_from_score(weighted)
 
     direction_up = weighted >= 0
     entry, sl, t1, t2 = entry_sl_targets(price, tech.get("atr"), horizon, direction_up)
     rr = abs(t1 - entry) / max(0.01, abs(entry - sl))
+    conviction, agreement, calibration_note = calibrated_conviction(
+        weighted, contributions, risk_reward=rr, regime=regime,
+    )
+    action = action_from_score(weighted, regime=regime)
+    if action in ("BUY", "SELL") and conviction < 45:
+        action = "HOLD"
+        calibration_note += " Directional call demoted to HOLD because calibrated conviction is below 45."
+
+    data_quality = "eod_verified"
+    if horizon == "intraday":
+        data_quality = "delayed_intraday"
+    elif len(df) < 120:
+        data_quality = "limited_history"
 
     rec = Recommendation(
         symbol=symbol, exchange="NSE", horizon=horizon, action=action,
@@ -421,11 +505,16 @@ async def generate_recommendation(
         risk_reward=round(rr, 2), timeframe_days=_HORIZON_TO_DAYS[horizon],
         signals=contributions,
         reasons=_build_reasons(contributions, fno_sig, fii_sig, delivery_pct),
-        sector=_sector_for(symbol),
+        sector=sector,
         market_cap_band=_classify_market_cap(symbol),
         last_price=round(price, 2),
         price_change_pct_1d=round(pchg_1d, 2),
         delivery_pct=delivery_pct, fii_dii_signal=fii_sig, f_and_o_signal=fno_sig,
+        regime=regime,
+        weighted_score=round(weighted, 4),
+        factor_agreement=agreement,
+        calibration_note=calibration_note,
+        data_quality=data_quality,
         generated_at=datetime.now(timezone.utc),
     )
     await cache_manager.set(cache_key, rec.model_dump(mode="json"), ttl=_HORIZON_TTL[horizon])

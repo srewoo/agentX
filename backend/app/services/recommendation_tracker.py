@@ -43,6 +43,37 @@ _MIN_SAMPLE_SIZE = 20
 # `seed_factor_edge_cache`. Format: {factor_name: edge_in_pct_pnl}.
 _factor_edge_cache: dict[str, float] = {}
 
+_TRACKER_COLUMNS: dict[str, str] = {
+    "max_favorable_pct": "REAL",
+    "max_adverse_pct": "REAL",
+    "bars_held": "INTEGER",
+    "outcome_reason": "TEXT",
+    "regime": "TEXT",
+    "weighted_score": "REAL",
+    "factor_agreement": "REAL",
+    "data_quality": "TEXT",
+}
+
+
+async def _ensure_tracker_columns() -> None:
+    """Add tracker columns for existing SQLite DBs.
+
+    Existing installs may already have `recommendation_outcomes` without the
+    newer calibration/outcome columns. SQLite lacks a portable IF NOT EXISTS
+    for ADD COLUMN on the supported local version, so we inspect PRAGMA first.
+    """
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("PRAGMA table_info(recommendation_outcomes)") as cur:
+                rows = await cur.fetchall()
+            existing = {row[1] for row in rows}
+            for name, ddl in _TRACKER_COLUMNS.items():
+                if name not in existing:
+                    await db.execute(f"ALTER TABLE recommendation_outcomes ADD COLUMN {name} {ddl}")
+            await db.commit()
+    except Exception as e:
+        logger.debug("tracker column migration skipped: %s", e)
+
 
 # ── persist a recommendation when generated ─────────────────────────────
 
@@ -55,6 +86,7 @@ async def store_recommendation(rec) -> None:
     """
     if rec is None or rec.action not in ("BUY", "SELL"):
         return
+    await _ensure_tracker_columns()
     rec_id = f"{rec.symbol}:{rec.horizon}:{rec.generated_at.isoformat()}"
     signals_json = json.dumps([
         {"name": s.name, "weight": s.weight, "score": s.score, "direction": s.direction}
@@ -65,13 +97,15 @@ async def store_recommendation(rec) -> None:
             await db.execute(
                 """INSERT OR IGNORE INTO recommendation_outcomes
                    (rec_id, symbol, horizon, action, conviction, entry, stoploss,
-                    target1, timeframe_days, signals_json, sector, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    target1, timeframe_days, signals_json, sector, created_at,
+                    regime, weighted_score, factor_agreement, data_quality)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     rec_id, rec.symbol, rec.horizon, rec.action, rec.conviction,
                     float(rec.entry), float(rec.stoploss), float(rec.target1),
                     int(rec.timeframe_days), signals_json, rec.sector,
                     rec.generated_at.isoformat(),
+                    rec.regime, rec.weighted_score, rec.factor_agreement, rec.data_quality,
                 ),
             )
             await db.commit()
@@ -94,6 +128,7 @@ async def evaluate_recommendation_outcomes() -> dict[str, Any]:
     Returns a small summary for observability.
     """
     cutoff_now = datetime.now(timezone.utc)
+    await _ensure_tracker_columns()
 
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
@@ -138,32 +173,46 @@ async def evaluate_recommendation_outcomes() -> dict[str, Any]:
                 continue
 
             outcome = exit_price = exit_time = None
+            outcome_reason = None
             entry = float(r["entry"])
             sl = float(r["stoploss"])
             tgt = float(r["target1"])
+            max_fav = 0.0
+            max_adv = 0.0
+            bars_held = 0
 
             for ts, row in bars.iterrows():
                 hi = float(row.get("High") or row.get("high") or row.get("Close"))
                 lo = float(row.get("Low") or row.get("low") or row.get("Close"))
+                bars_held += 1
                 if r["action"] == "BUY":
+                    max_fav = max(max_fav, (hi - entry) / entry * 100.0)
+                    max_adv = min(max_adv, (lo - entry) / entry * 100.0)
                     if lo <= sl:
                         outcome, exit_price = "loss", sl
+                        outcome_reason = "stoploss_hit"
                         exit_time = str(ts); break
                     if hi >= tgt:
                         outcome, exit_price = "win", tgt
+                        outcome_reason = "target_hit"
                         exit_time = str(ts); break
                 else:  # SELL
+                    max_fav = max(max_fav, (entry - lo) / entry * 100.0)
+                    max_adv = min(max_adv, (entry - hi) / entry * 100.0)
                     if hi >= sl:
                         outcome, exit_price = "loss", sl
+                        outcome_reason = "stoploss_hit"
                         exit_time = str(ts); break
                     if lo <= tgt:
                         outcome, exit_price = "win", tgt
+                        outcome_reason = "target_hit"
                         exit_time = str(ts); break
                 # Expire if we walked past horizon without a hit.
                 if (ts.tzinfo is None and ts >= horizon_end.replace(tzinfo=None)) or \
                    (ts.tzinfo is not None and ts >= horizon_end):
                     outcome = "expired"
                     exit_price = float(row.get("Close") or row.get("close"))
+                    outcome_reason = "time_expired"
                     exit_time = str(ts); break
 
             if outcome is None:
@@ -177,6 +226,10 @@ async def evaluate_recommendation_outcomes() -> dict[str, Any]:
                 "rec_id": r["rec_id"], "outcome": outcome,
                 "exit_price": exit_price, "exit_time": exit_time,
                 "pnl_pct": round(pnl, 2),
+                "max_favorable_pct": round(max_fav, 2),
+                "max_adverse_pct": round(max_adv, 2),
+                "bars_held": bars_held,
+                "outcome_reason": outcome_reason,
             })
             if outcome == "win": wins += 1
             elif outcome == "loss": losses += 1
@@ -186,11 +239,13 @@ async def evaluate_recommendation_outcomes() -> dict[str, Any]:
         async with aiosqlite.connect(DB_PATH) as db:
             await db.executemany(
                 """UPDATE recommendation_outcomes
-                   SET outcome=?, exit_price=?, exit_time=?, pnl_pct=?, evaluated_at=?
+                   SET outcome=?, exit_price=?, exit_time=?, pnl_pct=?, evaluated_at=?,
+                       max_favorable_pct=?, max_adverse_pct=?, bars_held=?, outcome_reason=?
                    WHERE rec_id=?""",
                 [
                     (u["outcome"], u["exit_price"], u["exit_time"], u["pnl_pct"],
-                     cutoff_now.isoformat(), u["rec_id"])
+                     cutoff_now.isoformat(), u["max_favorable_pct"], u["max_adverse_pct"],
+                     u["bars_held"], u["outcome_reason"], u["rec_id"])
                     for u in updates
                 ],
             )
@@ -285,7 +340,19 @@ async def _recalculate_factor_performance() -> None:
 
 # ── consumed by recommendation._score_all ──────────────────────────────
 
-def factor_edge_multiplier(factor: str) -> float:
+def _edge_multiplier(edge: float) -> float:
+    # Linear clip: edge of +5pp PnL -> 1.5x, -5pp -> 0.5x.
+    mult = 1.0 + max(-0.5, min(0.5, edge / 10.0))
+    return max(_WEIGHT_MIN, min(_WEIGHT_MAX, mult))
+
+
+def factor_edge_multiplier(
+    factor: str,
+    *,
+    regime: str | None = None,
+    sector: str | None = None,
+    horizon: str | None = None,
+) -> float:
     """Map factor edge → weight multiplier in [0.5, 1.5].
 
     Edge is in percentage-points of P&L. Empirically, useful Indian-equity
@@ -295,12 +362,28 @@ def factor_edge_multiplier(factor: str) -> float:
     """
     if not _factor_edge_cache:
         return 1.0
-    if factor not in _factor_edge_cache:
+    candidates: list[str] = []
+    if regime and horizon:
+        candidates.append(f"{factor}|regime={regime}|horizon={horizon}")
+    if sector and horizon:
+        candidates.append(f"{factor}|sector={sector}|horizon={horizon}")
+    if regime:
+        candidates.append(f"{factor}|regime={regime}")
+    if sector:
+        candidates.append(f"{factor}|sector={sector}")
+    if horizon:
+        candidates.append(f"{factor}|horizon={horizon}")
+    candidates.append(factor)
+
+    multipliers = [
+        _edge_multiplier(_factor_edge_cache[key])
+        for key in candidates
+        if key in _factor_edge_cache
+    ]
+    if not multipliers:
         return 1.0
-    edge = _factor_edge_cache[factor]
-    # Linear clip: edge of +5pp PnL → 1.5×, -5pp → 0.5×.
-    mult = 1.0 + max(-0.5, min(0.5, edge / 10.0))
-    return max(_WEIGHT_MIN, min(_WEIGHT_MAX, mult))
+    # Blend available context instead of allowing one narrow slice to dominate.
+    return sum(multipliers) / len(multipliers)
 
 
 async def seed_factor_edge_cache() -> int:

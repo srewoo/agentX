@@ -55,6 +55,15 @@ class Recommendation(BaseModel):
     delivery_pct: Optional[float] = None
     fii_dii_signal: Optional[FiiDiiSignal] = None
     f_and_o_signal: Optional[FnoSignal] = None
+    regime: Optional[str] = None
+    weighted_score: Optional[float] = None
+    factor_agreement: Optional[float] = None
+    calibration_note: Optional[str] = None
+    data_quality: Optional[str] = None
+    advisory_disclaimer: str = (
+        "Research signal only, not investment advice. Validate independently "
+        "and use your own risk controls."
+    )
     generated_at: datetime
 
     @field_validator("entry", "stoploss", "target1", "last_price")

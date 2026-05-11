@@ -512,6 +512,84 @@ def _get_signal_weight(signal_type: str, direction: str) -> float:
     return 1.0
 
 
+def _has_independent_positive_confirmation(candidate: dict, signals: list[dict]) -> bool:
+    """Require a different-family, same-direction signal with positive edge."""
+    try:
+        from app.services.signal_edge import get_family, has_positive_edge
+    except Exception:
+        return False
+
+    stype = candidate.get("signal_type", "")
+    direction = candidate.get("direction", "neutral")
+    family = get_family(stype)
+    for sig in signals:
+        if sig is candidate:
+            continue
+        if sig.get("direction") != direction:
+            continue
+        other_type = sig.get("signal_type", "")
+        if not other_type or get_family(other_type) == family:
+            continue
+        if sig.get("strength", 0) < 5:
+            continue
+        if has_positive_edge(other_type, direction):
+            return True
+    return False
+
+
+def _apply_backtest_edge_filters(signals: list[dict]) -> list[dict]:
+    """Block or downgrade weak historical setups unless independently confirmed."""
+    try:
+        from app.services.signal_edge import get_edge, requires_confirmation
+    except Exception:
+        return signals
+
+    filtered: list[dict] = []
+    for sig in signals:
+        stype = sig.get("signal_type", "")
+        direction = sig.get("direction", "neutral")
+        policy = requires_confirmation(stype, direction)
+        if not policy:
+            filtered.append(sig)
+            continue
+
+        confirmed = _has_independent_positive_confirmation(sig, signals)
+        sig["metadata"] = sig.get("metadata") or {}
+        edge = get_edge(stype, direction) or {}
+        sig["metadata"]["historical_edge"] = {
+            "avg_pnl": edge.get("avg_pnl"),
+            "win_rate": edge.get("win_rate"),
+            "trades": edge.get("trades"),
+            "confirmation_policy": policy,
+            "confirmed": confirmed,
+        }
+        if confirmed:
+            sig["metadata"]["edge_confirmed"] = True
+            filtered.append(sig)
+            continue
+
+        if policy == "hard":
+            sig["metadata"]["blocked_by_edge_filter"] = True
+            logger.debug(
+                "Blocked weak unconfirmed signal %s:%s for %s",
+                stype, direction, sig.get("symbol"),
+            )
+            continue
+
+        sig["strength"] = max(1, min(4, int(sig.get("strength", 1)) - 3))
+        sig["reason"] = (
+            f"{sig.get('reason', '')} [downgraded: historically weak without "
+            "independent confirmation]"
+        )
+        sig["risk"] = (
+            f"{sig.get('risk', '')} Backtest edge is weak unless another "
+            "positive-expectancy setup confirms it."
+        )
+        sig["metadata"]["downgraded_by_edge_filter"] = True
+        filtered.append(sig)
+    return filtered
+
+
 def scan_symbol(
     symbol: str,
     df: pd.DataFrame,
@@ -646,6 +724,8 @@ def scan_symbol(
 
             signals.append(psig)
 
+    signals = _apply_backtest_edge_filters(signals)
+
     # ── Dynamic signal weighting (boost proven signals, suppress poor ones) ─
     for sig in signals:
         stype = sig.get("signal_type", "")
@@ -662,7 +742,7 @@ def scan_symbol(
     # double_bottom + inverse_h&s). Fix: require ≥2 distinct *families*
     # (momentum/divergence/pattern/candle/volatility/volume…) before firing.
     # This is a deliberate sample-driven change, not a heuristic.
-    from app.services.signal_edge import get_family
+    from app.services.signal_edge import get_family, has_positive_edge
 
     bullish_sigs = [s for s in signals if s.get("direction") == "bullish"]
     bearish_sigs = [s for s in signals if s.get("direction") == "bearish"]
@@ -674,6 +754,10 @@ def scan_symbol(
         if len(families) < 2:
             # Stacking correlated detectors of the same family — historically
             # this just amplifies the same bias and lost money in the backtest.
+            return None
+        if direction == "bullish" and not any(
+            has_positive_edge(s["signal_type"], direction) for s in sigs
+        ):
             return None
         # Pick best signal per family to keep the contributors diverse.
         best_per_family: dict[str, dict] = {}

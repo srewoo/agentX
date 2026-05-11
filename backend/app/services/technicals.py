@@ -1,6 +1,8 @@
 from __future__ import annotations
 """
 Technical analysis computations using the ``ta`` library (bukosabino/ta).
+When TA-Lib is installed, core indicators are recalculated with TA-Lib and
+returned in the same response shape.
 
 Provides RSI, MACD, ADX, Bollinger Bands, SMA/EMA, VWAP, Stochastic,
 OBV, ATR, Ichimoku, CCI, Williams %R, MFI, plus support/resistance,
@@ -16,6 +18,11 @@ import ta
 from app.utils import safe_float
 
 logger = logging.getLogger(__name__)
+
+try:  # Optional production-grade indicator engine.
+    import talib as _talib
+except Exception:  # pragma: no cover - availability depends on environment
+    _talib = None
 
 
 # ---------------------------------------------------------------------------
@@ -40,6 +47,170 @@ def _prev(series: pd.Series) -> float | None:
     if pd.isna(val):
         return None
     return safe_float(val)
+
+
+def _series(index: pd.Index, values: Any) -> pd.Series:
+    return pd.Series(values, index=index)
+
+
+_CANDLE_PATTERNS = {
+    "doji": "CDLDOJI",
+    "hammer": "CDLHAMMER",
+    "inverted_hammer": "CDLINVERTEDHAMMER",
+    "engulfing": "CDLENGULFING",
+    "morning_star": "CDLMORNINGSTAR",
+    "evening_star": "CDLEVENINGSTAR",
+    "shooting_star": "CDLSHOOTINGSTAR",
+    "harami": "CDLHARAMI",
+}
+
+
+def _pattern_signal(value: float | None) -> str:
+    if value is None or value == 0:
+        return "neutral"
+    return "bullish" if value > 0 else "bearish"
+
+
+def _apply_talib_overrides(
+    result: dict[str, Any],
+    open_: pd.Series,
+    high: pd.Series,
+    low: pd.Series,
+    close: pd.Series,
+    volume: pd.Series,
+) -> None:
+    """Override core indicators with TA-Lib when available.
+
+    The app keeps the current ``ta`` implementation as the fallback so local
+    installs remain simple. TA-Lib adds faster, industry-standard calculations
+    and candlestick pattern recognition when present.
+    """
+    result["indicator_backend"] = "ta"
+    result["candlestick_patterns"] = {}
+    if _talib is None:
+        return
+
+    try:
+        open_arr = open_.astype(float).to_numpy()
+        high_arr = high.astype(float).to_numpy()
+        low_arr = low.astype(float).to_numpy()
+        close_arr = close.astype(float).to_numpy()
+        volume_arr = volume.astype(float).to_numpy()
+        index = close.index
+
+        rsi = _series(index, _talib.RSI(close_arr, timeperiod=14))
+        rsi_val = _last(rsi)
+        if rsi_val is not None:
+            result["rsi"] = rsi_val
+            result["rsi_prev"] = _prev(rsi)
+            result["rsi_signal"] = (
+                "Overbought" if rsi_val > 70
+                else ("Oversold" if rsi_val < 30 else "Neutral")
+            )
+
+        macd_line, signal_line, macd_hist = _talib.MACD(
+            close_arr, fastperiod=12, slowperiod=26, signalperiod=9,
+        )
+        macd_series = _series(index, macd_line)
+        signal_series = _series(index, signal_line)
+        macd_line_val = _last(macd_series)
+        signal_line_val = _last(signal_series)
+        result["macd"] = {
+            "macd_line": macd_line_val,
+            "macd_line_prev": _prev(macd_series),
+            "signal_line": signal_line_val,
+            "signal_line_prev": _prev(signal_series),
+            "histogram": _last(_series(index, macd_hist)),
+            "signal": (
+                "Bullish"
+                if macd_line_val is not None
+                and signal_line_val is not None
+                and macd_line_val > signal_line_val
+                else "Bearish"
+            ),
+        }
+
+        adx = _last(_series(index, _talib.ADX(high_arr, low_arr, close_arr, timeperiod=14)))
+        if adx is not None:
+            result["adx"] = adx
+
+        sma20 = _series(index, _talib.SMA(close_arr, timeperiod=20))
+        sma20_val = _last(sma20)
+        result["moving_averages"] = {
+            "sma20": sma20_val,
+            "sma50": _last(_series(index, _talib.SMA(close_arr, timeperiod=50))) if len(close) >= 50 else None,
+            "sma200": _last(_series(index, _talib.SMA(close_arr, timeperiod=200))) if len(close) >= 200 else None,
+            "ema20": _last(_series(index, _talib.EMA(close_arr, timeperiod=20))),
+        }
+        current_price = result.get("current_price")
+        result["price_vs_sma20"] = (
+            "Above" if current_price and sma20_val and current_price > sma20_val else "Below"
+        )
+
+        bb_upper, bb_middle, bb_lower = _talib.BBANDS(
+            close_arr, timeperiod=20, nbdevup=2, nbdevdn=2, matype=0,
+        )
+        bb_upper_val = _last(_series(index, bb_upper))
+        bb_middle_val = _last(_series(index, bb_middle))
+        bb_lower_val = _last(_series(index, bb_lower))
+        result["bollinger_bands"] = {
+            "upper": bb_upper_val,
+            "middle": bb_middle_val,
+            "lower": bb_lower_val,
+            "signal": (
+                "Overbought" if current_price and bb_upper_val and current_price > bb_upper_val
+                else ("Oversold" if current_price and bb_lower_val and current_price < bb_lower_val
+                      else "Normal")
+            ),
+        }
+
+        slowk, slowd = _talib.STOCH(
+            high_arr, low_arr, close_arr,
+            fastk_period=14, slowk_period=3, slowk_matype=0,
+            slowd_period=3, slowd_matype=0,
+        )
+        k_val = _last(_series(index, slowk))
+        d_val = _last(_series(index, slowd))
+        if k_val is not None and d_val is not None:
+            if k_val > d_val and k_val < 80:
+                stoch_signal = "bullish"
+            elif k_val < d_val and k_val > 20:
+                stoch_signal = "bearish"
+            else:
+                stoch_signal = "neutral"
+        else:
+            stoch_signal = "neutral"
+        result["stochastic"] = {"k": k_val, "d": d_val, "signal": stoch_signal}
+
+        obv_series = _series(index, _talib.OBV(close_arr, volume_arr))
+        result["obv"] = _last(obv_series)
+        obv_tail = obv_series.dropna().tail(5)
+        if len(obv_tail) >= 3:
+            slope = obv_tail.iloc[-1] - obv_tail.iloc[0]
+            result["obv_trend"] = "rising" if slope > 0 else ("falling" if slope < 0 else "flat")
+
+        atr_val = _last(_series(index, _talib.ATR(high_arr, low_arr, close_arr, timeperiod=14)))
+        result["atr"] = atr_val
+        result["atr_pct"] = (
+            round(atr_val / current_price * 100, 4)
+            if atr_val is not None and current_price
+            else None
+        )
+        result["cci"] = _last(_series(index, _talib.CCI(high_arr, low_arr, close_arr, timeperiod=20)))
+        result["williams_r"] = _last(_series(index, _talib.WILLR(high_arr, low_arr, close_arr, timeperiod=14)))
+        result["mfi"] = _last(_series(index, _talib.MFI(high_arr, low_arr, close_arr, volume_arr, timeperiod=14)))
+
+        patterns: dict[str, dict[str, Any]] = {}
+        for name, fn_name in _CANDLE_PATTERNS.items():
+            fn = getattr(_talib, fn_name, None)
+            if fn is None:
+                continue
+            val = _last(_series(index, fn(open_arr, high_arr, low_arr, close_arr)))
+            patterns[name] = {"value": val, "signal": _pattern_signal(val)}
+        result["candlestick_patterns"] = patterns
+        result["indicator_backend"] = "talib"
+    except Exception:
+        logger.exception("TA-Lib override failed; keeping ta indicator output")
 
 
 # ---------------------------------------------------------------------------
@@ -113,12 +284,18 @@ def compute_technicals(df: pd.DataFrame) -> dict[str, Any]:
         }
 
     # --- ADX (14) ---------------------------------------------------------
-    try:
-        adx_ind = ta.trend.ADXIndicator(high=high, low=low, close=close, window=14)
-        result["adx"] = _last(adx_ind.adx())
-    except Exception:
-        logger.exception("ADX computation failed")
+    # `ta` needs more than one full 14-bar window for ADX initialisation. During
+    # walk-forward calibration, early weekly slices can have only 9-14 bars;
+    # skip cleanly instead of logging an exception for every slice.
+    if len(close) < 28:
         result["adx"] = None
+    else:
+        try:
+            adx_ind = ta.trend.ADXIndicator(high=high, low=low, close=close, window=14)
+            result["adx"] = _last(adx_ind.adx())
+        except Exception:
+            logger.debug("ADX computation failed", exc_info=True)
+            result["adx"] = None
 
     # --- Moving Averages --------------------------------------------------
     try:
@@ -311,6 +488,7 @@ def compute_technicals(df: pd.DataFrame) -> dict[str, Any]:
         logger.exception("MFI computation failed")
         result["mfi"] = None
 
+    _apply_talib_overrides(result, open_, high, low, close, volume)
     return result
 
 

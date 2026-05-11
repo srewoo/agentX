@@ -283,6 +283,23 @@ async def test_given_bullish_history_when_generated_then_buy(patch_external_io, 
 
 
 @pytest.mark.asyncio
+async def test_given_intraday_horizon_when_generated_then_uses_5m_history(patch_external_io, monkeypatch):
+    seen = {}
+
+    async def _hist(_sym, period="6mo", interval="1d"):
+        seen["period"] = period
+        seen["interval"] = interval
+        return _make_bullish_df()
+
+    monkeypatch.setattr(rec_mod, "async_fetch_history", _hist)
+
+    rec = await rec_mod.generate_recommendation("RELIANCE", horizon="intraday")
+    assert rec is not None
+    assert seen == {"period": "5d", "interval": "5m"}
+    assert rec.timeframe_days == 1
+
+
+@pytest.mark.asyncio
 async def test_given_bearish_history_when_generated_then_sell_or_hold(patch_external_io, monkeypatch):
     async def _hist(_sym, period="6mo", interval="1d"):
         return _make_bearish_df()
