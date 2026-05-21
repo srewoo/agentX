@@ -24,8 +24,9 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     claude_api_key: str = ""
 
-    # Signal engine
-    default_alert_interval_minutes: int = 30
+    # Signal engine — 60-min scan cadence matches the production loop:
+    # weekly backtest Mon 10:30 IST, weekly calibration Fri 16:30 IST.
+    default_alert_interval_minutes: int = 60
 
     # Logging
     log_file: str = "agentx.log"

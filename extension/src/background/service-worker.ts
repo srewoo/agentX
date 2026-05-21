@@ -9,7 +9,7 @@ import type { Signal, PaperTrade, AppSettings } from "../shared/types";
 
 const ALARM_NAME = "stockpilot-scan";
 const PAPER_ALARM_NAME = "stockpilot-paper-track";
-const DEFAULT_INTERVAL_MINUTES = 30;
+const DEFAULT_INTERVAL_MINUTES = 60;
 const PAPER_INTERVAL_MINUTES = 5; // SL/Target check cadence during market hours
 const MAX_SIGNALS = 100;
 
@@ -124,6 +124,9 @@ async function autoPaperFromSignals(newSignals: Signal[]): Promise<void> {
       entry_price: price,
       entry_at: new Date().toISOString(),
       signal_id: s.id,
+      signal_type: s.signal_type,
+      signal_strength: s.strength,
+      signal_direction: s.direction === "bearish" ? "bearish" : "bullish",
       target,
       stop_loss: stop,
       status: "open",
@@ -134,8 +137,15 @@ async function autoPaperFromSignals(newSignals: Signal[]): Promise<void> {
   }
 
   if (!newTrades.length) return;
-  await chrome.storage.local.set({ paperTrades: [...newTrades, ...trades] });
+  const stored: PaperTrade[] = [...newTrades, ...trades];
+  await chrome.storage.local.set({ paperTrades: stored });
   console.log(`[agentX SW] auto-paper: opened ${newTrades.length} positions`);
+
+  // Fire-and-forget backend sync. Failures are non-fatal — the trades stay
+  // in chrome.storage and the next sync sweep retries the un-synced ones.
+  syncOpenTradesToBackend(newTrades).catch((e) =>
+    console.warn("[agentX SW] auto-paper backend sync failed:", e)
+  );
 
   // One consolidated notification (Chrome rate-limits per-id notifications)
   try {
@@ -148,6 +158,96 @@ async function autoPaperFromSignals(newSignals: Signal[]): Promise<void> {
       priority: 1,
     });
   } catch { /* notification errors are non-fatal */ }
+}
+
+// ── Paper-trade backend sync ─────────────────────────────────────────────────
+//
+// Closes the autonomous loop: extension-opened paper trades land in the
+// backend `paper_trades` table so they're visible to the same analytics
+// (signal_outcomes, performance summary) as the shell-script trades.
+// Both helpers are best-effort — they patch chrome.storage with the
+// resulting `backend_trade_id` / `backend_synced_at` so the popup can
+// reflect sync status.
+
+async function _patchStoredTrade(id: string, patch: Partial<PaperTrade>): Promise<void> {
+  const r = await chrome.storage.local.get("paperTrades");
+  const trades = (r.paperTrades as PaperTrade[] | undefined) ?? [];
+  const next = trades.map((t) => (t.id === id ? { ...t, ...patch } : t));
+  await chrome.storage.local.set({ paperTrades: next });
+}
+
+async function syncOpenTradesToBackend(newTrades: PaperTrade[]): Promise<void> {
+  if (!newTrades.length) return;
+  const baseUrl = await getBackendUrl();
+  const settingsAll = (await getSettings()) as Record<string, string>;
+  const apiKey = String(settingsAll.api_key || "");
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (apiKey) headers["X-API-Key"] = apiKey;
+
+  for (const t of newTrades) {
+    // Skip trades missing the source-signal context — the backend's
+    // CreatePaperTradeRequest requires signal_type + direction + strength.
+    if (!t.signal_type || !t.signal_direction || t.signal_strength == null) continue;
+    try {
+      const body = JSON.stringify({
+        symbol: t.symbol,
+        direction: t.signal_direction,
+        signal_type: t.signal_type,
+        strength: t.signal_strength,
+        entry_price: t.entry_price,
+        entry_date: t.entry_at,
+        stop_loss: t.stop_loss ?? null,
+        target: t.target ?? null,
+        shares: t.qty,
+      });
+      const res = await fetch(`${baseUrl}/api/performance/paper-trades`, {
+        method: "POST", headers, body,
+      });
+      if (!res.ok) {
+        console.warn(`[agentX SW] backend open POST ${res.status} for ${t.symbol}`);
+        continue;
+      }
+      const data = await res.json() as { data?: { trade_id?: string; id?: string } };
+      const backendId = data?.data?.trade_id || data?.data?.id;
+      if (backendId) {
+        await _patchStoredTrade(t.id, {
+          backend_trade_id: backendId,
+          backend_synced_at: new Date().toISOString(),
+        });
+      }
+    } catch (e) {
+      console.warn(`[agentX SW] backend open sync error for ${t.symbol}:`, e);
+    }
+  }
+}
+
+async function syncClosedTradeToBackend(t: PaperTrade): Promise<void> {
+  if (!t.backend_trade_id || t.exit_price == null) return;
+  const baseUrl = await getBackendUrl();
+  const settingsAll = (await getSettings()) as Record<string, string>;
+  const apiKey = String(settingsAll.api_key || "");
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (apiKey) headers["X-API-Key"] = apiKey;
+  try {
+    const body = JSON.stringify({
+      exit_price: t.exit_price,
+      exit_date: t.exit_at ?? new Date().toISOString(),
+      exit_reason: t.notes?.includes("auto-target") ? "target"
+        : t.notes?.includes("auto-stop") ? "stop_loss"
+        : "auto",
+    });
+    const res = await fetch(
+      `${baseUrl}/api/performance/paper-trades/${encodeURIComponent(t.backend_trade_id)}/close`,
+      { method: "POST", headers, body }
+    );
+    if (!res.ok) {
+      console.warn(`[agentX SW] backend close POST ${res.status} for ${t.symbol}`);
+      return;
+    }
+    await _patchStoredTrade(t.id, { backend_synced_at: new Date().toISOString() });
+  } catch (e) {
+    console.warn(`[agentX SW] backend close sync error for ${t.symbol}:`, e);
+  }
 }
 
 // ── Paper-trade auto-tracking ────────────────────────────────────────────────
@@ -252,6 +352,16 @@ async function trackPaperTrades(): Promise<void> {
 
     if (closedAny) {
       await chrome.storage.local.set({ paperTrades: updated });
+      // Push every just-closed trade with a backend_trade_id up to the API
+      // so the close also lands in `paper_trades` (and downstream analytics).
+      // Fire-and-forget; the local storage is already the source of truth.
+      const justClosed = updated.filter(
+        (t) => t.status === "closed" && !!t.backend_trade_id && !!t.exit_price
+          && !!t.exit_at && trades.find((o) => o.id === t.id)?.status === "open"
+      );
+      for (const t of justClosed) {
+        syncClosedTradeToBackend(t).catch(() => { /* logged inside */ });
+      }
     }
   } catch (err) {
     console.warn("[agentX SW] paper tracker error:", err);

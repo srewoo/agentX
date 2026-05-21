@@ -20,6 +20,12 @@ ALLOWED_KEYS = {
     # Configurable signal thresholds
     "rsi_overbought", "rsi_oversold", "price_spike_pct",
     "volume_spike_ratio", "breakout_min_score",
+    "llm_judging_enabled",
+    # Advisor + autonomous-paper-trading toggles
+    "auto_paper_trade", "auto_paper_min_strength", "auto_paper_max_open",
+    "capital", "risk_per_trade_pct", "atr_sl_mult", "atr_target_mult",
+    "regime_filter", "roundtrip_cost_pct", "dedupe_signals",
+    "audio_alerts", "audio_strength_threshold",
 }
 
 # Keys whose VALUES must never be returned to clients. We expose only a
@@ -87,9 +93,13 @@ async def update_settings(body: UpdateSettingsRequest):
         for key, value in updates.items():
             if key not in ALLOWED_KEYS:
                 continue
-            # Serialize lists to JSON
+            # Serialize lists to JSON; normalize booleans so the JS client can
+            # read them back with a strict `=== "true"` check (Python's
+            # `str(True)` returns "True" — different bytes from JS "true").
             if isinstance(value, list):
                 value = json.dumps(value)
+            elif isinstance(value, bool):
+                value = "true" if value else "false"
             else:
                 value = str(value)
             # Seal any SECRET_KEYS value at the persistence boundary so the

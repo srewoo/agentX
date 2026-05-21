@@ -45,11 +45,38 @@ CREATE TABLE IF NOT EXISTS signals (
     reason TEXT NOT NULL,
     risk TEXT,
     llm_summary TEXT,
+    llm_verdict TEXT,
+    llm_reason TEXT,
+    exchange TEXT DEFAULT 'NSE',
     current_price REAL,
     metadata TEXT,
     created_at TEXT NOT NULL,
     read INTEGER DEFAULT 0,
     dismissed INTEGER DEFAULT 0
+);
+"""
+
+# Columns added after initial schema — applied at startup via PRAGMA inspection
+# so existing installs pick them up without losing data. SQLite has no portable
+# IF NOT EXISTS for ADD COLUMN on the supported version range.
+_SIGNALS_LATE_COLUMNS = {
+    "llm_verdict": "TEXT",   # 'keep' | 'drop' | 'downgrade' | None
+    "llm_reason": "TEXT",    # short LLM explanation (<= ~200 chars)
+    "exchange": "TEXT",      # 'NSE' | 'BSE' — populated by the orchestrator
+}
+
+# Live edge overrides populated by the weekly autonomous backtest. Keyed by
+# (signal_type, direction); replaces the cold-start `SIGNAL_EDGE` table at
+# read time when a row exists. Sample-size guardrails are enforced at write.
+CREATE_SIGNAL_EDGE_OVERRIDES_TABLE = """
+CREATE TABLE IF NOT EXISTS signal_edge_overrides (
+    signal_type TEXT NOT NULL,
+    direction TEXT NOT NULL,
+    win_rate REAL NOT NULL,
+    avg_pnl REAL NOT NULL,
+    trades INTEGER NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (signal_type, direction)
 );
 """
 
@@ -293,6 +320,10 @@ DEFAULT_SETTINGS = {
     "recommendation_calibration_stride": "5",
     "recommendation_calibration_concurrency": "3",
     "recommendation_calibration_apply": "true",
+    # Two-layer scan: when true, the orchestrator runs a single batched LLM
+    # call over deterministic candidates and writes llm_verdict/llm_reason.
+    # Default off — opt-in to control LLM spend.
+    "llm_judging_enabled": "false",
 }
 
 # Max age for signals before archival
@@ -365,6 +396,14 @@ async def _init_db_sqlite() -> None:
         await db.execute(CREATE_PAPER_TRADES_TABLE)
         await db.execute(_create_backtest_runs_sql("sqlite"))
         await db.execute(_create_llm_usage_sql("sqlite"))
+        await db.execute(CREATE_SIGNAL_EDGE_OVERRIDES_TABLE)
+
+        # Late-added columns on `signals` for existing installs.
+        async with db.execute("PRAGMA table_info(signals)") as cur:
+            existing_cols = {row[1] for row in await cur.fetchall()}
+        for col_name, col_ddl in _SIGNALS_LATE_COLUMNS.items():
+            if col_name not in existing_cols:
+                await db.execute(f"ALTER TABLE signals ADD COLUMN {col_name} {col_ddl}")
 
         for idx_sql in CREATE_SIGNALS_INDEXES:
             await db.execute(idx_sql)
@@ -403,6 +442,7 @@ def _init_db_sqlalchemy() -> None:
         CREATE_PAPER_TRADES_TABLE,
         _create_backtest_runs_sql(dialect),
         _create_llm_usage_sql(dialect),
+        CREATE_SIGNAL_EDGE_OVERRIDES_TABLE,
         *CREATE_SIGNALS_INDEXES,
         *CREATE_PRICE_ALERTS_INDEXES,
         *CREATE_BACKTEST_RUNS_INDEXES,

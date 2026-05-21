@@ -4,7 +4,7 @@ import { getSettings, saveSettings } from "../../shared/storage";
 import { api } from "../../shared/api";
 
 const DEFAULTS: Partial<AppSettings> = {
-  alert_interval_minutes: "30",
+  alert_interval_minutes: "60",
   risk_mode: "balanced",
   signal_types: ["intraday", "swing", "long_term"],
   llm_provider: "gemini",
@@ -55,12 +55,16 @@ export function useSettings() {
   const update = useCallback(async (updates: Partial<AppSettings>) => {
     setSaving(true);
     try {
-      // Use functional setState to avoid stale closure over `settings`
-      let merged: Partial<AppSettings> = {};
-      setSettings((prev) => {
-        merged = { ...prev, ...updates };
-        return merged;
-      });
+      // Race-safe merge: read the authoritative current state from
+      // chrome.storage rather than the React state, which may not be
+      // flushed yet when we call saveSettings below. The previous
+      // `setSettings((prev) => merged = ...)` pattern was racy — the
+      // updater function ran AFTER `saveSettings(merged)`, so we sometimes
+      // persisted an empty object and wiped boolean toggles like
+      // `auto_paper_trade` on the next reload.
+      const existing = await getSettings();
+      const merged = { ...existing, ...updates };
+      setSettings((prev) => ({ ...prev, ...updates }));
       await saveSettings(merged);
       await api.updateSettings(updates);
       // Notify service worker to reconfigure alarm if interval changed

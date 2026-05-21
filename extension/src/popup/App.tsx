@@ -5,6 +5,7 @@ import { Header } from "./layout/Header";
 import { BottomNav, type NavItem } from "./layout/BottomNav";
 import { TabPanel } from "./layout/TabPanel";
 import { ThemeProvider, type ThemeMode } from "./theme/ThemeProvider";
+import { ExchangeProvider } from "./lib/ExchangeContext";
 import { getSettings } from "../shared/storage";
 import { deepLink } from "../shared/localStore";
 import type { AppSettings } from "../shared/types";
@@ -114,6 +115,7 @@ export default function App() {
 
   return (
     <ThemeProvider mode={themeMode} onModeChange={setThemeMode}>
+     <ExchangeProvider value={{ exchange, setExchange }}>
       <div
         className="relative flex flex-col"
         style={{
@@ -162,6 +164,7 @@ export default function App() {
 
         {showOnboarding && <Onboarding onDone={() => setShowOnboarding(false)} />}
       </div>
+     </ExchangeProvider>
     </ThemeProvider>
   );
 }

@@ -134,6 +134,13 @@ async def lifespan(app: FastAPI):
     if factors_seeded:
         logger.info("Dynamic factor weighting active: %d factors loaded", factors_seeded)
 
+    # Load weekly-backtest-derived edge overrides so the cards reflect the
+    # latest autonomous run from the very first request after restart.
+    from app.services.signal_edge import seed_edge_overrides
+    overrides_seeded = await seed_edge_overrides()
+    if overrides_seeded:
+        logger.info("Signal edge overrides loaded: %d keys", overrides_seeded)
+
     await orchestrator.start()
     logger.info("StockPilot backend ready")
 
@@ -194,7 +201,10 @@ _ROUTE_TIMEOUTS: list[tuple[str, str | None, int]] = [
     ("/api/stocks/", "/ai-analysis", 120),
     ("/api/recommendations", None, 90),
     ("/api/market/context", None, 45),
-    ("/api/scan/trigger", None, 120),
+    # Trigger is async — returns 202 in <1s with a job_id. Progress is
+    # polled via /api/market/scan/status. Generous-but-tight 10s for the
+    # spawn itself; the actual work runs detached.
+    ("/api/scan/trigger", None, 10),
     ("/api/backtest/", None, 120),
 ]
 

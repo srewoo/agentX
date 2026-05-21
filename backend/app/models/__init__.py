@@ -13,6 +13,10 @@ class Signal(BaseModel):
     reason: str
     risk: Optional[str] = None
     llm_summary: Optional[str] = None
+    # Layer-2 LLM judge output (None when judging is disabled or failed open).
+    llm_verdict: Optional[Literal["keep", "drop", "downgrade"]] = None
+    llm_reason: Optional[str] = None
+    exchange: Literal["NSE", "BSE"] = "NSE"
     current_price: Optional[float] = None
     metadata: Optional[dict] = None
     created_at: str
@@ -52,6 +56,20 @@ class UpdateSettingsRequest(BaseModel):
     openai_api_key: Optional[str] = Field(None, max_length=200)
     gemini_api_key: Optional[str] = Field(None, max_length=200)
     claude_api_key: Optional[str] = Field(None, max_length=200)
+    llm_judging_enabled: Optional[bool] = None
+    # Advisor + autonomous paper trading toggles — previously frontend-only.
+    auto_paper_trade: Optional[bool] = None
+    auto_paper_min_strength: Optional[int] = Field(None, ge=1, le=10)
+    auto_paper_max_open: Optional[int] = Field(None, ge=1, le=100)
+    capital: Optional[float] = Field(None, ge=0)
+    risk_per_trade_pct: Optional[float] = Field(None, ge=0, le=100)
+    atr_sl_mult: Optional[float] = Field(None, ge=0, le=20)
+    atr_target_mult: Optional[float] = Field(None, ge=0, le=20)
+    regime_filter: Optional[bool] = None
+    roundtrip_cost_pct: Optional[float] = Field(None, ge=0, le=10)
+    dedupe_signals: Optional[bool] = None
+    audio_alerts: Optional[bool] = None
+    audio_strength_threshold: Optional[int] = Field(None, ge=1, le=10)
 
 
 class CreateAlertRequest(BaseModel):

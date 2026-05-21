@@ -68,6 +68,7 @@ async def run_backtest(
     symbol: str,
     period: str = "1y",
     eval_windows: list[int] | None = None,
+    exchange: str = "NSE",
 ) -> dict[str, Any]:
     """
     Run a historical backtest of the signal engine on a single symbol.
@@ -77,6 +78,7 @@ async def run_backtest(
         period: yfinance period string (default "1y").
         eval_windows: List of forward-looking day counts to evaluate
                       (default [1, 3, 5, 10]).
+        exchange: NSE (default) or BSE — picks the yfinance suffix.
 
     Returns:
         Dict with per-signal-type and overall performance metrics.
@@ -86,10 +88,11 @@ async def run_backtest(
 
     max_eval = max(eval_windows)
 
-    logger.info("Backtest started: symbol=%s period=%s eval_windows=%s", symbol, period, eval_windows)
+    logger.info("Backtest started: symbol=%s exchange=%s period=%s eval_windows=%s",
+                symbol, exchange, period, eval_windows)
 
     # Fetch full history
-    df = await async_fetch_history(symbol, period=period, interval="1d")
+    df = await async_fetch_history(symbol, period=period, interval="1d", exchange=exchange)
     if df is None or df.empty or len(df) < MIN_LOOKBACK + max_eval:
         logger.warning("Insufficient data for backtest: symbol=%s bars=%d", symbol, len(df) if df is not None else 0)
         return {

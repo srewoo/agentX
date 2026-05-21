@@ -61,10 +61,22 @@ _PERIOD_TO_DAYS = {
 
 # ── yfinance (fallback) ──────────────────────────────────────
 
-def _yfinance_fetch_sync(symbol: str, period: str = "6mo", interval: str = "1d") -> pd.DataFrame:
-    """Sync yfinance fetch. Tries .NS then .BO suffix."""
+def _yfinance_fetch_sync(
+    symbol: str,
+    period: str = "6mo",
+    interval: str = "1d",
+    exchange: str = "NSE",
+) -> pd.DataFrame:
+    """Sync yfinance fetch. Tries the requested exchange suffix first.
+
+    `exchange="BSE"` flips the lookup order to `.BO` then `.NS` — important
+    when the user explicitly picks BSE in the header toggle, since some
+    stocks (smaller listings, SME segment) are BSE-only.
+    """
     if symbol.startswith("^") or symbol.endswith(".NS") or symbol.endswith(".BO") or "=" in symbol:
         candidates = [symbol]
+    elif exchange.upper() == "BSE":
+        candidates = [f"{symbol}.BO", f"{symbol}.NS"]
     else:
         candidates = [f"{symbol}.NS", f"{symbol}.BO"]
 
@@ -83,12 +95,16 @@ _YFINANCE_TIMEOUT = 30  # seconds — prevent yfinance from hanging indefinitely
 _YFINANCE_INFO_TIMEOUT = 8  # seconds — `.info` is metadata only; fail fast
 
 
-async def _yfinance_fetch(symbol: str, period: str, interval: str) -> pd.DataFrame:
+async def _yfinance_fetch(
+    symbol: str, period: str, interval: str, exchange: str = "NSE"
+) -> pd.DataFrame:
     """Async wrapper for yfinance with timeout protection."""
     loop = asyncio.get_event_loop()
     try:
         return await asyncio.wait_for(
-            loop.run_in_executor(None, _yfinance_fetch_sync, symbol, period, interval),
+            loop.run_in_executor(
+                None, _yfinance_fetch_sync, symbol, period, interval, exchange
+            ),
             timeout=_YFINANCE_TIMEOUT,
         )
     except asyncio.TimeoutError:
@@ -98,7 +114,12 @@ async def _yfinance_fetch(symbol: str, period: str, interval: str) -> pd.DataFra
 
 # ── Main fetch function: NSE first, yfinance fallback ─────────
 
-async def async_fetch_history(symbol: str, period: str = "6mo", interval: str = "1d") -> pd.DataFrame:
+async def async_fetch_history(
+    symbol: str,
+    period: str = "6mo",
+    interval: str = "1d",
+    exchange: str = "NSE",
+) -> pd.DataFrame:
     """
     Fetch OHLCV history. NSE primary, yfinance fallback.
 
@@ -109,10 +130,17 @@ async def async_fetch_history(symbol: str, period: str = "6mo", interval: str = 
     is_index = symbol.startswith("^")
     is_intraday = interval not in ("1d", "1wk", "1mo")
 
+    # When the caller explicitly picked BSE we skip the NSE-only primary
+    # path entirely — NseIndiaApi has no BSE coverage. Go straight to
+    # yfinance with the .BO suffix preferred.
+    bse_only = exchange.upper() == "BSE" and not is_index
+
     # Intraday or index data — NSE does not provide this endpoint here.
-    if is_intraday or is_index:
+    if is_intraday or is_index or bse_only:
         try:
-            hist = await _retry_async(_yfinance_fetch, symbol, period, interval, max_retries=1)
+            hist = await _retry_async(
+                _yfinance_fetch, symbol, period, interval, exchange, max_retries=1
+            )
             if not hist.empty:
                 return hist
         except Exception as e:
@@ -130,7 +158,9 @@ async def async_fetch_history(symbol: str, period: str = "6mo", interval: str = 
 
     # Fallback to yfinance
     try:
-        hist = await _retry_async(_yfinance_fetch, symbol, period, interval, max_retries=1)
+        hist = await _retry_async(
+            _yfinance_fetch, symbol, period, interval, exchange, max_retries=1
+        )
         if not hist.empty:
             return hist
     except Exception as e:

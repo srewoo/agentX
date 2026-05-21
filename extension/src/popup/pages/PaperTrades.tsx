@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { paperTrades, pMap } from "../../shared/localStore";
 import { api } from "../../shared/api";
+import { useExchange } from "../lib/ExchangeContext";
 import type { PaperTrade } from "../../shared/types";
 
 interface Props { onSelectSymbol?: (symbol: string) => void; }
@@ -14,6 +15,7 @@ function pnl(t: PaperTrade, last?: number): { value: number; pct: number } {
 }
 
 export default function PaperTrades({ onSelectSymbol }: Props) {
+  const exchange = useExchange();
   const [trades, setTrades] = useState<PaperTrade[]>([]);
   const [quotes, setQuotes] = useState<Record<string, number>>({});
   const [loading, setLoading] = useState(true);
@@ -34,7 +36,7 @@ export default function PaperTrades({ onSelectSymbol }: Props) {
     const q: Record<string, number> = {};
     await pMap(openSyms, async (s) => {
       try {
-        const r = await api.getQuote(s);
+        const r = await api.getQuote(s, exchange);
         if (r.price != null) q[s] = r.price;
       } catch { /* skip individual failures, don't blow up the page */ }
     }, 4);
@@ -42,7 +44,7 @@ export default function PaperTrades({ onSelectSymbol }: Props) {
     setLoading(false);
   };
 
-  useEffect(() => { reload(); }, []);
+  useEffect(() => { reload(); }, [exchange]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const open = useMemo(() => trades.filter((t) => t.status === "open"), [trades]);
   const closed = useMemo(() => trades.filter((t) => t.status === "closed").slice(0, 30), [trades]);

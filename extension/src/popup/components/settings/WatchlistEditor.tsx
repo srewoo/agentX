@@ -46,12 +46,27 @@ const DEBOUNCE_MS = 250;
 export default function WatchlistEditor({ items, onChange, searchSymbols }: Props) {
   const inputId = useId();
   const listboxId = useId();
+  const manualSymbolId = useId();
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<SearchResult[]>([]);
   const [activeIndex, setActiveIndex] = useState(-1);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+
+  // Manual entry — covers BSE-only listings the NSE-indexed search misses.
+  const [manualSymbol, setManualSymbol] = useState("");
+  const [manualExchange, setManualExchange] = useState<"NSE" | "BSE">("NSE");
+
+  const addManual = async () => {
+    const sym = manualSymbol.trim().toUpperCase();
+    if (!sym) return;
+    if (items.some((i) => i.symbol.toUpperCase() === sym && (i.exchange ?? "NSE") === manualExchange)) {
+      return;
+    }
+    await onChange([...items, { symbol: sym, name: sym, exchange: manualExchange }]);
+    setManualSymbol("");
+  };
 
   const existingSymbols = useMemo(
     () => new Set(items.map((i) => i.symbol.toUpperCase())),
@@ -221,6 +236,45 @@ export default function WatchlistEditor({ items, onChange, searchSymbols }: Prop
             {error}
           </p>
         ) : null}
+      </div>
+
+      {/* Manual add — needed for BSE-only listings (SME segment, smaller mid/
+          small caps) that aren't in the NSE-indexed search. */}
+      <div className="border-t border-slate-800 pt-3">
+        <label htmlFor={manualSymbolId} className="text-xs font-medium text-slate-300">
+          Add by symbol + exchange
+        </label>
+        <div className="mt-1 flex gap-1.5">
+          <TextInput
+            id={manualSymbolId}
+            value={manualSymbol}
+            onChange={(e) => setManualSymbol(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); void addManual(); } }}
+            placeholder="Symbol (e.g., SHANTIGEAR)"
+            autoComplete="off"
+            className="flex-1"
+          />
+          <select
+            value={manualExchange}
+            onChange={(e) => setManualExchange(e.target.value as "NSE" | "BSE")}
+            className="bg-slate-800 border border-slate-700 rounded px-2 text-xs text-slate-100"
+            aria-label="Exchange"
+          >
+            <option value="NSE">NSE</option>
+            <option value="BSE">BSE</option>
+          </select>
+          <button
+            type="button"
+            onClick={() => void addManual()}
+            disabled={!manualSymbol.trim()}
+            className="text-xs px-2 py-1 rounded bg-emerald-700 text-white disabled:opacity-40"
+          >
+            Add
+          </button>
+        </div>
+        <p className="mt-1 text-[10px] text-slate-500">
+          Use this for BSE-only listings the search misses.
+        </p>
       </div>
     </div>
   );

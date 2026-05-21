@@ -15,11 +15,11 @@ from app.utils import safe_float
 logger = logging.getLogger(__name__)
 
 
-def _resolve_yf_symbol(symbol: str) -> str:
-    """Add .NS suffix for NSE stocks (matching data_fetcher convention)."""
+def _resolve_yf_symbol(symbol: str, exchange: str = "NSE") -> str:
+    """Add the appropriate exchange suffix for yfinance lookup."""
     if symbol.startswith("^") or symbol.endswith(".NS") or symbol.endswith(".BO") or "=" in symbol:
         return symbol
-    return f"{symbol}.NS"
+    return f"{symbol}.BO" if exchange.upper() == "BSE" else f"{symbol}.NS"
 
 
 def _extract_fundamentals(info: dict[str, Any]) -> dict[str, Any]:
@@ -208,7 +208,7 @@ def _fetch_info_sync(yf_symbol: str) -> dict[str, Any]:
 _YFINANCE_TIMEOUT = 30  # seconds — prevent yfinance from hanging indefinitely
 
 
-async def get_fundamentals(symbol: str) -> dict[str, Any]:
+async def get_fundamentals(symbol: str, exchange: str = "NSE") -> dict[str, Any]:
     """
     Extract fundamental data for a stock with a layered fallback chain:
 
@@ -218,8 +218,11 @@ async def get_fundamentals(symbol: str) -> dict[str, Any]:
 
     Each later source only fills fields the earlier ones left empty.
     Returns the canonical fundamentals dict + health score.
+
+    ``exchange`` picks the yfinance suffix: NSE → .NS, BSE → .BO. The NSE
+    quote fallback is skipped on BSE since the endpoint is NSE-only.
     """
-    yf_symbol = _resolve_yf_symbol(symbol)
+    yf_symbol = _resolve_yf_symbol(symbol, exchange)
 
     loop = asyncio.get_event_loop()
     info: dict[str, Any] = {}
@@ -267,13 +270,15 @@ async def get_fundamentals(symbol: str) -> dict[str, Any]:
 
     nse_partial = None
     screener_partial = None
-    try:
-        nse_partial = await asyncio.wait_for(
-            loop.run_in_executor(None, fetch_nse_quote, symbol),
-            timeout=10,
-        )
-    except Exception as e:
-        logger.debug("nse_quote fallback skipped for %s: %s", symbol, e)
+    # NSE quote fallback only applies to NSE-listed symbols.
+    if exchange.upper() != "BSE":
+        try:
+            nse_partial = await asyncio.wait_for(
+                loop.run_in_executor(None, fetch_nse_quote, symbol),
+                timeout=10,
+            )
+        except Exception as e:
+            logger.debug("nse_quote fallback skipped for %s: %s", symbol, e)
 
     try:
         screener_partial = await asyncio.wait_for(

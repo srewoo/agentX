@@ -67,6 +67,7 @@ Desktop.ini
 
 # Logs
 *.log
+*.log.*
 logs/
 
 # ML Models (FinBERT downloads ~420MB)

@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { api } from "../../shared/api";
+import { useExchange } from "../lib/ExchangeContext";
 import { getSettings } from "../../shared/storage";
 import type { BacktestResult, AppSettings } from "../../shared/types";
 
@@ -12,6 +13,7 @@ const PERIODS: Array<{ id: "3mo" | "6mo" | "1y" | "2y" | "5y"; label: string }> 
 ];
 
 export default function BacktestPanel({ symbol }: Props) {
+  const exchange = useExchange();
   const [period, setPeriod] = useState<"3mo" | "6mo" | "1y" | "2y" | "5y">("1y");
   const [result, setResult] = useState<BacktestResult | null>(null);
   const [loading, setLoading] = useState(false);
@@ -31,7 +33,7 @@ export default function BacktestPanel({ symbol }: Props) {
     setError(null);
     setResult(null);
     try {
-      const r = await api.backtest(symbol, period);
+      const r = await api.backtest(symbol, period, 5, exchange);
       setResult(r);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Backtest failed");

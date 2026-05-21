@@ -169,3 +169,10 @@ days at current trajectory. Both: H / M / L.
   unsupported.
 - **Backtester at 17% coverage** — any "this strategy made +X%"
   number we surface is barely tested.
+
+## 11. Regulatory & Compliance risk of direct NSE/BSE scraping
+
+- **Severity: H** — NSE/BSE do not provide public APIs; unauthorized scraping violates ToS and can result in legal action or IP blocks.
+- **Likelihood: M** — Current implementation relies on `nse_fetcher` which mimics browser requests.
+- **Where**: `backend/app/services/nse_fetcher.py`.
+- **Mitigation**: Transition away from scraping. Integrate authorized Broker APIs (e.g., Zerodha Kite) or Authorized Information Vendors (AIVs) like TrueData as outlined in the scaling roadmap. Stop scraping if the application moves to public hosting.

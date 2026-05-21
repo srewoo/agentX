@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { createChart, type IChartApi, type ISeriesApi, ColorType, CrosshairMode, LineStyle, CandlestickSeries, HistogramSeries, LineSeries } from "lightweight-charts";
 import { api } from "../../shared/api";
+import { useExchange } from "../lib/ExchangeContext";
 
 interface Props {
   symbol: string;
@@ -103,6 +104,7 @@ function computeBollingerBands(closes: number[], window = 20, mult = 2): { upper
 }
 
 export default function MiniChart({ symbol, height = 150 }: Props) {
+  const exchange = useExchange();
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const candleSeriesRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
@@ -285,7 +287,7 @@ export default function MiniChart({ symbol, height = 150 }: Props) {
     // Fetch data
     let cancelled = false;
 
-    api.getHistory(symbol, tf.period, tf.interval)
+    api.getHistory(symbol, tf.period, tf.interval, exchange)
       .then((res) => {
         if (cancelled) return;
 
@@ -372,7 +374,7 @@ export default function MiniChart({ symbol, height = 150 }: Props) {
       ema21SeriesRef.current = null;
       rsiSeriesRef.current = null;
     };
-  }, [symbol, height, activeTimeframe]);
+  }, [symbol, height, activeTimeframe, exchange]);
 
   if (error) {
     return (

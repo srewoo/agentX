@@ -7,6 +7,7 @@ import BacktestPanel from "../components/BacktestPanel";
 import NewsPanel from "../components/NewsPanel";
 import FundamentalsCard from "../components/FundamentalsCard";
 import { api } from "../../shared/api";
+import { useExchange } from "../lib/ExchangeContext";
 import type { StockQuote, AIAnalysisResponse } from "../../shared/types";
 
 interface SearchResult {
@@ -29,6 +30,7 @@ function useDebounce<T extends unknown[]>(fn: (...args: T) => void, delay: numbe
 }
 
 export default function Search({ initialSymbol, onSymbolConsumed }: SearchProps = {}) {
+  const exchange = useExchange();
   const [query, setQuery] = useState("");
   const [suggestions, setSuggestions] = useState<SearchResult[]>([]);
   const [selectedSymbol, setSelectedSymbol] = useState<string | null>(null);
@@ -73,7 +75,7 @@ export default function Search({ initialSymbol, onSymbolConsumed }: SearchProps 
     setError(null);
     setLoadingQuote(true);
     try {
-      const q = await api.getQuote(symbol);
+      const q = await api.getQuote(symbol, exchange);
       setQuote(q);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));

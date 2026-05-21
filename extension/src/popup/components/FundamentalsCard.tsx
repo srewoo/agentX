@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { api } from "../../shared/api";
+import { useExchange } from "../lib/ExchangeContext";
 import type { FundamentalsResponse } from "../../shared/types";
 
 interface Props { symbol: string; }
@@ -65,6 +66,7 @@ function fmtCr(v: number | null | undefined): string {
 }
 
 export default function FundamentalsCard({ symbol }: Props) {
+  const exchange = useExchange();
   const [data, setData] = useState<FundamentalsResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -82,7 +84,7 @@ export default function FundamentalsCard({ symbol }: Props) {
       setCollapsed(false);
       if (!data && !loading) {
         setLoading(true);
-        api.getFundamentals(symbol)
+        api.getFundamentals(symbol, exchange)
           .then((d) => {
             // Backend returns 200 with an `error` field when yfinance is
             // rate-limited or returned an empty info dict — surface that

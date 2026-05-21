@@ -1,11 +1,13 @@
 import { useEffect, useMemo, useState } from "react";
 import { holdings as store, parseCSV, toCSV, downloadFile, pMap } from "../../shared/localStore";
 import { api } from "../../shared/api";
+import { useExchange } from "../lib/ExchangeContext";
 import type { Holding, StockQuote } from "../../shared/types";
 
 interface Props { onSelectSymbol?: (symbol: string) => void; }
 
 export default function Holdings({ onSelectSymbol }: Props) {
+  const exchange = useExchange();
   const [items, setItems] = useState<Holding[]>([]);
   const [quotes, setQuotes] = useState<Record<string, StockQuote>>({});
   const [loading, setLoading] = useState(true);
@@ -23,13 +25,13 @@ export default function Holdings({ onSelectSymbol }: Props) {
     setItems(list);
     const q: Record<string, StockQuote> = {};
     await pMap(list, async (h) => {
-      try { q[h.symbol] = await api.getQuote(h.symbol); } catch { /* skip */ }
+      try { q[h.symbol] = await api.getQuote(h.symbol, exchange); } catch { /* skip */ }
     }, 4);
     setQuotes(q);
     setLoading(false);
   };
 
-  useEffect(() => { reload(); }, []);
+  useEffect(() => { reload(); }, [exchange]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const totals = useMemo(() => {
     let invested = 0, current = 0;

@@ -4,10 +4,11 @@ import Sectors from "./Sectors";
 import Holdings from "./Holdings";
 import PaperTrades from "./PaperTrades";
 import Screener from "./Screener";
+import Performance from "./Performance";
 
 interface Props { onSelectSymbol?: (symbol: string) => void; }
 
-type SubTab = "screener" | "sectors" | "earnings" | "holdings" | "paper";
+type SubTab = "screener" | "sectors" | "earnings" | "holdings" | "paper" | "perf";
 
 const TABS: Array<{ id: SubTab; label: string; icon: string }> = [
   // Screener owns the dividend / momentum / value / growth presets — that's
@@ -17,6 +18,7 @@ const TABS: Array<{ id: SubTab; label: string; icon: string }> = [
   { id: "earnings", label: "Earnings", icon: "📅" },
   { id: "holdings", label: "Holdings", icon: "💼" },
   { id: "paper", label: "Paper", icon: "📒" },
+  { id: "perf", label: "Perf", icon: "📈" },
 ];
 
 export default function Tools({ onSelectSymbol }: Props) {
@@ -44,6 +46,7 @@ export default function Tools({ onSelectSymbol }: Props) {
         {tab === "earnings" && <Earnings onSelectSymbol={onSelectSymbol} />}
         {tab === "holdings" && <Holdings onSelectSymbol={onSelectSymbol} />}
         {tab === "paper" && <PaperTrades onSelectSymbol={onSelectSymbol} />}
+        {tab === "perf" && <Performance />}
       </div>
     </div>
   );

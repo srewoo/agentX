@@ -11,7 +11,7 @@ import { DIRECTION_ACTION, getSignalTimeframe } from "../../shared/constants";
 import { getSettings } from "../../shared/storage";
 import { deepLink } from "../../shared/localStore";
 import { loadEdge } from "../../shared/edgeCache";
-import type { AppSettings } from "../../shared/types";
+import type { AppSettings, ScanStatus } from "../../shared/types";
 
 interface DashboardProps {
   onSelectSymbol?: (symbol: string) => void;
@@ -91,6 +91,7 @@ export default function Dashboard({ onSelectSymbol }: DashboardProps = {}) {
     })();
   }, []);
   const [scanning, setScanning] = useState(false);
+  const [scanProgress, setScanProgress] = useState<ScanStatus | null>(null);
   const [marketOpen, setMarketOpen] = useState<boolean | null>(null);
   const [perfSummary, setPerfSummary] = useState<PerformanceSummary | null>(null);
   const [marketCtx, setMarketCtx] = useState<MarketContext | null>(null);
@@ -218,14 +219,31 @@ export default function Dashboard({ onSelectSymbol }: DashboardProps = {}) {
 
   const triggerScan = async () => {
     setScanning(true);
+    setScanProgress(null);
     try {
+      // Async pattern: trigger returns 202 + job_id in <1s; we poll the
+      // status endpoint until the scan is done. Cap polling at 6 minutes
+      // (real scans land at 160-200s; LLM judge adds 5-15s; safety margin
+      // for a slow yfinance day).
       await api.triggerScan();
+      const deadline = Date.now() + 6 * 60_000;
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 2000));
+        const status = await api.getScanStatus();
+        setScanProgress(status);
+        if (status.status === "completed") break;
+        if (status.status === "failed") {
+          console.warn("[agentX] Scan failed:", status.error);
+          break;
+        }
+      }
       setCleared(false);
       await reload();
     } catch (e) {
       console.warn("[agentX] Scan request failed:", e instanceof Error ? e.message : e);
     } finally {
       setScanning(false);
+      setScanProgress(null);
     }
   };
 
@@ -275,7 +293,11 @@ export default function Dashboard({ onSelectSymbol }: DashboardProps = {}) {
             disabled={scanning}
             className="text-xs bg-brand/20 text-brand-light border border-brand/30 px-2 py-0.5 rounded hover:bg-brand/30 disabled:opacity-50"
           >
-            {scanning ? "Scanning..." : "Scan Now"}
+            {scanning
+              ? (scanProgress && scanProgress.total_symbols > 0
+                  ? `Scanning ${scanProgress.completed_symbols}/${scanProgress.total_symbols}…`
+                  : "Scanning…")
+              : "Scan Now"}
           </button>
         </div>
       </div>
@@ -511,7 +533,11 @@ export default function Dashboard({ onSelectSymbol }: DashboardProps = {}) {
               disabled={scanning}
               className="bg-brand text-white text-sm font-medium px-5 py-2 rounded-lg hover:bg-brand/80 disabled:opacity-50 transition-colors"
             >
-              {scanning ? "Scanning..." : "Scan Now"}
+              {scanning
+              ? (scanProgress && scanProgress.total_symbols > 0
+                  ? `Scanning ${scanProgress.completed_symbols}/${scanProgress.total_symbols}…`
+                  : "Scanning…")
+              : "Scan Now"}
             </button>
           </div>
         ) : filteredSignals.length === 0 ? (

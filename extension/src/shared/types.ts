@@ -42,6 +42,9 @@ export interface Signal {
   reason: string;
   risk: string | null;
   llm_summary: string | null;
+  llm_verdict: "keep" | "drop" | "downgrade" | null;
+  llm_reason: string | null;
+  exchange?: "NSE" | "BSE";
   current_price: number | null;
   metadata: Record<string, unknown>;
   created_at: string; // ISO timestamp
@@ -51,6 +54,7 @@ export interface Signal {
 
 export interface StockQuote {
   symbol: string;
+  exchange?: "NSE" | "BSE";
   price: number | null;
   change: number | null;
   change_pct: number | null;
@@ -189,6 +193,10 @@ export interface AppSettings {
   auto_paper_min_strength?: number;
   /** Cap on simultaneous open auto-paper positions (portfolio heat). */
   auto_paper_max_open?: number;
+
+  /** Layer-2 LLM judge: when on, the orchestrator runs one batched LLM call
+   *  per scan that endorses/downgrades/drops each deterministic candidate. */
+  llm_judging_enabled?: boolean;
 }
 
 export interface FundamentalsResponse {
@@ -331,6 +339,29 @@ export interface InsightsResponse {
   count: number;
 }
 
+/** Returned by `POST /api/scan/trigger` — the scan runs asynchronously, the
+ *  client polls `/api/scan/status` until `status === "completed" | "failed"`. */
+export interface ScanTriggerResponse {
+  job_id: string;
+  status: "running";
+  started_at: string;
+  already_running: boolean;
+}
+
+export interface ScanStatus {
+  job_id: string | null;
+  status: "idle" | "running" | "completed" | "failed";
+  started_at: string | null;
+  completed_at: string | null;
+  duration_ms: number | null;
+  total_symbols: number;
+  completed_symbols: number;
+  current_symbol: string | null;
+  progress_pct: number;        // 0–100
+  signals_so_far: number;
+  error: string | null;
+}
+
 export interface BacktestRun {
   id: number;
   run_at: string;
@@ -342,6 +373,18 @@ export interface BacktestRun {
   directional_win_rate: number | null;
   best_signal_type: string | null;
   worst_signal_type: string | null;
+}
+
+export interface PerformanceByTypeRow {
+  signal_type: string;
+  direction: string;
+  timeframe?: string;
+  total_signals: number;
+  wins: number;
+  losses?: number;
+  win_rate: number;        // percent (0-100)
+  avg_pnl_pct: number;     // percent
+  updated_at?: string;
 }
 
 export interface SignalEdgeRow {
@@ -387,12 +430,22 @@ export interface PaperTrade {
   entry_price: number;
   entry_at: string;
   signal_id?: string;
+  /** Captured from the source signal so the backend can attribute outcomes
+   *  to the right (signal_type, direction) bucket for edge tracking. */
+  signal_type?: string;
+  signal_strength?: number;
+  signal_direction?: "bullish" | "bearish";
   target?: number;
   stop_loss?: number;
   status: "open" | "closed";
   exit_price?: number;
   exit_at?: string;
   notes?: string;
+  /** Server-side trade_id once the auto-open is POSTed to the backend.
+   *  Absence indicates "not yet synced" — periodic retry loop catches up. */
+  backend_trade_id?: string;
+  /** ISO timestamp of the most-recent successful sync (open or close). */
+  backend_synced_at?: string;
 }
 
 export interface Holding {

@@ -49,10 +49,9 @@ export function useStreamQuote(
 
     const tickOnce = async () => {
       try {
-        // exchange currently unused by REST fallback but kept in the contract
-        // so a future WS implementation can route by venue.
-        void exchange;
-        const q = await api.getQuote(symbol);
+        // Route quote fetches to the user-selected exchange. Backend skips
+        // the NSE-only direct endpoint for BSE and uses yfinance .BO instead.
+        const q = await api.getQuote(symbol, exchange);
         if (cancelRef.current) return;
         if (q.price != null) {
           setTick({

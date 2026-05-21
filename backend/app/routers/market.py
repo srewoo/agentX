@@ -3,13 +3,16 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 import aiosqlite
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 
 from app.database import DB_PATH
 from app.services.data_fetcher import async_fetch_history
 from app.services.nse_fetcher import nse_fetch_indices, nse_market_status
 from app.services.sentiment import get_market_news, get_sentiment_summary
-from app.services.orchestrator import orchestrator, run_scan_cycle, last_scan_time, is_market_open
+from app.services.orchestrator import (
+    orchestrator, run_scan_cycle, last_scan_time, is_market_open,
+    start_manual_scan, get_scan_status,
+)
 from app.services.cache import cache_manager, make_cache_key
 from app.utils import safe_float
 
@@ -295,19 +298,27 @@ async def get_market_context_summary():
     return result
 
 
-@router.post("/scan/trigger")
+@router.post("/scan/trigger", status_code=202)
 async def trigger_scan():
-    """Manually trigger a scan cycle. Returns signals found."""
-    import time
-    start = time.time()
+    """Kick off a scan asynchronously. Returns 202 + job_id immediately.
+
+    Real scans take 160-200s — far longer than any reasonable HTTP timeout.
+    The client polls `/api/market/scan/status` (every 2s is typical) for
+    progress and the completion verdict. If a scan is already running,
+    the same job_id is returned (idempotent retrigger).
+    """
     try:
-        signals = await run_scan_cycle()
-        elapsed_ms = int((time.time() - start) * 1000)
-        return {
-            "signals_found": len(signals),
-            "scan_duration_ms": elapsed_ms,
-            "signals": signals[:10],  # Return first 10 for preview
-        }
+        return await start_manual_scan()
     except Exception as e:
-        logger.error(f"Manual scan failed: {e}")
-        return {"signals_found": 0, "scan_duration_ms": 0, "error": str(e)}
+        logger.error("Failed to start manual scan: %s", e)
+        raise HTTPException(status_code=500, detail=f"Could not start scan: {e}")
+
+
+@router.get("/scan/status")
+async def scan_status():
+    """Progress snapshot of the most recent (or in-flight) manual scan.
+
+    Lightweight — locks the in-memory state for a single read, no DB hit.
+    Safe to poll at 1-2s intervals.
+    """
+    return await get_scan_status()

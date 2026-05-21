@@ -45,6 +45,8 @@ function makeSignal(overrides: Partial<Signal> = {}): Signal {
     reason: "Price moved +5.2% in the last session",
     risk: "Price spikes can reverse quickly.",
     llm_summary: "AI analysis: strong momentum driven by sector rotation.",
+    llm_verdict: null,
+    llm_reason: null,
     current_price: 2524.8,
     metadata: {},
     created_at: new Date().toISOString(),

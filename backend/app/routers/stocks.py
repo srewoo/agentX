@@ -73,50 +73,63 @@ async def search_stocks(q: str = ""):
 
 
 @router.get("/{symbol}/quote")
-async def get_quote(symbol: str):
+async def get_quote(symbol: str, exchange: str = "NSE"):
     """
     Get current price quote for a stock.
     Tries NSE free API first (fast, no rate limit), falls back to yfinance.
+
+    `exchange` defaults to NSE. When the caller picks BSE we skip the
+    NSE-only direct endpoint and go straight to yfinance with the .BO
+    suffix preferred — this gives BSE-only listings (smaller mid/small
+    caps, SME segment) actual data.
     """
     symbol = sanitize_symbol(symbol)
-    cache_key = make_cache_key("stock:quote", symbol)
+    exchange_norm = (exchange or "NSE").upper()
+    if exchange_norm not in {"NSE", "BSE"}:
+        exchange_norm = "NSE"
+    # Cache key includes exchange so NSE/BSE prices don't share an entry.
+    cache_key = make_cache_key("stock:quote", symbol, exchange_norm)
 
     cached = await cache_manager.get(cache_key)
     if cached:
         return cached
 
-    # --- Strategy 1: NSE quote (fast, free, no rate limit) ---
-    try:
-        nse_data = await nse_fetch_quote(symbol)
-        if nse_data and nse_data.get("lastPrice"):
-            # Look up friendly name from our index
-            name = symbol
-            for s in _SEARCH_INDEX:
-                if s["symbol"] == symbol:
-                    name = s["name"]
-                    break
+    # --- Strategy 1: NSE quote (NSE-only — skip for BSE) ---
+    if exchange_norm == "NSE":
+        try:
+            nse_data = await nse_fetch_quote(symbol)
+            if nse_data and nse_data.get("lastPrice"):
+                # Look up friendly name from our index
+                name = symbol
+                for s in _SEARCH_INDEX:
+                    if s["symbol"] == symbol:
+                        name = s["name"]
+                        break
 
-            result = {
-                "symbol": symbol,
-                "price": safe_float(nse_data["lastPrice"]),
-                "change": safe_float(nse_data.get("change")),
-                "change_pct": safe_float(nse_data.get("pChange")),
-                "volume": safe_float(nse_data.get("totalTradedVolume")),
-                "high": safe_float(nse_data.get("high")),
-                "low": safe_float(nse_data.get("low")),
-                "open": safe_float(nse_data.get("open")),
-                "prev_close": safe_float(nse_data.get("previousClose")),
-                "name": name,
-                "market_cap": None,
-            }
-            await cache_manager.set(cache_key, result, ttl=timedelta(minutes=2))
-            return result
-    except Exception as e:
-        logger.debug("NSE quote failed for %s, trying yfinance: %s", symbol, e)
+                result = {
+                    "symbol": symbol,
+                    "exchange": "NSE",
+                    "price": safe_float(nse_data["lastPrice"]),
+                    "change": safe_float(nse_data.get("change")),
+                    "change_pct": safe_float(nse_data.get("pChange")),
+                    "volume": safe_float(nse_data.get("totalTradedVolume")),
+                    "high": safe_float(nse_data.get("high")),
+                    "low": safe_float(nse_data.get("low")),
+                    "open": safe_float(nse_data.get("open")),
+                    "prev_close": safe_float(nse_data.get("previousClose")),
+                    "name": name,
+                    "market_cap": None,
+                }
+                await cache_manager.set(cache_key, result, ttl=timedelta(minutes=2))
+                return result
+        except Exception as e:
+            logger.debug("NSE quote failed for %s, trying yfinance: %s", symbol, e)
 
-    # --- Strategy 2: yfinance fallback ---
+    # --- Strategy 2: yfinance fallback (also primary for BSE) ---
     try:
-        hist = await async_fetch_history(symbol, period="5d", interval="1d")
+        hist = await async_fetch_history(
+            symbol, period="5d", interval="1d", exchange=exchange_norm
+        )
 
         if hist is None or hist.empty:
             raise HTTPException(status_code=404, detail=f"No data found for {symbol}")
@@ -135,6 +148,7 @@ async def get_quote(symbol: str):
 
         result = {
             "symbol": symbol,
+            "exchange": exchange_norm,
             "price": current,
             "change": change,
             "change_pct": change_pct,
@@ -156,17 +170,24 @@ async def get_quote(symbol: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def _norm_exchange(exchange: str) -> str:
+    """Validate + uppercase the exchange query param. Falls back to NSE."""
+    ex = (exchange or "NSE").upper()
+    return ex if ex in {"NSE", "BSE"} else "NSE"
+
+
 @router.get("/{symbol}/history")
-async def get_history(symbol: str, period: str = "6mo", interval: str = "1d"):
+async def get_history(symbol: str, period: str = "6mo", interval: str = "1d", exchange: str = "NSE"):
     """Get OHLCV price history."""
     symbol = sanitize_symbol(symbol)
-    cache_key = make_cache_key("stock:history", symbol, period=period, interval=interval)
+    ex = _norm_exchange(exchange)
+    cache_key = make_cache_key("stock:history", symbol, ex, period=period, interval=interval)
 
     cached = await cache_manager.get(cache_key)
     if cached:
         return cached
 
-    df = await async_fetch_history(symbol, period=period, interval=interval)
+    df = await async_fetch_history(symbol, period=period, interval=interval, exchange=ex)
     if df is None or df.empty:
         raise HTTPException(status_code=404, detail=f"No history found for {symbol}")
 
@@ -190,22 +211,23 @@ async def get_history(symbol: str, period: str = "6mo", interval: str = "1d"):
             "v": safe_float(row.get("Volume")),
         })
 
-    result = {"symbol": symbol, "period": period, "interval": interval, "history": history}
+    result = {"symbol": symbol, "exchange": ex, "period": period, "interval": interval, "history": history}
     await cache_manager.set(cache_key, result, ttl=timedelta(minutes=30))
     return result
 
 
 @router.get("/{symbol}/technicals")
-async def get_technicals(symbol: str):
+async def get_technicals(symbol: str, exchange: str = "NSE"):
     """Get technical indicators for a stock."""
     symbol = sanitize_symbol(symbol)
-    cache_key = make_cache_key("stock:technicals", symbol)
+    ex = _norm_exchange(exchange)
+    cache_key = make_cache_key("stock:technicals", symbol, ex)
 
     cached = await cache_manager.get(cache_key)
     if cached:
         return cached
 
-    df = await async_fetch_history(symbol, period="1y", interval="1d")
+    df = await async_fetch_history(symbol, period="1y", interval="1d", exchange=ex)
     if df is None or df.empty:
         raise HTTPException(status_code=404, detail=f"No data found for {symbol}")
 
@@ -217,6 +239,7 @@ async def get_technicals(symbol: str):
 
     result = {
         "symbol": symbol,
+        "exchange": ex,
         **technicals,
         "support_resistance": sr,
         "fibonacci": fib,
@@ -229,7 +252,7 @@ async def get_technicals(symbol: str):
 
 
 @router.get("/{symbol}/fundamentals")
-async def get_stock_fundamentals(symbol: str):
+async def get_stock_fundamentals(symbol: str, exchange: str = "NSE"):
     """Fundamentals snapshot + health score.
 
     Yahoo / yfinance throttles aggressively, so we (a) cache fresh data 6h,
@@ -238,15 +261,16 @@ async def get_stock_fundamentals(symbol: str):
     message so the UI shows the cause instead of a wall of em-dashes.
     """
     symbol = sanitize_symbol(symbol)
-    cache_key = make_cache_key("stock:fundamentals", symbol)
-    last_good_key = make_cache_key("stock:fundamentals:lastgood", symbol)
+    ex = _norm_exchange(exchange)
+    cache_key = make_cache_key("stock:fundamentals", symbol, ex)
+    last_good_key = make_cache_key("stock:fundamentals:lastgood", symbol, ex)
 
     cached = await cache_manager.get(cache_key)
     if cached:
         return cached
 
     try:
-        data = await get_fundamentals(symbol)
+        data = await get_fundamentals(symbol, exchange=ex)
     except Exception as e:
         logger.exception("Fundamentals fetch failed for %s: %s", symbol, e)
         last_good = await cache_manager.get(last_good_key)

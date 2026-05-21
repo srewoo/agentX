@@ -599,6 +599,7 @@ def scan_symbol(
     sentiment_score: Optional[float] = None,
     thresholds: Optional[dict] = None,
     delivery_pct: Optional[float] = None,
+    exchange: str = "NSE",
 ) -> list[dict[str, Any]]:
     """
     Run all detectors on a symbol's data. Returns list of signals found.
@@ -800,6 +801,12 @@ def scan_symbol(
                 sig["strength"] = max(1, sig["strength"] - 2)
                 sig["metadata"] = sig.get("metadata", {})
                 sig["metadata"]["conflicting_signals"] = True
+
+    # Stamp the venue exchange so the orchestrator, paper trader, and edge
+    # tracker can attribute outcomes correctly. The detectors don't need to
+    # know about exchanges — this is the single chokepoint.
+    for sig in signals:
+        sig["exchange"] = exchange
 
     return signals
 

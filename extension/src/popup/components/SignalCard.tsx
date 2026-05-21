@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import type { Signal, AppSettings, PaperTrade, SignalEdgeRow, DeepSignalAnalysis } from "../../shared/types";
 import { SIGNAL_TYPE_LABELS, DIRECTION_ACTION, ACTION_COLORS, getSignalTimeframe } from "../../shared/constants";
 import { api } from "../../shared/api";
+import { useExchange } from "../lib/ExchangeContext";
 import { getSettings, saveSettings } from "../../shared/storage";
 import { paperTrades } from "../../shared/localStore";
 import { getEdgeFor } from "../../shared/edgeCache";
@@ -110,6 +111,7 @@ const TIMEFRAME_STYLE: Record<string, string> = {
 };
 
 export default function SignalCard({ signal, onRead, onDismiss }: Props) {
+  const exchange = useExchange();
   const [expanded, setExpanded] = useState(false);
   const [tradeAdded, setTradeAdded] = useState(false);
   const [muteMsg, setMuteMsg] = useState<string | null>(null);
@@ -131,10 +133,10 @@ export default function SignalCard({ signal, onRead, onDismiss }: Props) {
   }, [signal.signal_type, signal.direction]);
   useEffect(() => {
     if (!expanded || atr != null) return;
-    api.getTechnicals(signal.symbol)
+    api.getTechnicals(signal.symbol, exchange)
       .then((t) => { if (typeof t.atr === "number") setAtr(t.atr); })
       .catch(() => { /* fallback to heuristic remains */ });
-  }, [expanded, atr, signal.symbol]);
+  }, [expanded, atr, signal.symbol, exchange]);
 
   const action = DIRECTION_ACTION[signal.direction] || "HOLD";
   const actionColor = ACTION_COLORS[action] || "#F59E0B";
@@ -232,6 +234,24 @@ export default function SignalCard({ signal, onRead, onDismiss }: Props) {
           <span className={`text-[11px] font-medium px-1.5 py-0.5 rounded border ${TIMEFRAME_STYLE[timeframe]}`}>
             {timeframe}
           </span>
+
+          {/* Layer-2 LLM judge verdict — present only when llm_judging_enabled.
+              KEEP renders as a quiet endorsement; DOWNGRADE/DROP are louder so
+              the user sees that the LLM disagreed with the rule. */}
+          {signal.llm_verdict && (
+            <span
+              className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border ${
+                signal.llm_verdict === "drop"
+                  ? "bg-red-500/15 text-red-400 border-red-500/30"
+                  : signal.llm_verdict === "downgrade"
+                    ? "bg-amber-500/15 text-amber-400 border-amber-500/30"
+                    : "bg-emerald-500/10 text-emerald-400 border-emerald-500/30"
+              }`}
+              title={signal.llm_reason || "LLM reviewed this signal"}
+            >
+              LLM: {signal.llm_verdict.toUpperCase()}
+            </span>
+          )}
         </div>
 
         <div className="flex items-center gap-2">
@@ -357,6 +377,22 @@ export default function SignalCard({ signal, onRead, onDismiss }: Props) {
             <div className="text-xs text-zinc-200 leading-relaxed bg-zinc-900/60 rounded-lg p-2.5">
               <span className="text-brand-light font-semibold">AI Insight: </span>
               {signal.llm_summary}
+            </div>
+          )}
+          {signal.llm_verdict && signal.llm_reason && (
+            <div
+              className={`text-xs leading-relaxed rounded-lg p-2.5 border ${
+                signal.llm_verdict === "drop"
+                  ? "bg-red-500/10 border-red-500/20 text-zinc-200"
+                  : signal.llm_verdict === "downgrade"
+                    ? "bg-amber-500/10 border-amber-500/20 text-zinc-200"
+                    : "bg-emerald-500/5 border-emerald-500/20 text-zinc-200"
+              }`}
+            >
+              <span className="font-semibold">
+                LLM review ({signal.llm_verdict}):
+              </span>{" "}
+              {signal.llm_reason}
             </div>
           )}
           {deepAnalysis && (

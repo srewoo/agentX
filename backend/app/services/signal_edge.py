@@ -15,7 +15,13 @@ engine changes materially. This file is the single source of truth for the
 extension's edge UX.
 """
 from __future__ import annotations
+import logging
+from datetime import datetime, timezone
 from typing import Optional
+
+import aiosqlite
+
+logger = logging.getLogger(__name__)
 
 # Family taxonomy — used by confluence diversity check.
 #  - momentum:   trend / momentum (MACD, EMA cross, price spike)
@@ -137,9 +143,96 @@ EDGE_META = {
 }
 
 
+# ── Live override cache ──────────────────────────────────────────────────
+# The weekly autonomous backtest writes per-key edge into the
+# `signal_edge_overrides` SQLite table. `seed_edge_overrides()` (called at
+# app startup) loads them into this dict; `get_edge` prefers an override
+# when present so the displayed edge tracks real recent performance instead
+# of staying frozen at the 2026-05-07 baseline.
+#
+# Guardrails (enforced at write time, not here): an override is only stored
+# when the latest weekly backtest has >= _OVERRIDE_MIN_TRADES samples for
+# that (signal_type, direction). The static SIGNAL_EDGE table remains the
+# cold-start fallback so a sparse backtest never erases known edges.
+_OVERRIDE_MIN_TRADES = 30
+_edge_overrides: dict[tuple[str, str], dict] = {}
+
+
+def set_edge_overrides(rows: dict[tuple[str, str], dict]) -> None:
+    """Replace the in-memory override map. Called by the weekly backtest."""
+    global _edge_overrides
+    _edge_overrides = dict(rows)
+
+
+async def seed_edge_overrides() -> int:
+    """Load overrides from SQLite at startup. Returns number loaded."""
+    from app.database import DB_PATH
+    loaded: dict[tuple[str, str], dict] = {}
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT signal_type, direction, win_rate, avg_pnl, trades "
+                "FROM signal_edge_overrides"
+            ) as cur:
+                async for row in cur:
+                    loaded[(row["signal_type"], row["direction"])] = {
+                        "win_rate": float(row["win_rate"]),
+                        "avg_pnl": float(row["avg_pnl"]),
+                        "trades": int(row["trades"]),
+                    }
+    except Exception as e:
+        logger.debug("seed_edge_overrides: %s", e)
+    set_edge_overrides(loaded)
+    return len(loaded)
+
+
+async def write_edge_overrides(
+    rows: dict[tuple[str, str], dict],
+    min_trades: int = _OVERRIDE_MIN_TRADES,
+) -> int:
+    """Persist + activate per-key overrides. Returns number written.
+
+    Skips rows below `min_trades` so a thin weekly run can never erase
+    a known-good baseline edge. Replaces all rows in one transaction so
+    keys that no longer meet the threshold are removed cleanly.
+    """
+    from app.database import DB_PATH
+    keep: dict[tuple[str, str], dict] = {
+        k: v for k, v in rows.items() if (v.get("trades") or 0) >= min_trades
+    }
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("DELETE FROM signal_edge_overrides")
+            for (stype, direction), d in keep.items():
+                await db.execute(
+                    "INSERT INTO signal_edge_overrides "
+                    "(signal_type, direction, win_rate, avg_pnl, trades, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (stype, direction, float(d["win_rate"]), float(d["avg_pnl"]),
+                     int(d["trades"]), now),
+                )
+            await db.commit()
+    except Exception as e:
+        logger.warning("write_edge_overrides failed (non-critical): %s", e)
+        return 0
+    set_edge_overrides(keep)
+    logger.info(
+        "signal_edge overrides refreshed: %d/%d keys persisted (min_trades=%d)",
+        len(keep), len(rows), min_trades,
+    )
+    return len(keep)
+
+
 def get_edge(signal_type: str, direction: str) -> Optional[dict]:
-    """Look up edge for a (signal_type, direction) pair. Returns None if unknown."""
-    return SIGNAL_EDGE.get((signal_type, direction))
+    """Look up edge for a (signal_type, direction) pair. Returns None if unknown.
+
+    Live overrides take priority over the cold-start `SIGNAL_EDGE` table so
+    the UI reflects the latest autonomous backtest run.
+    """
+    key = (signal_type, direction)
+    return _edge_overrides.get(key) or SIGNAL_EDGE.get(key)
 
 
 def has_positive_edge(signal_type: str, direction: str, min_trades: int = 50) -> bool:
@@ -166,13 +259,31 @@ def get_family(signal_type: str) -> str:
 
 
 def all_edge_rows() -> list[dict]:
-    """Return the full edge table as a sorted list (for the API endpoint)."""
+    """Return the full edge table as a sorted list (for the API endpoint).
+
+    Overrides shadow the cold-start values per key, so the response always
+    reflects the most-recent autonomous backtest where data is available.
+    """
     rows = []
-    for (stype, direction), data in SIGNAL_EDGE.items():
+    seen: set[tuple[str, str]] = set()
+    for key, data in _edge_overrides.items():
+        stype, direction = key
+        seen.add(key)
         rows.append({
             "signal_type": stype,
             "direction": direction,
             "family": get_family(stype),
+            "source": "live",
+            **data,
+        })
+    for (stype, direction), data in SIGNAL_EDGE.items():
+        if (stype, direction) in seen:
+            continue
+        rows.append({
+            "signal_type": stype,
+            "direction": direction,
+            "family": get_family(stype),
+            "source": "baseline",
             **data,
         })
     rows.sort(key=lambda r: r["avg_pnl"], reverse=True)

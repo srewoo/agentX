@@ -33,11 +33,18 @@ export default function NewsPanel({ collapsedDefault = true, filterSymbols }: Pr
 
   useEffect(() => {
     if (collapsed) return;
-    if (items !== null) return;
-    api.getNews(20)
-      .then((r) => setItems(r.news || []))
-      .catch((e) => setError(e instanceof Error ? e.message : "News unavailable"));
-  }, [collapsed, items]);
+    let cancelled = false;
+    const fetchNews = () => {
+      api.getNews(20)
+        .then((r) => { if (!cancelled) setItems(r.news || []); })
+        .catch((e) => { if (!cancelled) setError(e instanceof Error ? e.message : "News unavailable"); });
+    };
+    fetchNews();
+    // Refetch every hour while the panel is open so the user sees fresh
+    // headlines without having to close and reopen the popup.
+    const interval = setInterval(fetchNews, 60 * 60 * 1000);
+    return () => { cancelled = true; clearInterval(interval); };
+  }, [collapsed]);
 
   const filterSet = filterSymbols ? new Set(filterSymbols.map((s) => s.toUpperCase())) : null;
   const visible = items

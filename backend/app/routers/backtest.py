@@ -20,6 +20,7 @@ async def backtest_symbol(
     symbol: str,
     period: Optional[str] = "1y",
     eval_days: Optional[int] = 5,
+    exchange: str = "NSE",
 ):
     """
     Run a historical backtest of the signal engine on a symbol.
@@ -40,14 +41,18 @@ async def backtest_symbol(
             detail=f"Invalid period. Allowed: {', '.join(sorted(allowed_periods))}",
         )
 
+    ex = (exchange or "NSE").upper()
+    if ex not in {"NSE", "BSE"}:
+        ex = "NSE"
+
     # Check cache
-    cache_key = make_cache_key("backtest", symbol, period, eval_days=eval_days)
+    cache_key = make_cache_key("backtest", symbol, ex, period, eval_days=eval_days)
     cached = await cache_manager.get(cache_key)
     if cached:
         logger.info("Backtest cache hit: %s", cache_key)
         return cached
 
-    logger.info("Running backtest: symbol=%s period=%s eval_days=%d", symbol, period, eval_days)
+    logger.info("Running backtest: symbol=%s exchange=%s period=%s eval_days=%d", symbol, ex, period, eval_days)
 
     eval_windows = sorted(set([1, 3, 5, 10, eval_days]))
 
@@ -56,6 +61,7 @@ async def backtest_symbol(
             symbol=symbol,
             period=period,
             eval_windows=eval_windows,
+            exchange=ex,
         )
     except Exception as exc:
         logger.exception("Backtest failed for %s: %s", symbol, exc)

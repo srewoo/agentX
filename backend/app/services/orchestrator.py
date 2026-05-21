@@ -25,6 +25,7 @@ from app.services.screener import pre_screen_stocks
 from app.services.technicals import compute_technicals, compute_support_resistance
 from app.services.signal_engine import scan_symbol, filter_by_risk_mode, detect_options_signal
 from app.services.llm_analyst import enrich_signal
+from app.services.llm_signal_judge import judge_signals, is_enabled as judge_enabled
 from app.services.sentiment import get_stock_news, get_sentiment_summary, calculate_sentiment
 from app.services.fundamentals import get_fundamentals
 from app.services.cache import cache_manager, make_cache_key
@@ -55,11 +56,30 @@ IST = timezone(timedelta(hours=5, minutes=30))
 # for existing importers (e.g. `app.routers.market`).
 @dataclass
 class _ScanState:
-    """Mutable scan-cycle state shared across scan triggers."""
+    """Mutable scan-cycle state shared across scan triggers.
+
+    Backs both the periodic scheduler loop and the manual `/api/scan/trigger`
+    endpoint. The manual trigger is asynchronous: POST returns 202 with
+    `job_id`, the client polls `/api/scan/status` for progress + result.
+    This avoids the 120s HTTP timeout that was killing real 160-200s scans.
+    """
 
     last_scan_time: Optional[str] = None
     last_scan_signal_count: int = 0
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+    # ── Manual-trigger job tracking ────────────────────────────────────
+    job_id: Optional[str] = None
+    status: str = "idle"            # idle | running | completed | failed
+    started_at: Optional[str] = None
+    completed_at: Optional[str] = None
+    duration_ms: Optional[int] = None
+    # Progress: filled in by run_scan_cycle as it iterates symbols.
+    total_symbols: int = 0
+    completed_symbols: int = 0
+    current_symbol: Optional[str] = None
+    signals_so_far: int = 0
+    error: Optional[str] = None
 
 
 _scan_state = _ScanState()
@@ -97,13 +117,34 @@ def is_market_open() -> bool:
 
 
 async def _get_settings() -> dict[str, Any]:
-    """Load current settings from database."""
+    """Load current settings from database.
+
+    SECRET_KEYS rows are stored sealed (encrypted at rest). Internal
+    consumers — the LLM judge, the analyst, notification channels —
+    expect plaintext. Unseal here so callers don't have to know the
+    table layout. Without this, LLM providers get the literal
+    ``enc:v1:...`` ciphertext as an API key and return 401.
+    """
     try:
+        from app.services.secrets import SECRET_KEYS, get_manager
+        mgr = get_manager()
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
             async with db.execute("SELECT key, value FROM settings") as cursor:
                 rows = await cursor.fetchall()
-                return {row["key"]: row["value"] for row in rows}
+                out: dict[str, Any] = {}
+                for row in rows:
+                    k, v = row["key"], row["value"]
+                    if k in SECRET_KEYS and v:
+                        try:
+                            v = mgr.unseal_key(v)
+                        except Exception as e:
+                            # Don't let a single bad ciphertext kill the whole
+                            # scan. Log and pass through — the provider will
+                            # 401 and the judge fails open.
+                            logger.warning("Failed to unseal %s: %s", k, e)
+                    out[k] = v
+                return out
     except Exception as e:
         logger.error(f"Failed to load settings: {e}")
         return {}
@@ -122,6 +163,104 @@ async def _get_watchlist_symbols() -> list[str]:
         return []
 
 
+async def _get_watchlist_exchanges() -> dict[str, str]:
+    """Return {symbol: exchange} for every watchlist row. Defaults to NSE."""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute("SELECT symbol, exchange FROM watchlist") as cursor:
+                rows = await cursor.fetchall()
+                return {
+                    row["symbol"]: (row["exchange"] or "NSE").upper()
+                    for row in rows
+                }
+    except Exception as e:
+        logger.debug("Failed to load watchlist exchanges: %s", e)
+        return {}
+
+
+async def start_manual_scan() -> dict:
+    """Spawn a scan in the background and return immediately with a job_id.
+
+    The popup polls `get_scan_status()` for progress + completion. This
+    replaces the synchronous `await run_scan_cycle()` path that hit the
+    proxy/HTTP 120-240s timeout on real scans. We keep at most one
+    in-flight manual scan — re-triggering while running returns the
+    running job's id (idempotent).
+    """
+    import uuid
+
+    async with _scan_state.lock:
+        if _scan_state.status == "running" and _scan_state.job_id:
+            # Idempotent retrigger — surface the in-flight job.
+            return {
+                "job_id": _scan_state.job_id,
+                "status": "running",
+                "started_at": _scan_state.started_at,
+                "already_running": True,
+            }
+        _scan_state.job_id = uuid.uuid4().hex[:12]
+        _scan_state.status = "running"
+        _scan_state.started_at = datetime.now(timezone.utc).isoformat()
+        _scan_state.completed_at = None
+        _scan_state.duration_ms = None
+        _scan_state.total_symbols = 0
+        _scan_state.completed_symbols = 0
+        _scan_state.current_symbol = None
+        _scan_state.signals_so_far = 0
+        _scan_state.error = None
+        job_id = _scan_state.job_id
+        started = _scan_state.started_at
+
+    async def _run() -> None:
+        import time
+        t0 = time.time()
+        try:
+            await run_scan_cycle()
+            async with _scan_state.lock:
+                _scan_state.status = "completed"
+                _scan_state.completed_at = datetime.now(timezone.utc).isoformat()
+                _scan_state.duration_ms = int((time.time() - t0) * 1000)
+        except Exception as e:
+            logger.exception("Manual scan job %s failed: %s", job_id, e)
+            async with _scan_state.lock:
+                _scan_state.status = "failed"
+                _scan_state.error = str(e)
+                _scan_state.completed_at = datetime.now(timezone.utc).isoformat()
+                _scan_state.duration_ms = int((time.time() - t0) * 1000)
+
+    # Detach the task from the request — it survives the 202 response.
+    asyncio.create_task(_run())
+
+    return {
+        "job_id": job_id,
+        "status": "running",
+        "started_at": started,
+        "already_running": False,
+    }
+
+
+async def get_scan_status() -> dict:
+    """Snapshot of the in-flight (or last) manual scan job for /api/scan/status."""
+    async with _scan_state.lock:
+        total = _scan_state.total_symbols
+        done = _scan_state.completed_symbols
+        progress_pct = round((done / total) * 100, 1) if total else 0.0
+        return {
+            "job_id": _scan_state.job_id,
+            "status": _scan_state.status,
+            "started_at": _scan_state.started_at,
+            "completed_at": _scan_state.completed_at,
+            "duration_ms": _scan_state.duration_ms,
+            "total_symbols": total,
+            "completed_symbols": done,
+            "current_symbol": _scan_state.current_symbol,
+            "progress_pct": progress_pct,
+            "signals_so_far": _scan_state.signals_so_far,
+            "error": _scan_state.error,
+        }
+
+
 async def _store_signals(signals: list[dict]) -> None:
     """Persist signals to SQLite."""
     if not signals:
@@ -131,12 +270,16 @@ async def _store_signals(signals: list[dict]) -> None:
             await db.execute(
                 """INSERT OR REPLACE INTO signals
                    (id, symbol, signal_type, direction, strength, reason, risk,
-                    llm_summary, current_price, metadata, created_at, read, dismissed)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    llm_summary, llm_verdict, llm_reason, exchange,
+                    current_price, metadata, created_at, read, dismissed)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     sig["id"], sig["symbol"], sig["signal_type"], sig["direction"],
                     sig["strength"], sig["reason"], sig.get("risk"),
-                    sig.get("llm_summary"), sig.get("current_price"),
+                    sig.get("llm_summary"),
+                    sig.get("llm_verdict"), sig.get("llm_reason"),
+                    sig.get("exchange") or "NSE",
+                    sig.get("current_price"),
                     json.dumps(sig.get("metadata", {})),
                     sig["created_at"], 0, 0,
                 ),
@@ -188,6 +331,10 @@ async def run_scan_cycle() -> list[dict]:
     # This replaces scanning ALL 160+ MAJOR_STOCKS — only scan watchlist + pre-screened.
     watchlist_symbols = await _get_watchlist_symbols()
     watchlist_set = set(watchlist_symbols)
+    # Per-symbol exchange map. Watchlist rows can be NSE or BSE; anything not
+    # in the watchlist defaults to NSE (pre-screener + MAJOR_STOCKS are
+    # NSE-listed). The scan routes data fetches accordingly.
+    symbol_exchange = await _get_watchlist_exchanges()
 
     # Pre-screen via TradingView to find stocks with interesting signals
     pre_screened: list[str] = []
@@ -311,10 +458,21 @@ async def run_scan_cycle() -> list[dict]:
         async with semaphore:
             # Skip symbols that consistently fail (delisted, bad ticker, etc.)
             if _bad_symbol_strikes.get(sym, 0) >= _BAD_SYMBOL_THRESHOLD:
+                async with _scan_state.lock:
+                    _scan_state.completed_symbols += 1
                 return []
 
+            # Lightweight progress hook — lets /api/scan/status report which
+            # symbol is currently being scanned without taking the lock
+            # inside the hot path of each detector.
+            async with _scan_state.lock:
+                _scan_state.current_symbol = sym
+
             try:
-                df = await async_fetch_history(sym, period="6mo", interval="1d")
+                sym_exchange = symbol_exchange.get(sym, "NSE")
+                df = await async_fetch_history(
+                    sym, period="6mo", interval="1d", exchange=sym_exchange
+                )
                 if df is None or df.empty or len(df) < 20:
                     _bad_symbol_strikes[sym] = _bad_symbol_strikes.get(sym, 0) + 1
                     if _bad_symbol_strikes[sym] == _BAD_SYMBOL_THRESHOLD:
@@ -387,6 +545,7 @@ async def run_scan_cycle() -> list[dict]:
                     sentiment_score=sentiment_score,
                     thresholds=scan_thresholds,
                     delivery_pct=sym_delivery_pct,
+                    exchange=sym_exchange,
                 )
             except Exception as e:
                 _bad_symbol_strikes[sym] = _bad_symbol_strikes.get(sym, 0) + 1
@@ -395,11 +554,21 @@ async def run_scan_cycle() -> list[dict]:
             finally:
                 # Delay between symbols to avoid yfinance rate limits
                 await asyncio.sleep(0.5)
+                async with _scan_state.lock:
+                    _scan_state.completed_symbols += 1
+
+    # Expose the symbol total so /api/scan/status can compute progress %.
+    async with _scan_state.lock:
+        _scan_state.total_symbols = len(all_symbols)
+        _scan_state.completed_symbols = 0
+        _scan_state.signals_so_far = 0
 
     # Run all symbols concurrently (semaphore limits actual parallelism)
     results = await asyncio.gather(*[process_symbol(sym) for sym in all_symbols])
     for result in results:
         all_signals.extend(result)
+    async with _scan_state.lock:
+        _scan_state.signals_so_far = len(all_signals)
 
     # Save current prices for next cycle's spike detection
     await _store_current_prices(current_prices)
@@ -545,6 +714,21 @@ async def run_scan_cycle() -> list[dict]:
                 logger.info(f"Enriched signal for {top_signal['symbol']} with LLM narrative")
         except Exception as e:
             logger.warning(f"LLM enrichment failed: {e}")
+
+    # Layer-2: optional LLM judge over the deterministic candidate list.
+    # Single batched call per scan — fail-open so a provider outage or parse
+    # error never blocks the deterministic signals from being stored.
+    if judge_enabled(db_settings):
+        try:
+            verdicts = await judge_signals(filtered, db_settings)
+            for sig in filtered:
+                v = verdicts.get(sig["id"])
+                if v is None:
+                    continue
+                sig["llm_verdict"] = v.verdict
+                sig["llm_reason"] = v.reason
+        except Exception as e:
+            logger.warning("LLM judge layer failed (non-critical): %s", e)
 
     # Persist to DB
     await _store_signals(filtered)
@@ -771,6 +955,7 @@ class SignalOrchestrator:
         all_evaluated = 0
         type_pnl: dict[str, float] = {}
         type_count: dict[str, int] = {}
+        type_dir_stats: dict[tuple[str, str], dict[str, float]] = {}
 
         # Fan out backtests with bounded concurrency. Each task is wrapped in
         # `asyncio.wait_for` so a single misbehaving symbol cannot stall the
@@ -803,7 +988,9 @@ class SignalOrchestrator:
             ov = r.get("overall", {})
             if ov.get("avg_pnl_5d") is not None:
                 all_pnl.append(ov["avg_pnl_5d"])
-            # Aggregate per-type
+            # Aggregate per-type and per-(type,direction) — the latter feeds
+            # the signal_edge override table that drives the live Edge/Avoid
+            # badges in the extension.
             for stype, dirs in (r.get("by_signal_type") or {}).items():
                 for direction, m in dirs.items():
                     if m.get("is_neutral"):
@@ -815,6 +1002,14 @@ class SignalOrchestrator:
                     if m.get("avg_pnl_5d") is not None and m.get("total"):
                         type_pnl[stype] = type_pnl.get(stype, 0.0) + m["avg_pnl_5d"] * m["total"]
                         type_count[stype] = type_count.get(stype, 0) + m["total"]
+                        key = (stype, direction)
+                        td = type_dir_stats.setdefault(
+                            key, {"pnl_sum": 0.0, "wins": 0, "losses": 0, "trades": 0}
+                        )
+                        td["pnl_sum"] += m["avg_pnl_5d"] * m["total"]
+                        td["wins"] += wins
+                        td["losses"] += losses
+                        td["trades"] += m["total"]
 
         avg_pnl = round(sum(all_pnl) / len(all_pnl), 4) if all_pnl else 0.0
         win_rate = round(all_wins / all_evaluated * 100, 2) if all_evaluated else 0.0
@@ -842,32 +1037,57 @@ class SignalOrchestrator:
             len(all_syms), win_rate, avg_pnl, best, worst,
         )
 
+        # Refresh signal_edge overrides — closes the loop so the Edge/Avoid
+        # badges and the recommendation engine see live numbers, not the
+        # frozen baseline. Sample-size guardrail lives inside the writer.
+        try:
+            from app.services.signal_edge import write_edge_overrides
+            edge_payload: dict[tuple[str, str], dict] = {}
+            for (stype, direction), s in type_dir_stats.items():
+                trades = int(s["trades"])
+                if trades <= 0:
+                    continue
+                resolved = int(s["wins"]) + int(s["losses"])
+                wr = round((s["wins"] / resolved) * 100, 2) if resolved else 0.0
+                edge_payload[(stype, direction)] = {
+                    "win_rate": wr,
+                    "avg_pnl": round(s["pnl_sum"] / trades, 4),
+                    "trades": trades,
+                }
+            written = await write_edge_overrides(edge_payload)
+            logger.info("Edge overrides refreshed: %d/%d keys persisted", written, len(edge_payload))
+        except Exception as e:
+            logger.warning("Edge override refresh failed (non-critical): %s", e)
+
     def is_running(self) -> bool:
         return self._running
 
 
-def _next_weekly_backtest_dt() -> datetime:
-    """Return next Sunday 18:00 IST in UTC."""
+def _next_weekly_at(weekday: int, hour: int, minute: int) -> datetime:
+    """Return the next IST `weekday hh:mm` slot expressed in UTC.
+
+    weekday: Mon=0 … Sun=6 (matches `datetime.weekday()`).
+    """
     IST_OFFSET = timedelta(hours=5, minutes=30)
     now_utc = datetime.now(timezone.utc)
     now_ist = now_utc + IST_OFFSET
-    days_until_sun = (6 - now_ist.weekday()) % 7  # Mon=0, Sun=6
-    target_ist = (now_ist + timedelta(days=days_until_sun)).replace(hour=18, minute=0, second=0, microsecond=0)
-    if days_until_sun == 0 and now_ist >= target_ist:
+    days_until = (weekday - now_ist.weekday()) % 7
+    target_ist = (now_ist + timedelta(days=days_until)).replace(
+        hour=hour, minute=minute, second=0, microsecond=0
+    )
+    if days_until == 0 and now_ist >= target_ist:
         target_ist += timedelta(days=7)
     return (target_ist - IST_OFFSET).replace(tzinfo=timezone.utc)
+
+
+def _next_weekly_backtest_dt() -> datetime:
+    """Monday 10:30 IST."""
+    return _next_weekly_at(weekday=0, hour=10, minute=30)
 
 
 def _next_weekly_calibration_dt() -> datetime:
-    """Return next Sunday 21:00 IST in UTC, after the weekly backtest slot."""
-    IST_OFFSET = timedelta(hours=5, minutes=30)
-    now_utc = datetime.now(timezone.utc)
-    now_ist = now_utc + IST_OFFSET
-    days_until_sun = (6 - now_ist.weekday()) % 7
-    target_ist = (now_ist + timedelta(days=days_until_sun)).replace(hour=21, minute=0, second=0, microsecond=0)
-    if days_until_sun == 0 and now_ist >= target_ist:
-        target_ist += timedelta(days=7)
-    return (target_ist - IST_OFFSET).replace(tzinfo=timezone.utc)
+    """Friday 16:30 IST."""
+    return _next_weekly_at(weekday=4, hour=16, minute=30)
 
 
 # Global orchestrator instance

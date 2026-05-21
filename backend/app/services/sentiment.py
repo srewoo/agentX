@@ -8,7 +8,7 @@ LLM sentiment is opt-in (used for watchlist stocks during scan).
 """
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -193,6 +193,39 @@ def extract_symbols(text: str, known_symbols: list[str]) -> list[str]:
 # ---------------------------------------------------------------------------
 # RSS feed fetching
 # ---------------------------------------------------------------------------
+_MAX_NEWS_AGE_DAYS = 14
+
+
+def _parse_pub_iso(entry) -> tuple[str, Optional[datetime]]:
+    """Resolve a published timestamp for an RSS entry.
+
+    feedparser populates `published_parsed` (a struct_time in UTC) for almost
+    every well-formed entry. We use that as the authoritative timestamp and
+    fall back to the raw `published` string only if the structured parse
+    failed. Returns (iso_string, datetime_or_None). When the entry has no
+    usable date at all, we return ("", None) so the caller can drop it
+    rather than stamping ancient items with today's date — that was the
+    "3514d ago" Moneycontrol bug.
+    """
+    pp = getattr(entry, "published_parsed", None) or entry.get("published_parsed")
+    if pp:
+        try:
+            dt = datetime(*pp[:6], tzinfo=timezone.utc)
+            return dt.isoformat(), dt
+        except (TypeError, ValueError):
+            pass
+    raw = entry.get("published") or entry.get("updated") or ""
+    if raw:
+        # Best-effort parse for ISO-shaped strings; if it fails, keep the raw
+        # string but signal "unknown age" so the freshness filter can drop it.
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            return dt.isoformat(), dt
+        except ValueError:
+            return raw, None
+    return "", None
+
+
 async def fetch_rss_feed(url: str, source_name: str, timeout: int = 10) -> list[dict[str, Any]]:
     """Fetch and parse RSS feed with FinBERT sentiment scoring (batched)."""
     if not FEEDPARSER_AVAILABLE:
@@ -203,12 +236,23 @@ async def fetch_rss_feed(url: str, source_name: str, timeout: int = 10) -> list[
         if not entries:
             return []
 
+        cutoff = datetime.now(timezone.utc) - timedelta(days=_MAX_NEWS_AGE_DAYS)
+        skipped_stale = 0
+
         # Prepare texts and metadata
         titles = []
         summaries = []
         combined_texts = []
         entry_meta = []
         for entry in entries:
+            iso, pub_dt = _parse_pub_iso(entry)
+            # Drop entries with no parseable date OR older than the cutoff.
+            # Without this filter, feeds like Moneycontrol's MCtopnews.xml
+            # (which still serves 2015-era archives) surface as 9-year-old
+            # "Market News".
+            if pub_dt is None or pub_dt < cutoff:
+                skipped_stale += 1
+                continue
             title = _clean_text(entry.get("title", ""))
             summary = _clean_text(entry.get("summary", entry.get("description", "")))
             combined = f"{title} {summary}"
@@ -216,9 +260,17 @@ async def fetch_rss_feed(url: str, source_name: str, timeout: int = 10) -> list[
             summaries.append(summary)
             combined_texts.append(combined)
             entry_meta.append({
-                "published": entry.get("published", datetime.now(timezone.utc).isoformat()),
+                "published": iso,
                 "link": entry.get("link", ""),
             })
+
+        if not combined_texts:
+            if skipped_stale:
+                logger.info(
+                    "RSS %s: %d entries dropped as stale or undated (cutoff=%dd)",
+                    source_name, skipped_stale, _MAX_NEWS_AGE_DAYS,
+                )
+            return []
 
         # Batch FinBERT scoring (up to 10 texts at once)
         sentiment_results = _batch_finbert_sentiment(combined_texts)

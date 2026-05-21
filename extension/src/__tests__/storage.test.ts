@@ -23,6 +23,8 @@ function makeSignal(id: string): Signal {
     reason: "Test",
     risk: null,
     llm_summary: null,
+    llm_verdict: null,
+    llm_reason: null,
     current_price: 3800,
     metadata: {},
     created_at: new Date().toISOString(),

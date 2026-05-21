@@ -340,6 +340,29 @@ export default function Settings() {
                 </div>
               );
             })}
+
+            {/* Layer-2 LLM judge — pairs with the keep/downgrade/drop badge on
+                signal cards. Off by default; turning it on costs 1 LLM call
+                per scan and may downgrade/drop deterministic candidates. */}
+            <div className="border-t border-border pt-3">
+              <label className="flex items-center justify-between text-xs text-zinc-300">
+                <span>
+                  LLM signal judging
+                  <span className="text-[10px] text-zinc-600 block">
+                    One batched LLM review per scan — endorses, downgrades, or drops candidates
+                  </span>
+                </span>
+                <input
+                  type="checkbox"
+                  checked={
+                    settings.llm_judging_enabled === true ||
+                    String(settings.llm_judging_enabled).toLowerCase() === "true"
+                  }
+                  onChange={(e) => set("llm_judging_enabled", e.target.checked)}
+                  className="accent-brand"
+                />
+              </label>
+            </div>
           </div>
         </section>
 

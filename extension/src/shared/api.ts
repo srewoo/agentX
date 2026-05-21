@@ -2,7 +2,8 @@ import { getBackendUrl, getSettings } from "./storage";
 import type {
   Signal, StockQuote, TechnicalsResponse, AIAnalysisResponse, WatchlistItem, AppSettings, HealthResponse,
   NewsItem, CorporateAction, OptionsAnalysis, BlockDeal, BacktestResult, ScreenerParams, FundamentalsResponse,
-  SignalEdgeResponse, InsightsResponse, BacktestRun, DeepSignalAnalysis,
+  SignalEdgeResponse, InsightsResponse, BacktestRun, PerformanceByTypeRow, DeepSignalAnalysis,
+  ScanTriggerResponse, ScanStatus,
 } from "./types";
 
 const DEFAULT_TIMEOUT_MS = 30_000; // 30 seconds
@@ -65,12 +66,16 @@ export const api = {
   // Stocks
   search: (q: string) =>
     request<{ results: Array<{ symbol: string; name: string; exchange: string }> }>(`/api/stocks/search?q=${encodeURIComponent(q)}`),
-  getQuote: (symbol: string) => request<StockQuote>(`/api/stocks/${symbol}/quote`),
-  getTechnicals: (symbol: string) => request<TechnicalsResponse>(`/api/stocks/${symbol}/technicals`),
-  getFundamentals: (symbol: string) => request<FundamentalsResponse>(`/api/stocks/${encodeURIComponent(symbol)}/fundamentals`, {}, 45_000),
-  getHistory: (symbol: string, period = "6mo", interval = "1d") =>
+  getQuote: (symbol: string, exchange: "NSE" | "BSE" = "NSE") =>
+    request<StockQuote>(`/api/stocks/${symbol}/quote?exchange=${exchange}`),
+  getTechnicals: (symbol: string, exchange: "NSE" | "BSE" = "NSE") =>
+    request<TechnicalsResponse>(`/api/stocks/${symbol}/technicals?exchange=${exchange}`),
+  getFundamentals: (symbol: string, exchange: "NSE" | "BSE" = "NSE") =>
+    request<FundamentalsResponse>(
+      `/api/stocks/${encodeURIComponent(symbol)}/fundamentals?exchange=${exchange}`, {}, 45_000),
+  getHistory: (symbol: string, period = "6mo", interval = "1d", exchange: "NSE" | "BSE" = "NSE") =>
     request<{ history: Array<{ date: string; o: number; h: number; l: number; c: number; v: number }> }>(
-      `/api/stocks/${symbol}/history?period=${period}&interval=${interval}`
+      `/api/stocks/${symbol}/history?period=${period}&interval=${interval}&exchange=${exchange}`
     ),
   aiAnalysis: (symbol: string, timeframe: "intraday" | "swing" | "long" = "swing") =>
     request<AIAnalysisResponse>(`/api/stocks/${symbol}/ai-analysis`, {
@@ -123,7 +128,13 @@ export const api = {
     request<{ data: { total_evaluated: number; total_wins: number; win_rate: number; avg_pnl_pct: number } }>("/api/performance/summary"),
 
   // Manual scan (120s timeout — scan now fetches FII/DII, VIX, delivery volume, RS, etc.)
-  triggerScan: () => request<{ signals_found: number; scan_duration_ms: number }>("/api/scan/trigger", { method: "POST" }, 120_000),
+  // Scan is asynchronous: POST returns 202 + job_id in <1s, then the client
+  // polls `getScanStatus()` until status is "completed" or "failed". This
+  // avoids HTTP timeouts on real scans which run 160-200s. See watchScan().
+  triggerScan: () =>
+    request<ScanTriggerResponse>("/api/scan/trigger", { method: "POST" }, 10_000),
+  getScanStatus: () =>
+    request<ScanStatus>("/api/scan/status", {}, 10_000),
 
   // ── Tier 1/2/3 added bindings ───────────────────────────────────────
   getNews: (limit = 20) =>
@@ -149,29 +160,31 @@ export const api = {
     request<{ presets: Record<string, { label: string; description?: string; params: ScreenerParams }> }>("/api/screener/presets"),
 
   // Backtest
-  backtest: (symbol: string, period = "1y", evalDays = 5) =>
-    request<BacktestResult>(`/api/backtest/${encodeURIComponent(symbol)}?period=${period}&eval_days=${evalDays}`, { method: "POST" }, 90_000),
-
-  // Performance breakdown by signal type
-  getPerformanceByType: (signalType?: string, direction?: string) => {
-    const qs = new URLSearchParams();
-    if (signalType) qs.set("signal_type", signalType);
-    if (direction) qs.set("direction", direction);
-    const q = qs.toString();
-    return request<{ data: Array<{ signal_type: string; direction: string; total: number; wins: number; win_rate: number; avg_pnl_pct: number }> }>(
-      `/api/performance/by-type${q ? `?${q}` : ""}`
-    );
-  },
+  backtest: (symbol: string, period = "1y", evalDays = 5, exchange: "NSE" | "BSE" = "NSE") =>
+    request<BacktestResult>(
+      `/api/backtest/${encodeURIComponent(symbol)}?period=${period}&eval_days=${evalDays}&exchange=${exchange}`,
+      { method: "POST" }, 90_000),
 
   // Per-signal-type edge (static, derived from internal backtest)
   getSignalEdge: () => request<SignalEdgeResponse>("/api/performance/edge"),
 
   // Autonomous-loop endpoints
   getInsights: () => request<InsightsResponse>("/api/performance/insights"),
-  getBacktestHistory: (limit = 12) =>
-    request<{ runs: BacktestRun[]; count: number }>(`/api/performance/backtest-history?limit=${limit}`),
 
-  // Alert history (triggered)
-  getAlertHistory: () =>
-    request<{ alerts: Array<{ id: string; symbol: string; target_price: number; condition: string; triggered_at: string | null; triggered_price: number | null; note: string | null }> }>("/api/alerts/history"),
+  // Performance breakdown by signal type (live + tracked outcomes).
+  getPerformanceByType: (signalType?: string, direction?: string) => {
+    const qs = new URLSearchParams();
+    if (signalType) qs.set("signal_type", signalType);
+    if (direction) qs.set("direction", direction);
+    const q = qs.toString();
+    return request<{ data: PerformanceByTypeRow[] }>(
+      `/api/performance/by-type${q ? `?${q}` : ""}`
+    );
+  },
+
+  // Last N weekly autonomous backtest runs (newest first).
+  getBacktestHistory: (limit = 12) =>
+    request<{ runs: BacktestRun[]; count: number }>(
+      `/api/performance/backtest-history?limit=${limit}`
+    ),
 };

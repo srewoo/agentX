@@ -37,7 +37,10 @@ export default function Watchlist({ onSelectSymbol }: WatchlistProps = {}) {
       // don't fire 50 parallel quote calls (which then cascade to NSE/yfinance).
       const qMap: Record<string, StockQuote> = {};
       await pMap(res.watchlist, async (item) => {
-        try { qMap[item.symbol] = await api.getQuote(item.symbol); } catch { /* skip */ }
+        try {
+          const ex = (item.exchange === "BSE" ? "BSE" : "NSE") as "NSE" | "BSE";
+          qMap[item.symbol] = await api.getQuote(item.symbol, ex);
+        } catch { /* skip */ }
       }, 4);
       setQuotes(qMap);
     } catch (e) {
