@@ -32,10 +32,15 @@ async def get_latest_signals(since: Optional[str] = None, limit: int = 50):
     """Get latest signals, optionally filtered by timestamp."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
+        # strength > 0 excludes signals that the edge filter has muted
+        # (broken detectors like bullish_engulfing or the bullish leg of
+        # rsi_extreme). They stay in the DB for analytics, but the Live
+        # tab should not present a "SELL HOLD BUY" card the engine has
+        # already deemed worthless.
         if since:
             async with db.execute(
                 """SELECT * FROM signals
-                   WHERE dismissed = 0 AND created_at > ?
+                   WHERE dismissed = 0 AND strength > 0 AND created_at > ?
                    ORDER BY created_at DESC LIMIT ?""",
                 (since, limit),
             ) as cursor:
@@ -43,7 +48,7 @@ async def get_latest_signals(since: Optional[str] = None, limit: int = 50):
         else:
             async with db.execute(
                 """SELECT * FROM signals
-                   WHERE dismissed = 0
+                   WHERE dismissed = 0 AND strength > 0
                    ORDER BY created_at DESC LIMIT ?""",
                 (limit,),
             ) as cursor:
@@ -52,7 +57,7 @@ async def get_latest_signals(since: Optional[str] = None, limit: int = 50):
         signals = [_row_to_signal(r) for r in rows]
 
         async with db.execute(
-            "SELECT COUNT(*) FROM signals WHERE read = 0 AND dismissed = 0"
+            "SELECT COUNT(*) FROM signals WHERE read = 0 AND dismissed = 0 AND strength > 0"
         ) as cursor:
             count_row = await cursor.fetchone()
             unread_count = count_row[0] if count_row else 0

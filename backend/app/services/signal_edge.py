@@ -120,6 +120,12 @@ RECOMMENDED_MUTES: list[str] = [
     "52_week_high",           # n=928,  avg_pnl -0.61%, lb95 38.68
     "cup_and_handle",         # n=226,  avg_pnl -0.31%, lb95 37.49
     "morning_star",           # n=448,  avg_pnl -0.33%, lb95 39.45
+    # 2026-05-25 audit (signal_outcomes table, 9,984 trades): bullish
+    # engulfing collapsed to a 1.2% win rate on n=82. The detector is
+    # firing on every counter-trend bounce in a bearish regime; there is
+    # no salvageable edge. Muted universally — single-direction signal,
+    # safe to kill outright.
+    "bullish_engulfing",      # n=82,   avg_pnl -6.25%, WR 1.2%
     # Note: double_bottom, double_top, head_and_shoulders, and
     # inverse_head_and_shoulders were ALSO muted before. Their detectors
     # have been rewritten with prominence + separation + neckline-break
@@ -127,6 +133,17 @@ RECOMMENDED_MUTES: list[str] = [
     # from net-negative noise into legitimate (rarer) signals. They are
     # unmuted here; the next walk-forward run will confirm or refute.
 ]
+
+# Direction-aware mutes: kill one leg of a two-direction signal where the
+# leg is structurally broken. Same semantics as RECOMMENDED_MUTES — the
+# detector still runs (UI can show context) but strength is zeroed and
+# the signal contributes nothing to scoring. Source: 2026-05-25 audit of
+# signal_outcomes — bullish legs of these setups historically lose money
+# on Indian large-caps in this regime; bearish legs work.
+DIRECTIONAL_MUTES: set[tuple[str, str]] = {
+    ("rsi_extreme", "bullish"),       # n=1612, WR 5.5%, avg -7.38%
+    ("macd_crossover", "bullish"),    # n=472,  WR 6.6%, avg -5.52%
+}
 
 # Setups the engine considers genuine edge sources after the walk-forward.
 # Used by the scoring layer to amplify signal weight when one of these
@@ -234,10 +251,20 @@ EDGE_META = {
 }
 
 
-def is_muted(signal_type: str) -> bool:
-    """True when a signal type is on the mute list (engine should still
-    detect it for UI but skip its contribution to scoring/trades)."""
-    return signal_type in RECOMMENDED_MUTES
+def is_muted(signal_type: str, direction: Optional[str] = None) -> bool:
+    """True when a (signal_type[, direction]) combination is muted.
+
+    - ``signal_type`` only: universal mute (kills both directions). Back-compat
+      with callers that don't yet pass direction.
+    - ``signal_type + direction``: also checks the directional mute set —
+      kills just the broken leg of a two-direction signal (e.g. the bullish
+      leg of ``rsi_extreme`` while keeping the bearish leg).
+    """
+    if signal_type in RECOMMENDED_MUTES:
+        return True
+    if direction is not None and (signal_type, direction) in DIRECTIONAL_MUTES:
+        return True
+    return False
 
 
 def is_promoted(signal_type: str, direction: str) -> bool:
@@ -256,7 +283,7 @@ def signal_weight_multiplier(signal_type: str, direction: str, regime: Optional[
       4. `is_promoted` — universal 1.6× boost
       5. 1.0 otherwise
     """
-    if is_muted(signal_type):
+    if is_muted(signal_type, direction):
         return 0.0
     if regime and (regime, signal_type, direction) in REGIME_KILL_SET:
         return 0.0

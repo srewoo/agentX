@@ -770,7 +770,9 @@ def scan_symbol(
     pre_mute_count = len(signals)
     kept_after_mute: list[dict] = []
     for sig in signals:
-        if _is_muted(sig.get("signal_type", "")):
+        # Direction-aware: kills broken legs (e.g. rsi_extreme bullish at
+        # 5.5% WR) while keeping the working leg (rsi_extreme bearish).
+        if _is_muted(sig.get("signal_type", ""), sig.get("direction")):
             sig["metadata"] = sig.get("metadata") or {}
             sig["metadata"]["muted_by_edge"] = True
             # Mark strength to 0 so any downstream sort/filter ignores it,
