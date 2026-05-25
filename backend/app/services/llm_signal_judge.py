@@ -138,6 +138,12 @@ async def judge_signals(
     prompt = _build_prompt(candidates)
     fallback = _build_fallback_chain(settings, provider)
 
+    # Budget: per-candidate ~60 output tokens (id+verdict+short reason) plus
+    # ~1.5x slack for reasoning-model hidden tokens (gpt-5 / o-series). The
+    # previous 2048 default starved reasoning models, producing empty
+    # `message.content` and failing the parser on every scan.
+    judge_max_tokens = max(2048, _MAX_CANDIDATES_PER_CALL * 60 * 2)
+
     try:
         raw = await call_llm(
             provider=provider,
@@ -148,9 +154,19 @@ async def judge_signals(
             fallback_chain=fallback,
             route="signal_judge",
             symbol=None,
+            max_tokens=judge_max_tokens,
         )
     except Exception as e:
         logger.warning("judge: LLM call failed, failing open: %s", e)
+        return {}
+
+    if not raw or not raw.strip():
+        logger.warning(
+            "judge: empty response from %s/%s (likely reasoning tokens exhausted "
+            "max_completion_tokens=%d); failing open. Consider raising the budget "
+            "or switching to a non-reasoning model for this route.",
+            provider, model, judge_max_tokens,
+        )
         return {}
 
     try:

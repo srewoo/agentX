@@ -170,19 +170,53 @@ async def signal_edge():
 async def recommendation_calibration():
     """Current learned factor-edge multipliers for the recommendation engine."""
     snapshot = get_factor_edge_snapshot()
+    from app.services.recommendation_tuner import get_learned_weights_snapshot
     return {
         "data": {
             "factors": snapshot,
+            "learned_weights": get_learned_weights_snapshot(),
             "sample_policy": "Factors are only seeded on startup after the minimum sample threshold; fresh runs are conservative.",
         }
     }
 
 
+@router.post("/fit-weights")
+async def fit_factor_weights(regime: Optional[str] = None):
+    """Refit factor weights from resolved win/loss outcomes (logistic regression).
+
+    Returns coefficients + normalised weight vector. Requires ≥200 resolved
+    trades; below that returns `insufficient_data` and the engine keeps
+    its hardcoded priors.
+    """
+    from app.services.recommendation_tuner import logistic_fit_weights
+    result = await logistic_fit_weights(regime=regime)
+    return {"data": result}
+
+
+@router.post("/train-meta-label")
+async def train_meta_label(n_splits: int = 5):
+    """Fit + persist the meta-labeling secondary classifier (AFML Ch.3).
+
+    Uses purged K-fold CV to estimate OOS accuracy. Predicts whether
+    each primary recommendation will hit its target before its stop;
+    output probability gates conviction at scoring time.
+    """
+    from app.services.ml_meta_label import train_meta_label_model
+    return {"data": await train_meta_label_model(n_splits=n_splits)}
+
+
 @router.get("/summary")
-async def performance_summary():
-    """Return overall win rate, avg PnL, and total signals evaluated."""
+async def performance_summary(window_days: int = 30):
+    """Return rolling-window win rate, avg PnL, and signals evaluated.
+
+    Defaults to a 30-day rolling window so the dashboard reflects recent
+    behaviour rather than a lifetime aggregate that barely moves once the
+    outcomes table grows past a few thousand rows. Pass ``window_days=0``
+    for all-time stats.
+    """
     try:
-        summary = await get_performance_summary()
+        win = None if window_days <= 0 else window_days
+        summary = await get_performance_summary(window_days=win)
         return {"data": summary}
     except Exception as e:
         logger.error(f"Error fetching performance summary: {e}")

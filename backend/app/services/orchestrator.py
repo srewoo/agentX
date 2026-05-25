@@ -86,6 +86,22 @@ _scan_state = _ScanState()
 last_scan_time: Optional[str] = None
 last_scan_signal_count: int = 0
 
+# Module A runs at most once per IST trading day; this latch prevents
+# the scan loop (which fires every N minutes) from triggering 30+
+# Module A scans per day.
+_module_a_last_run_date: Optional[str] = None
+
+
+def _module_a_ran_today() -> bool:
+    global _module_a_last_run_date
+    today = datetime.now(IST).date().isoformat()
+    return _module_a_last_run_date == today
+
+
+def _mark_module_a_ran_today() -> None:
+    global _module_a_last_run_date
+    _module_a_last_run_date = datetime.now(IST).date().isoformat()
+
 
 # Concurrency cap for the weekly backtest fan-out. Tuned to keep yfinance /
 # NSE rate limits happy while still finishing ~50 symbols in reasonable time.
@@ -482,7 +498,11 @@ async def run_scan_cycle() -> list[dict]:
                 # Success — reset strike count
                 _bad_symbol_strikes.pop(sym, None)
 
+                # Yield to the event loop after CPU-bound pandas work so that
+                # lightweight requests (e.g. /api/scan/status polling) can be
+                # served while the scan is running across 40+ concurrent tasks.
                 technicals = compute_technicals(df)
+                await asyncio.sleep(0)
                 if not technicals:
                     return []
 
@@ -508,6 +528,7 @@ async def run_scan_cycle() -> list[dict]:
                     pass  # Non-critical — proceed without earnings check
 
                 sr = compute_support_resistance(df)
+                await asyncio.sleep(0)
                 prev_price = previous_prices.get(sym)
 
                 # For watchlist stocks, also check news sentiment
@@ -775,6 +796,12 @@ async def run_scan_cycle() -> list[dict]:
     except Exception as e:
         logger.warning(f"Recommendation evaluation failed (non-critical): {e}")
 
+    # Auto paper-trading + Module A scan run as SEPARATE background tasks
+    # (`_auto_paper_loop` and `_module_a_loop`). Keeping them out of
+    # `run_scan_cycle` is critical: each does 40-152 yfinance calls and
+    # was previously bloating scan duration past the 10s `/api/scan/status`
+    # frontend timeout. The scan cycle now does only what its name says.
+
     # Cleanup old signals (non-blocking best-effort)
     try:
         from app.database import cleanup_old_signals
@@ -794,6 +821,8 @@ class SignalOrchestrator:
         self._task: Optional[asyncio.Task] = None
         self._backtest_task: Optional[asyncio.Task] = None
         self._calibration_task: Optional[asyncio.Task] = None
+        self._auto_paper_task: Optional[asyncio.Task] = None
+        self._module_a_task: Optional[asyncio.Task] = None
         self._running = False
 
     async def start(self) -> None:
@@ -803,12 +832,19 @@ class SignalOrchestrator:
         self._task = asyncio.create_task(self._loop())
         self._backtest_task = asyncio.create_task(self._backtest_loop())
         self._calibration_task = asyncio.create_task(self._calibration_loop())
+        # Separated from run_scan_cycle so /api/scan/status stays snappy.
+        self._auto_paper_task = asyncio.create_task(self._auto_paper_loop())
+        self._module_a_task = asyncio.create_task(self._module_a_loop())
         await asyncio.sleep(0)
         logger.info("Signal orchestrator started (scan + weekly backtest + calibration)")
 
     async def stop(self) -> None:
         self._running = False
-        for t in (self._task, self._backtest_task, self._calibration_task):
+        for t in (
+            self._task, self._backtest_task, self._calibration_task,
+            getattr(self, "_auto_paper_task", None),
+            getattr(self, "_module_a_task", None),
+        ):
             if t:
                 t.cancel()
                 try:
@@ -938,6 +974,117 @@ class SignalOrchestrator:
             apply=apply,
         )
         logger.info("Weekly recommendation calibration complete: %s", result.get("summary"))
+
+        # Auto-retrain the learnt weight vector AND the meta-labeler from
+        # the freshly-evaluated outcomes. Both are no-ops below 200
+        # resolved trades; once over the threshold they self-activate
+        # and the engine picks them up on its next request without a
+        # restart (in-memory caches updated as a side effect).
+        try:
+            from app.services.recommendation_tuner import logistic_fit_weights
+            tune_res = await logistic_fit_weights()
+            logger.info("Weekly factor-weight refit: %s", tune_res.get("status"))
+        except Exception as e:
+            logger.warning("Weekly factor-weight refit failed: %s", e)
+        try:
+            from app.services.ml_meta_label import train_meta_label_model
+            meta_res = await train_meta_label_model(n_splits=5)
+            logger.info(
+                "Weekly meta-label refit: status=%s samples=%s cv_acc=%s",
+                meta_res.get("status"), meta_res.get("samples"),
+                meta_res.get("cv_accuracy_mean"),
+            )
+        except Exception as e:
+            logger.warning("Weekly meta-label refit failed: %s", e)
+
+    async def _auto_paper_loop(self) -> None:
+        """Independent loop for the multi-factor auto-paper-trader.
+
+        Runs every `auto_paper_interval_minutes` (default 15 min) during
+        market hours. Separated from `run_scan_cycle` so the heavy
+        `generate_batch` work doesn't slow the user-facing scan
+        endpoint. Failures are swallowed and logged.
+        """
+        await asyncio.sleep(120)  # grace period after startup
+        while self._running:
+            try:
+                if not is_market_open():
+                    await asyncio.sleep(600)  # 10 min wait outside market hours
+                    continue
+                db_settings = await _get_settings()
+                interval_min = int(db_settings.get("auto_paper_interval_minutes", 15))
+                from app.services.auto_paper_trader import (
+                    auto_close_hits, auto_open_from_recommendations,
+                    get_auto_paper_settings,
+                )
+                from app.services.recommendation import generate_batch, default_universe
+                cfg = await get_auto_paper_settings(db_settings)
+                if cfg["enabled"]:
+                    close_res = await auto_close_hits()
+                    uni = [s.get("symbol") for s in (db_settings.get("watchlist") or []) if s.get("symbol")]
+                    if not uni:
+                        uni = default_universe(limit=40)
+                    recs, _err = await generate_batch(uni, horizon="swing")
+                    open_res = await auto_open_from_recommendations(
+                        recs,
+                        min_conviction=cfg["min_conviction"],
+                        max_per_day=cfg["max_per_day"],
+                        max_open_positions=cfg["max_open_positions"],
+                    )
+                    logger.info(
+                        "Auto-paper loop: opened=%d closed=%d",
+                        len(open_res.get("opened", [])),
+                        len(close_res.get("closed", [])),
+                    )
+                await asyncio.sleep(max(60, interval_min * 60))
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.warning("Auto-paper loop error: %s", e)
+                await asyncio.sleep(300)
+
+    async def _module_a_loop(self) -> None:
+        """Once-per-trading-day Module A scan.
+
+        Module A holds for 180 days, so checking once a day is plenty.
+        Runs at 11:00 IST (~75 min after market open) so 52-week-low
+        proximity checks against a real intraday price. Separated from
+        the scan cycle so its yfinance fan-out can't slow the user UI.
+        """
+        await asyncio.sleep(300)
+        while self._running:
+            try:
+                now_ist = datetime.now(IST)
+                # Target 11:00 IST on a weekday — if past, target tomorrow.
+                target = now_ist.replace(hour=11, minute=0, second=0, microsecond=0)
+                if target <= now_ist:
+                    target = target + timedelta(days=1)
+                while target.weekday() >= 5:  # skip weekends
+                    target = target + timedelta(days=1)
+                wait_s = max(60, (target - now_ist).total_seconds())
+                logger.info("Next Module A scan at %s IST (in %.1fh)", target.isoformat(), wait_s / 3600)
+                await asyncio.sleep(wait_s)
+                if not self._running:
+                    break
+                if not is_market_open():
+                    # Market holiday or off-hours — skip and wait for next.
+                    continue
+                from app.services.module_a_live import (
+                    evaluate_and_close_module_a, scan_and_open_module_a,
+                )
+                close_res = await evaluate_and_close_module_a()
+                open_res = await scan_and_open_module_a()
+                logger.info(
+                    "Module A daily: opened=%d closed=%d status=%s",
+                    len(open_res.get("opened", [])),
+                    len(close_res.get("closed", [])),
+                    open_res.get("status"),
+                )
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.warning("Module A loop error: %s", e)
+                await asyncio.sleep(3600)
 
     async def _run_weekly_backtest(self) -> None:
         """Execute the weekly backtest and persist the result row."""

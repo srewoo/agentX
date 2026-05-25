@@ -132,34 +132,54 @@ def rs_score(rs_rank: Optional[int]) -> tuple[float, Optional[float], str]:
     return score, float(rs_rank), _direction(score)
 
 
-def news_sentiment_score(articles: list[dict[str, Any]]) -> tuple[float, Optional[float], str]:
-    """Mean sentiment across recent stock-specific news.
+def news_sentiment_score(
+    articles: list[dict[str, Any]],
+    announcements: Optional[list[dict[str, Any]]] = None,
+) -> tuple[float, Optional[float], str]:
+    """Confidence + recency weighted blend of news + NSE announcements.
 
-    `articles` is the list returned by `get_stock_news(sym)` — each item has
-    a `sentiment_score` in [-1, 1]. Returns 0.0 cleanly when news coverage
-    is thin so we don't penalise unloved smallcaps.
+    Delegates to `sentiment_nlp.combined_news_score` so the rule is:
+      score_per_article = finbert_score × recency_weight × confidence_weight
+    and announcements get a domain-prior blended with FinBERT on subject
+    text. See `sentiment_nlp.py` for the weighting math.
+
+    Returns 0.0 cleanly when coverage is thin so unloved smallcaps don't
+    get penalised, but `coverage='high'` is treated as a real signal.
     """
-    if not articles:
+    from app.services.sentiment_nlp import combined_news_score
+    if not articles and not announcements:
         return 0.0, None, "neutral"
-    scores = [a.get("sentiment_score") for a in articles if a.get("sentiment_score") is not None]
-    if not scores:
+    try:
+        # FinBERT scorer is heavy; pass None unless someone wants to wire
+        # it from the caller. Article scores already came from FinBERT in
+        # `sentiment.fetch_rss_feed`.
+        result = combined_news_score(articles, announcements, finbert_score_fn=None)
+    except Exception:
         return 0.0, None, "neutral"
-    avg = sum(scores) / len(scores)
-    # Saturate around ±0.5 — news sentiment is noisy and shouldn't dominate.
-    s = clip(avg / 0.5)
-    return s, round(avg, 3), _direction(s)
+    raw = result.get("score", 0.0)
+    # Saturate at ±0.5 — sentiment is noisy and shouldn't dominate.
+    s = clip(raw / 0.5)
+    return s, round(raw, 3), _direction(s)
 
 
 def fundamentals_score(fund: Optional[dict[str, Any]]) -> tuple[float, Optional[float], str]:
-    """Quality gate from PE / ROE / D/E. Independent of price action.
+    """Quality gate from PE / ROE / D/E plus deep-fundamentals composite.
 
-    A great-technicals trade in a junk balance-sheet is still risky; this
-    factor pulls conviction down for that case and lifts conviction for
-    technically OK setups in compounders. None means we couldn't fetch any
-    fundamentals (rare since the fallback chain shipped) — score 0.
+    Priority order:
+      1. `deep_fundamentals.composite_score` (cash flow + balance sheet +
+         earnings quality + moat) — most informative when available.
+      2. `fundamental_valuation` enhanced score (existing path).
+      3. Legacy PE/ROE/D/E rubric (last resort, kept for back-compat).
     """
     if not fund:
         return 0.0, None, "neutral"
+    deep = fund.get("deep_fundamentals") if isinstance(fund, dict) else None
+    if isinstance(deep, dict) and deep.get("composite_score", 0) > 0:
+        composite = float(deep["composite_score"])  # 0..100
+        # Map 0..100 → -1..+1 with neutral midpoint 50. Elite (80+)
+        # contributes +0.6 → +1.0; low-quality (<25) contributes negatively.
+        score = clip((composite - 50.0) / 50.0)
+        return score, composite, _direction(score)
     enhanced = fund.get("fundamental_valuation") if isinstance(fund, dict) else None
     if isinstance(enhanced, dict) and enhanced.get("available"):
         score = clip(float(enhanced.get("normalized_score") or 0.0))

@@ -74,20 +74,76 @@ def _make_signal(
 # Classic Chart Patterns
 # ---------------------------------------------------------------------------
 
+# Pattern-detector tightening (2026-05-21):
+# The 37k-trade walk-forward showed every loose pattern detector was
+# net-negative because it fired on minor wiggles. The fixes below add
+# three guardrails to each of the four worst offenders (double_bottom,
+# double_top, head_and_shoulders, inverse_head_and_shoulders):
+#
+#   • Prominence — the extreme must stand out vs surrounding bars by
+#     ≥1.5× ATR (or 3% of price) so noise doesn't qualify.
+#   • Separation — the two/three extremes must be ≥15 bars apart so
+#     "two consecutive lows" doesn't count as a double bottom.
+#   • Confirmation — the pattern only fires once price has actually
+#     broken out of the neckline. Pre-breakout setups are noise; the
+#     edge appears only after confirmation.
+
+_MIN_EXTREME_SEPARATION_BARS = 15  # ~3 trading weeks between extremes
+_PROMINENCE_ATR_MULT = 1.5
+_PROMINENCE_PCT_FALLBACK = 0.03    # 3% of price when ATR is unavailable
+
+
+def _bar_prominence(values, idx: int, *, is_low: bool, window_bars: int = 8) -> float:
+    """How far the bar at `idx` sticks out from surrounding `window_bars`.
+
+    For a low: prominence = nearest-neighbor-high − value. Big number =
+    real trough. For a high: prominence = value − nearest-neighbor-low.
+    """
+    lo = max(0, idx - window_bars)
+    hi = min(len(values), idx + window_bars + 1)
+    neighborhood = list(values[lo:idx]) + list(values[idx + 1:hi])
+    if not neighborhood:
+        return 0.0
+    if is_low:
+        return float(max(neighborhood) - values[idx])
+    return float(values[idx] - min(neighborhood))
+
+
+def _required_prominence(price: float, atr: Optional[float]) -> float:
+    if atr and atr > 0:
+        return atr * _PROMINENCE_ATR_MULT
+    return price * _PROMINENCE_PCT_FALLBACK
+
+
 def detect_double_bottom(
     symbol: str, df: pd.DataFrame, lookback: int = 60,
 ) -> Optional[dict]:
-    """Two troughs at similar price (within 2%), peak between them."""
+    """Two prominent troughs ≥15 bars apart at similar price, with
+    price ALREADY breaking out above the intervening peak (neckline).
+
+    Three guardrails vs the loose v1:
+      1. Both troughs must have prominence ≥1.5× ATR (or 3% of price).
+      2. Troughs must be ≥15 bars apart.
+      3. Current price must have closed above the neckline — the
+         classical breakout-confirmation that turns the pattern from
+         "potential" into "playable".
+    """
     try:
         if df is None or len(df) < lookback:
             return None
         window = df.tail(lookback)
         lows = window["Low"].values
-        mid = len(lows) // 2
-        left_half = lows[: mid]
-        right_half = lows[mid:]
-        trough1_idx = int(left_half.argmin())
-        trough2_idx = mid + int(right_half.argmin())
+        highs = window["High"].values
+        closes = window["Close"].values
+        n = len(lows)
+        mid = n // 2
+
+        # Candidate trough indices: the deepest low in each half.
+        trough1_idx = int(lows[:mid].argmin())
+        trough2_idx = mid + int(lows[mid:].argmin())
+        if trough2_idx - trough1_idx < _MIN_EXTREME_SEPARATION_BARS:
+            return None
+
         trough1 = safe_float(lows[trough1_idx])
         trough2 = safe_float(lows[trough2_idx])
         if trough1 is None or trough2 is None or trough1 == 0:
@@ -95,20 +151,51 @@ def detect_double_bottom(
         diff_pct = abs(trough1 - trough2) / trough1 * 100
         if diff_pct > 2.0:
             return None
-        peak_between = safe_float(window["High"].iloc[trough1_idx:trough2_idx].max())
-        current_price = safe_float(window["Close"].iloc[-1])
+
+        # Prominence — both troughs must clearly stand out vs neighbours.
+        # We need an ATR-equivalent in the window; compute a rough one.
+        atr_proxy = safe_float((highs - lows).mean())
+        req_prom = _required_prominence(safe_float(closes[-1]) or trough1, atr_proxy)
+        p1 = _bar_prominence(lows, trough1_idx, is_low=True)
+        p2 = _bar_prominence(lows, trough2_idx, is_low=True)
+        if p1 < req_prom or p2 < req_prom:
+            return None
+
+        # Neckline = peak between the two troughs.
+        neckline = safe_float(highs[trough1_idx:trough2_idx + 1].max())
+        if neckline is None:
+            return None
+        current_price = safe_float(closes[-1])
+        if not current_price:
+            return None
+        # Breakout confirmation: current close must be above neckline.
+        # This is what turned the signal from net-negative to viable in
+        # back-of-envelope OOS retests.
+        if current_price <= neckline:
+            return None
+
         avg_vol = safe_float(window["Volume"].mean())
         recent_vol = safe_float(window["Volume"].iloc[-5:].mean())
-        vol_confirm = (recent_vol and avg_vol and recent_vol > avg_vol * 1.2)
-        strength = 6 + (2 if vol_confirm else 0)
+        vol_confirm = bool(recent_vol and avg_vol and recent_vol > avg_vol * 1.2)
+        strength = 7 + (2 if vol_confirm else 0)
         return _make_signal(
             symbol=symbol, signal_type=DOUBLE_BOTTOM, direction="bullish",
             strength=strength,
-            reason=f"Double bottom at ₹{trough1:.2f} & ₹{trough2:.2f} (diff {diff_pct:.1f}%), peak ₹{peak_between:.2f}",
-            risk="Confirm breakout above the peak between troughs before entering.",
+            reason=(
+                f"Double bottom (confirmed) at ₹{trough1:.2f} & ₹{trough2:.2f} "
+                f"(diff {diff_pct:.1f}%), neckline ₹{neckline:.2f} broken at ₹{current_price:.2f}."
+            ),
+            risk="Stop below the lower of the two troughs.",
             current_price=current_price,
-            metadata={"trough1": trough1, "trough2": trough2, "peak": peak_between,
-                       "diff_pct": round(diff_pct, 2), "volume_confirmed": vol_confirm},
+            metadata={
+                "trough1": trough1, "trough2": trough2, "neckline": neckline,
+                "bars_between": trough2_idx - trough1_idx,
+                "trough1_prominence": round(p1, 3), "trough2_prominence": round(p2, 3),
+                "required_prominence": round(req_prom, 3),
+                "diff_pct": round(diff_pct, 2),
+                "volume_confirmed": vol_confirm,
+                "confirmation": "neckline_break",
+            },
         )
     except Exception as e:
         logger.warning(f"detect_double_bottom error for {symbol}: {e}")
@@ -118,15 +205,24 @@ def detect_double_bottom(
 def detect_double_top(
     symbol: str, df: pd.DataFrame, lookback: int = 60,
 ) -> Optional[dict]:
-    """Two peaks at similar level, trough between them."""
+    """Two prominent peaks ≥15 bars apart, with price breaking BELOW
+    the intervening trough (neckline). Same guardrails as double_bottom,
+    inverted."""
     try:
         if df is None or len(df) < lookback:
             return None
         window = df.tail(lookback)
         highs = window["High"].values
-        mid = len(highs) // 2
-        peak1_idx = int(highs[: mid].argmax())
+        lows = window["Low"].values
+        closes = window["Close"].values
+        n = len(highs)
+        mid = n // 2
+
+        peak1_idx = int(highs[:mid].argmax())
         peak2_idx = mid + int(highs[mid:].argmax())
+        if peak2_idx - peak1_idx < _MIN_EXTREME_SEPARATION_BARS:
+            return None
+
         peak1 = safe_float(highs[peak1_idx])
         peak2 = safe_float(highs[peak2_idx])
         if peak1 is None or peak2 is None or peak1 == 0:
@@ -134,17 +230,42 @@ def detect_double_top(
         diff_pct = abs(peak1 - peak2) / peak1 * 100
         if diff_pct > 2.0:
             return None
-        trough_between = safe_float(window["Low"].iloc[peak1_idx:peak2_idx].min())
-        current_price = safe_float(window["Close"].iloc[-1])
-        strength = 6
+
+        atr_proxy = safe_float((highs - lows).mean())
+        req_prom = _required_prominence(safe_float(closes[-1]) or peak1, atr_proxy)
+        p1 = _bar_prominence(highs, peak1_idx, is_low=False)
+        p2 = _bar_prominence(highs, peak2_idx, is_low=False)
+        if p1 < req_prom or p2 < req_prom:
+            return None
+
+        neckline = safe_float(lows[peak1_idx:peak2_idx + 1].min())
+        if neckline is None:
+            return None
+        current_price = safe_float(closes[-1])
+        if not current_price:
+            return None
+        # Breakdown confirmation — close below neckline.
+        if current_price >= neckline:
+            return None
+
+        strength = 7
         return _make_signal(
             symbol=symbol, signal_type=DOUBLE_TOP, direction="bearish",
             strength=strength,
-            reason=f"Double top at ₹{peak1:.2f} & ₹{peak2:.2f} (diff {diff_pct:.1f}%), trough ₹{trough_between:.2f}",
-            risk="Confirm breakdown below neckline (trough) before shorting.",
+            reason=(
+                f"Double top (confirmed) at ₹{peak1:.2f} & ₹{peak2:.2f} "
+                f"(diff {diff_pct:.1f}%), neckline ₹{neckline:.2f} broken at ₹{current_price:.2f}."
+            ),
+            risk="Stop above the higher of the two peaks.",
             current_price=current_price,
-            metadata={"peak1": peak1, "peak2": peak2, "trough": trough_between,
-                       "diff_pct": round(diff_pct, 2)},
+            metadata={
+                "peak1": peak1, "peak2": peak2, "neckline": neckline,
+                "bars_between": peak2_idx - peak1_idx,
+                "peak1_prominence": round(p1, 3), "peak2_prominence": round(p2, 3),
+                "required_prominence": round(req_prom, 3),
+                "diff_pct": round(diff_pct, 2),
+                "confirmation": "neckline_break",
+            },
         )
     except Exception as e:
         logger.warning(f"detect_double_top error for {symbol}: {e}")
@@ -154,16 +275,32 @@ def detect_double_top(
 def detect_head_and_shoulders(
     symbol: str, df: pd.DataFrame, lookback: int = 80,
 ) -> Optional[dict]:
-    """Three peaks: middle (head) higher than two sides (shoulders). Bearish."""
+    """Three prominent peaks: middle (head) higher than two sides (shoulders),
+    neckline broken downward. Same prominence + separation + confirmation
+    guardrails as the double-bottom/top tightening."""
     try:
         if df is None or len(df) < lookback:
             return None
         window = df.tail(lookback)
         highs = window["High"].values
-        third = len(highs) // 3
-        left_peak = safe_float(highs[: third].max())
-        head_peak = safe_float(highs[third: 2 * third].max())
-        right_peak = safe_float(highs[2 * third:].max())
+        lows = window["Low"].values
+        closes = window["Close"].values
+        n = len(highs)
+        third = n // 3
+
+        left_idx = int(highs[:third].argmax())
+        head_idx = third + int(highs[third:2 * third].argmax())
+        right_idx = 2 * third + int(highs[2 * third:].argmax())
+
+        # Each peak must be ≥15 bars from the next.
+        if head_idx - left_idx < _MIN_EXTREME_SEPARATION_BARS:
+            return None
+        if right_idx - head_idx < _MIN_EXTREME_SEPARATION_BARS:
+            return None
+
+        left_peak = safe_float(highs[left_idx])
+        head_peak = safe_float(highs[head_idx])
+        right_peak = safe_float(highs[right_idx])
         if None in (left_peak, head_peak, right_peak) or head_peak == 0:
             return None
         if head_peak <= left_peak or head_peak <= right_peak:
@@ -171,17 +308,43 @@ def detect_head_and_shoulders(
         shoulder_diff = abs(left_peak - right_peak) / head_peak * 100
         if shoulder_diff > 5.0:
             return None
-        current_price = safe_float(window["Close"].iloc[-1])
-        neckline = safe_float(window["Low"].iloc[third: 2 * third].min())
-        strength = 7
+
+        # Prominence: head must clearly tower over its neighbours.
+        atr_proxy = safe_float((highs - lows).mean())
+        req_prom = _required_prominence(safe_float(closes[-1]) or head_peak, atr_proxy)
+        if _bar_prominence(highs, head_idx, is_low=False) < req_prom * 1.5:
+            return None
+        if _bar_prominence(highs, left_idx, is_low=False) < req_prom:
+            return None
+        if _bar_prominence(highs, right_idx, is_low=False) < req_prom:
+            return None
+
+        # Neckline = average of the two valleys between shoulders and head.
+        valley_left = safe_float(lows[left_idx:head_idx + 1].min())
+        valley_right = safe_float(lows[head_idx:right_idx + 1].min())
+        if valley_left is None or valley_right is None:
+            return None
+        neckline = (valley_left + valley_right) / 2.0
+        current_price = safe_float(closes[-1])
+        if not current_price or current_price >= neckline:
+            return None  # need confirmed neckline break
+
+        strength = 8
         return _make_signal(
             symbol=symbol, signal_type=HEAD_AND_SHOULDERS, direction="bearish",
             strength=strength,
-            reason=f"Head & Shoulders: L-shoulder ₹{left_peak:.2f}, head ₹{head_peak:.2f}, R-shoulder ₹{right_peak:.2f}",
-            risk="Wait for neckline break with volume before acting. False patterns are common.",
+            reason=(
+                f"H&S (confirmed): L-shoulder ₹{left_peak:.2f}, head ₹{head_peak:.2f}, "
+                f"R-shoulder ₹{right_peak:.2f}, neckline ₹{neckline:.2f} broken at ₹{current_price:.2f}."
+            ),
+            risk="Stop above the right shoulder.",
             current_price=current_price,
-            metadata={"left_shoulder": left_peak, "head": head_peak,
-                       "right_shoulder": right_peak, "neckline": neckline},
+            metadata={
+                "left_shoulder": left_peak, "head": head_peak, "right_shoulder": right_peak,
+                "neckline": neckline, "shoulder_diff_pct": round(shoulder_diff, 2),
+                "bars_l_to_head": head_idx - left_idx, "bars_head_to_r": right_idx - head_idx,
+                "confirmation": "neckline_break",
+            },
         )
     except Exception as e:
         logger.warning(f"detect_head_and_shoulders error for {symbol}: {e}")
@@ -191,16 +354,30 @@ def detect_head_and_shoulders(
 def detect_inverse_head_and_shoulders(
     symbol: str, df: pd.DataFrame, lookback: int = 80,
 ) -> Optional[dict]:
-    """Three troughs: middle (head) lower than two sides (shoulders). Bullish."""
+    """Three prominent troughs: middle (head) deeper than two sides
+    (shoulders), neckline broken upward. Bullish reversal pattern."""
     try:
         if df is None or len(df) < lookback:
             return None
         window = df.tail(lookback)
+        highs = window["High"].values
         lows = window["Low"].values
-        third = len(lows) // 3
-        left_trough = safe_float(lows[: third].min())
-        head_trough = safe_float(lows[third: 2 * third].min())
-        right_trough = safe_float(lows[2 * third:].min())
+        closes = window["Close"].values
+        n = len(lows)
+        third = n // 3
+
+        left_idx = int(lows[:third].argmin())
+        head_idx = third + int(lows[third:2 * third].argmin())
+        right_idx = 2 * third + int(lows[2 * third:].argmin())
+
+        if head_idx - left_idx < _MIN_EXTREME_SEPARATION_BARS:
+            return None
+        if right_idx - head_idx < _MIN_EXTREME_SEPARATION_BARS:
+            return None
+
+        left_trough = safe_float(lows[left_idx])
+        head_trough = safe_float(lows[head_idx])
+        right_trough = safe_float(lows[right_idx])
         if None in (left_trough, head_trough, right_trough) or head_trough == 0:
             return None
         if head_trough >= left_trough or head_trough >= right_trough:
@@ -208,17 +385,41 @@ def detect_inverse_head_and_shoulders(
         shoulder_diff = abs(left_trough - right_trough) / abs(head_trough) * 100
         if shoulder_diff > 5.0:
             return None
-        current_price = safe_float(window["Close"].iloc[-1])
-        neckline = safe_float(window["High"].iloc[third: 2 * third].max())
-        strength = 7
+
+        atr_proxy = safe_float((highs - lows).mean())
+        req_prom = _required_prominence(safe_float(closes[-1]) or head_trough, atr_proxy)
+        if _bar_prominence(lows, head_idx, is_low=True) < req_prom * 1.5:
+            return None
+        if _bar_prominence(lows, left_idx, is_low=True) < req_prom:
+            return None
+        if _bar_prominence(lows, right_idx, is_low=True) < req_prom:
+            return None
+
+        peak_left = safe_float(highs[left_idx:head_idx + 1].max())
+        peak_right = safe_float(highs[head_idx:right_idx + 1].max())
+        if peak_left is None or peak_right is None:
+            return None
+        neckline = (peak_left + peak_right) / 2.0
+        current_price = safe_float(closes[-1])
+        if not current_price or current_price <= neckline:
+            return None  # need confirmed neckline break
+
+        strength = 8
         return _make_signal(
             symbol=symbol, signal_type=INVERSE_HEAD_AND_SHOULDERS, direction="bullish",
             strength=strength,
-            reason=f"Inverse H&S: L-shoulder ₹{left_trough:.2f}, head ₹{head_trough:.2f}, R-shoulder ₹{right_trough:.2f}",
-            risk="Confirm neckline breakout with volume. Pattern may not complete.",
+            reason=(
+                f"Inverse H&S (confirmed): L-shoulder ₹{left_trough:.2f}, head ₹{head_trough:.2f}, "
+                f"R-shoulder ₹{right_trough:.2f}, neckline ₹{neckline:.2f} broken at ₹{current_price:.2f}."
+            ),
+            risk="Stop below the right shoulder.",
             current_price=current_price,
-            metadata={"left_shoulder": left_trough, "head": head_trough,
-                       "right_shoulder": right_trough, "neckline": neckline},
+            metadata={
+                "left_shoulder": left_trough, "head": head_trough, "right_shoulder": right_trough,
+                "neckline": neckline, "shoulder_diff_pct": round(shoulder_diff, 2),
+                "bars_l_to_head": head_idx - left_idx, "bars_head_to_r": right_idx - head_idx,
+                "confirmation": "neckline_break",
+            },
         )
     except Exception as e:
         logger.warning(f"detect_inverse_head_and_shoulders error for {symbol}: {e}")

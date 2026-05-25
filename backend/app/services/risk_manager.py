@@ -110,6 +110,66 @@ def calculate_portfolio_heat(open_trades: list[dict]) -> dict[str, Any]:
     }
 
 
+def vol_targeted_position_size(
+    capital: float,
+    entry_price: float,
+    realized_vol_pct: float,
+    *,
+    target_vol_pct: float = 1.0,
+    max_position_pct: float = 5.0,
+) -> dict[str, Any]:
+    """Volatility-targeted position size (Moskowitz/Ooi/Pedersen 2012).
+
+    Position size scales inversely with realized vol so each trade
+    contributes roughly the same risk to the portfolio:
+
+        size_pct = target_vol / realized_vol      (clamped)
+
+    Documented ~30% Sharpe improvement vs equal-weight on diversified
+    factor portfolios. Free Sharpe — no new signal needed.
+
+    Args:
+        capital:           total portfolio capital (₹)
+        entry_price:       per-share price (₹)
+        realized_vol_pct:  annualised daily-return stdev (%) e.g. 30.0
+        target_vol_pct:    contribution this trade should make (%) — default 1%
+        max_position_pct:  hard ceiling (% of capital) — default 5%
+
+    Returns dict with shares, position_value, target_capital_pct,
+    realized_vol_pct, target_vol_pct.
+    """
+    if entry_price <= 0 or realized_vol_pct <= 0:
+        return {"shares": 0, "position_value": 0.0, "target_capital_pct": 0.0,
+                "realized_vol_pct": realized_vol_pct, "target_vol_pct": target_vol_pct}
+    target_capital_pct = min(max_position_pct, target_vol_pct / realized_vol_pct * 100.0)
+    position_value = capital * target_capital_pct / 100.0
+    shares = int(position_value / entry_price)
+    if shares <= 0:
+        return {"shares": 0, "position_value": 0.0, "target_capital_pct": 0.0,
+                "realized_vol_pct": realized_vol_pct, "target_vol_pct": target_vol_pct}
+    return {
+        "shares": shares,
+        "position_value": round(shares * entry_price, 2),
+        "target_capital_pct": round(target_capital_pct, 3),
+        "realized_vol_pct": round(realized_vol_pct, 3),
+        "target_vol_pct": target_vol_pct,
+    }
+
+
+def annualised_volatility(daily_returns: list[float]) -> float:
+    """Annualised return-stdev (%) from a series of daily fractional returns.
+
+    Standard 252-day scaling. Returns 0 when series is too short.
+    """
+    if len(daily_returns) < 5:
+        return 0.0
+    import math
+    n = len(daily_returns)
+    mu = sum(daily_returns) / n
+    var = sum((r - mu) ** 2 for r in daily_returns) / max(1, n - 1)
+    return math.sqrt(var * 252) * 100.0
+
+
 def update_trailing_stop(
     entry_price: float,
     current_stop: float,

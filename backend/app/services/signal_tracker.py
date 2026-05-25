@@ -6,7 +6,7 @@ Fetches current prices for past signals, calculates PnL, and stores outcomes.
 import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
-from typing import Any
+from typing import Any, Optional
 
 import aiosqlite
 
@@ -361,20 +361,35 @@ async def get_signal_accuracy(
             }
 
 
-async def get_performance_summary() -> dict[str, Any]:
-    """Return overall summary: total evaluated, overall win rate, avg PnL."""
+async def get_performance_summary(window_days: Optional[int] = 30) -> dict[str, Any]:
+    """Return summary stats from ``signal_outcomes``.
+
+    ``window_days``: rolling window over ``entry_time`` (the signal's
+    creation time). Defaults to 30 — lifetime aggregates become static once
+    the table has thousands of rows, so the dashboard shows a rolling view
+    that actually moves as new outcomes evaluate. Pass ``None`` for all-time.
+    """
+    params: tuple = ()
+    where = ""
+    if window_days is not None and window_days > 0:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=window_days)).isoformat()
+        where = "WHERE entry_time >= ?"
+        params = (cutoff,)
+
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        query = """
+        query = f"""
             SELECT
                 COUNT(*) as total_evaluated,
                 SUM(CASE WHEN outcome = 'win' THEN 1 ELSE 0 END) as total_wins,
                 SUM(CASE WHEN outcome = 'loss' THEN 1 ELSE 0 END) as total_losses,
                 AVG(CASE WHEN pnl_pct IS NOT NULL THEN pnl_pct ELSE 0 END) as avg_pnl,
-                SUM(CASE WHEN outcome = 'open' THEN 1 ELSE 0 END) as open_signals
+                SUM(CASE WHEN outcome = 'open' THEN 1 ELSE 0 END) as open_signals,
+                MAX(evaluated_at) as last_evaluated_at
             FROM signal_outcomes
+            {where}
         """
-        async with db.execute(query) as cursor:
+        async with db.execute(query, params) as cursor:
             row = await cursor.fetchone()
 
         if not row or row["total_evaluated"] == 0:
@@ -385,6 +400,8 @@ async def get_performance_summary() -> dict[str, Any]:
                 "open_signals": 0,
                 "win_rate": 0.0,
                 "avg_pnl_pct": 0.0,
+                "window_days": window_days,
+                "last_evaluated_at": None,
             }
 
         total = row["total_evaluated"]
@@ -399,4 +416,6 @@ async def get_performance_summary() -> dict[str, Any]:
             "open_signals": row["open_signals"] or 0,
             "win_rate": win_rate,
             "avg_pnl_pct": round(row["avg_pnl"] or 0, 2),
+            "window_days": window_days,
+            "last_evaluated_at": row["last_evaluated_at"],
         }

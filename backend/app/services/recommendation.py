@@ -106,11 +106,23 @@ def _market_regime(india_vix: Optional[float], weekly_tech: Optional[dict[str, A
 
 
 def _select_weights(india_vix: Optional[float], regime: Optional[str] = None) -> dict[str, float]:
-    """India VIX > 18 ≈ historically elevated fear. Above that we treat the
-    regime as risk-off and the defensive weight profile takes over."""
-    if regime == "risk_off" or (india_vix is not None and india_vix > 18.0):
-        return WEIGHTS_RISK_OFF
-    return WEIGHTS_CALM
+    """Prefer learned weights from `recommendation_tuner` when available;
+    fall back to hardcoded priors otherwise.
+
+    The tuner persists per-regime weights once ≥200 resolved trades exist.
+    Until then we use the original priors so the system has a sensible
+    starting state.
+    """
+    is_risk_off = regime == "risk_off" or (india_vix is not None and india_vix > 18.0)
+    regime_key = "risk_off" if is_risk_off else "calm"
+    try:
+        from app.services.recommendation_tuner import get_learned_weights
+        learned = get_learned_weights(regime_key) or get_learned_weights("all")
+        if learned and set(learned) == set(WEIGHTS_CALM):
+            return learned
+    except Exception as e:  # tuner is best-effort; never break recs over this
+        logger.debug("learned-weights lookup failed: %s", e)
+    return WEIGHTS_RISK_OFF if is_risk_off else WEIGHTS_CALM
 
 _HORIZON_TO_DAYS: dict[Horizon, int] = {"intraday": 1, "swing": 10, "positional": 60}
 _HORIZON_TO_PERIOD: dict[Horizon, str] = {"intraday": "5d", "swing": "6mo", "positional": "1y"}
@@ -212,6 +224,7 @@ def _score_all(
     regime: Optional[str] = None,
     sector: Optional[str] = None,
     horizon: Optional[Horizon] = None,
+    announcements: Optional[list[dict[str, Any]]] = None,
 ) -> tuple[list[SignalContribution], Optional[FnoSignal], Optional[FiiDiiSignal]]:
     w = weights or FACTOR_WEIGHTS
     s_t, v_t, d_t = trend_score(tech)
@@ -221,7 +234,7 @@ def _score_all(
     s_fi, v_fi, d_fi, fii_sig = fii_dii_score(fii_dii)
     s_r, v_r, d_r = rs_score(rs_rank)
     s_atr, v_atr, d_atr = volatility_score(tech)
-    s_news, v_news, d_news = news_sentiment_score(news or [])
+    s_news, v_news, d_news = news_sentiment_score(news or [], announcements or [])
     s_fund, v_fund, d_fund = fundamentals_score(fundamentals)
     s_wk, v_wk, d_wk = weekly_trend_score(weekly_tech)
     # Self-improvement: scale each base weight by its learned edge from
@@ -483,10 +496,47 @@ async def generate_recommendation(
     if fundamentals is not None:
         fundamentals = {**fundamentals, "fundamental_valuation": fundamental_valuation}
 
+    # Deep fundamentals (cash flow + balance sheet + earnings quality + moat)
+    # is best-effort and cached separately; tucked under `deep_fundamentals`
+    # for the factor scorer to pick up. Skipped for intraday — quality
+    # matters far less for 1-day calls and we don't want yfinance latency
+    # on the hot intraday path.
+    if horizon != "intraday":
+        try:
+            deep_cache_key = make_cache_key("stock:deep_fundamentals", symbol)
+            deep = await cache_manager.get(deep_cache_key)
+            if not deep:
+                from app.services.fundamentals_deep import get_deep_fundamentals
+                deep = await asyncio.wait_for(get_deep_fundamentals(symbol), timeout=12)
+                # Long TTL — fundamentals change quarterly.
+                await cache_manager.set(deep_cache_key, deep, ttl=timedelta(days=7))
+                # Persist a point-in-time snapshot. Backtests should load
+                # the snapshot dated ≤ entry bar instead of fetching live
+                # data — yfinance returns restated financials, which leak.
+                try:
+                    from app.services.execution_costs import snapshot_fundamentals
+                    await snapshot_fundamentals(
+                        symbol, deep, source="yfinance_deep",
+                        composite_score=deep.get("composite_score"),
+                    )
+                except Exception:
+                    pass
+            if isinstance(deep, dict) and deep.get("composite_score", 0) > 0:
+                fundamentals = {**(fundamentals or {}), "deep_fundamentals": deep}
+        except Exception as e:
+            logger.debug("deep fundamentals skipped for %s: %s", symbol, e)
+
+    # Filter announcements to this symbol so NSE-wide noise doesn't leak in.
+    sym_u = symbol.upper()
+    symbol_announcements = [
+        a for a in (corp_actions or [])
+        if (a.get("symbol") or "").upper() == sym_u
+    ]
     contributions, fno_sig, fii_sig = _score_all(
         tech, delivery_pct, fii_dii, options, rs_rank, pchg_1d,
         news=news, fundamentals=fundamentals, weekly_tech=weekly_tech,
         weights=weights, regime=regime, sector=sector, horizon=horizon,
+        announcements=symbol_announcements,
     )
     weighted = sum(c.score * c.weight for c in contributions)
 
@@ -605,6 +655,37 @@ async def generate_recommendation(
         except Exception as e:
             logger.debug("llm judge skipped for %s: %s", symbol, e)
 
+    # Meta-labeling: gate conviction by secondary classifier's p(win).
+    # No-op when the model hasn't been trained yet (returns None).
+    try:
+        from app.services.ml_meta_label import meta_label_probability
+        rec_payload = {
+            "action": rec.action,
+            "signals": rec.signals,
+            "weighted_score": rec.weighted_score,
+            "factor_agreement": rec.factor_agreement,
+            "conviction": rec.conviction,
+            "entry": rec.entry, "stoploss": rec.stoploss, "target1": rec.target1,
+            "regime": rec.regime,
+        }
+        p_meta = meta_label_probability(rec_payload)
+        if p_meta is not None and rec.action in ("BUY", "SELL"):
+            # Conviction × p_meta with a 0.5 floor (don't fully veto on a
+            # weak prior — let the multi-factor stack still speak). Below
+            # p_meta=0.45 we demote to HOLD; above 0.55 we keep BUY/SELL.
+            scaled = int(round(rec.conviction * max(0.5, min(1.5, p_meta * 2))))
+            new_action = rec.action if p_meta >= 0.45 else "HOLD"
+            rec = rec.model_copy(update={
+                "conviction": max(0, min(100, scaled)),
+                "action": new_action,
+                "calibration_note": (
+                    f"{rec.calibration_note} Meta-label p(win)={p_meta:.2f} → "
+                    f"conviction {rec.conviction} → {scaled}."
+                ),
+            })
+    except Exception as e:
+        logger.debug("meta-label gating skipped for %s: %s", symbol, e)
+
     await cache_manager.set(cache_key, rec.model_dump(mode="json"), ttl=_HORIZON_TTL[horizon])
     # Persist to the outcome tracker (no-op for HOLD/AVOID). Fire-and-forget
     # — tracker failures must not break the recommendation surface.
@@ -663,7 +744,120 @@ async def generate_batch(
 
     results = await asyncio.gather(*(_one(s) for s in symbols))
     recs = [r for r in results if r is not None]
-    return _diversify_by_sector(recs), errors
+    # Cross-sectional rerank: re-score each rec's conviction with a
+    # blended absolute + cross-sectional score so picks reflect
+    # *relative* strength across the batch. Largest single documented
+    # edge improvement on factor systems (+3–5pp win rate, Asness/
+    # Stockopedia/Fama-French). Only meaningful when batch >= 10.
+    try:
+        recs = _apply_cross_sectional_rank(recs)
+    except Exception as e:
+        logger.debug("cross-sectional rerank skipped: %s", e)
+    diversified = _diversify_by_sector(recs)
+    # Portfolio-level risk pass: correlation, VaR, exposure budget.
+    # Best-effort — failures fall back to sector-only diversification.
+    try:
+        diversified = await _apply_portfolio_risk(diversified)
+    except Exception as e:
+        logger.debug("portfolio risk pass skipped: %s", e)
+    return diversified, errors
+
+
+async def _apply_portfolio_risk(recs: list[Recommendation]) -> list[Recommendation]:
+    """Enforce correlation + VaR + exposure caps across the basket.
+
+    Pulls 60d daily history per symbol (cached by data_fetcher), builds
+    a returns matrix, then defers to `portfolio_risk.enforce_exposure_budget`.
+    Picks the engine wants to demote get their `action` flipped to HOLD
+    and a reason appended.
+    """
+    from app.services.portfolio_risk import enforce_exposure_budget
+
+    syms = [r.symbol for r in recs if r.action in ("BUY", "SELL")]
+    if not syms:
+        return recs
+
+    # Fetch returns in parallel — cheap because data_fetcher caches.
+    async def _ret(sym: str) -> tuple[str, list[float]]:
+        try:
+            df = await async_fetch_history(sym, period="3mo", interval="1d")
+            if df is None or df.empty:
+                return sym, []
+            prices = df["Close"].dropna().tolist()
+            from app.services.portfolio_risk import _pct_returns
+            return sym, _pct_returns(prices)
+        except Exception:
+            return sym, []
+
+    rets_pairs = await asyncio.gather(*(_ret(s) for s in syms))
+    returns_by_symbol = {s: r for s, r in rets_pairs if r}
+
+    plain = [r.model_dump() for r in recs]
+    result = enforce_exposure_budget(plain, returns_by_symbol=returns_by_symbol)
+    demoted_syms = {d["symbol"]: d.get("demotion_reason", "portfolio_cap") for d in result["demoted"]}
+    ctx = result["portfolio_context"]
+
+    out: list[Recommendation] = []
+    for r in recs:
+        if r.symbol in demoted_syms and r.action in ("BUY", "SELL"):
+            reason = demoted_syms[r.symbol]
+            r = r.model_copy(update={
+                "action": "HOLD",
+                "reasons": [*r.reasons, f"Portfolio risk cap ({reason}) — demoted to HOLD."],
+                "portfolio_context": ctx,
+            })
+        else:
+            r = r.model_copy(update={"portfolio_context": ctx})
+        out.append(r)
+    return out
+
+
+def _apply_cross_sectional_rank(recs: list[Recommendation]) -> list[Recommendation]:
+    """Re-score conviction with a blended absolute + cross-sectional score.
+
+    Builds the {symbol: {factor: score}} matrix from each rec's
+    `signals` list, calls `cross_sectional_rank`, then updates each
+    rec's `weighted_score`, `action`, and `conviction`. Sector/risk
+    diversification still runs downstream.
+    """
+    from app.services.cross_sectional import (
+        cross_sectional_rank,
+        blend_absolute_and_cross_sectional,
+    )
+    if len(recs) < 10:
+        return recs
+
+    factor_matrix: dict[str, dict[str, float]] = {}
+    for r in recs:
+        factor_matrix[r.symbol] = {c.name: float(c.score) for c in (r.signals or [])}
+    # Use the first rec's actual weights — they're all the same regime.
+    first_weights = {c.name: float(c.weight) for c in (recs[0].signals or [])}
+    cs = cross_sectional_rank(factor_matrix, weights=first_weights)
+
+    out: list[Recommendation] = []
+    for r in recs:
+        info = cs.get(r.symbol) or {}
+        cs_score = float(info.get("cross_sectional_score") or 0.0)
+        rank = info.get("rank")
+        blended = blend_absolute_and_cross_sectional(
+            r.weighted_score, cs_score, cs_weight=0.4,
+        )
+        # Re-derive action + conviction from the blended score.
+        new_action = action_from_score(blended, regime=r.regime or "neutral")
+        new_conviction, agreement, _note = calibrated_conviction(
+            blended, r.signals, risk_reward=r.risk_reward, regime=r.regime or "neutral",
+        )
+        out.append(r.model_copy(update={
+            "weighted_score": round(blended, 4),
+            "action": new_action,
+            "conviction": new_conviction,
+            "factor_agreement": agreement,
+            "calibration_note": (
+                f"{r.calibration_note} Cross-sectional rerank: rank {rank}/{len(recs)}, "
+                f"cs_score {cs_score:+.3f} blended at 40% weight."
+            ),
+        }))
+    return out
 
 
 # Tunable: at most this many directional (BUY/SELL) picks per sector.

@@ -134,6 +134,13 @@ async def lifespan(app: FastAPI):
     if factors_seeded:
         logger.info("Dynamic factor weighting active: %d factors loaded", factors_seeded)
 
+    # Learned per-regime weight vectors (logistic fit from realised PnL).
+    # Falls back to hardcoded priors when insufficient outcomes exist.
+    from app.services.recommendation_tuner import seed_learned_weights
+    weights_seeded = await seed_learned_weights()
+    if weights_seeded:
+        logger.info("Learned factor weights loaded: %d regime profiles", weights_seeded)
+
     # Load weekly-backtest-derived edge overrides so the cards reflect the
     # latest autonomous run from the very first request after restart.
     from app.services.signal_edge import seed_edge_overrides
@@ -201,10 +208,15 @@ _ROUTE_TIMEOUTS: list[tuple[str, str | None, int]] = [
     ("/api/stocks/", "/ai-analysis", 120),
     ("/api/recommendations", None, 90),
     ("/api/market/context", None, 45),
-    # Trigger is async — returns 202 in <1s with a job_id. Progress is
-    # polled via /api/market/scan/status. Generous-but-tight 10s for the
-    # spawn itself; the actual work runs detached.
-    ("/api/scan/trigger", None, 10),
+    # Trigger is async — returns 202 in <1s with a job_id and the work runs
+    # detached. The spawn itself is O(ms), but if the event loop is briefly
+    # saturated by an in-flight scan we want headroom; match the 30s used by
+    # /api/scan/status so behaviour is symmetric and matches the client.
+    ("/api/scan/trigger", None, 30),
+    # Status is read-only in-memory state — should respond in <1s. Give
+    # it an explicit 30s ceiling to match the frontend poll timeout and
+    # prevent the 60s default from masking a stuck event loop.
+    ("/api/scan/status", None, 30),
     ("/api/backtest/", None, 120),
 ]
 

@@ -481,6 +481,41 @@ def detect_macd_divergence(
     return None
 
 
+def _classify_regime(tech: dict) -> str:
+    """Same rule the walk-forward uses (ADX≥22 + price/SMA50/SMA200 alignment).
+
+    Kept local to avoid a circular import; mirrors
+    `backtester_walk_forward._regime_at_bar`.
+    """
+    if not tech:
+        return "sideways"
+    adx = tech.get("adx") or 0
+    ma = tech.get("moving_averages") or {}
+    sma50 = ma.get("sma50")
+    sma200 = ma.get("sma200")
+    price = tech.get("current_price")
+    if not (price and sma50):
+        return "sideways"
+    if adx < 22:
+        return "sideways"
+    if sma200:
+        if price > sma50 > sma200:
+            return "trend_up"
+        if price < sma50 < sma200:
+            return "trend_down"
+    return "trend_up" if price > sma50 else "trend_down"
+
+
+def _is_muted_universal_only(stype: str) -> bool:
+    """True only for the always-muted list (helps distinguish regime kills
+    from universal mutes when surfacing metadata to the UI)."""
+    try:
+        from app.services.signal_edge import is_muted
+        return is_muted(stype)
+    except Exception:
+        return False
+
+
 def _get_signal_weight(signal_type: str, direction: str) -> float:
     """Return dynamic weight for a signal type based on historical win rate.
 
@@ -725,17 +760,66 @@ def scan_symbol(
 
             signals.append(psig)
 
+    # ── Walk-forward-driven mute list ────────────────────────────────────
+    # Drop signals whose OOS edge is negative across thousands of trades.
+    # These setups are still useful as visual context (the UI surfaces them
+    # via `metadata.muted_by_edge`) but they don't contribute to scoring
+    # or trade selection. Source: signal_edge.RECOMMENDED_MUTES, refreshed
+    # 2026-05-21 from the 37k-trade walk-forward run.
+    from app.services.signal_edge import is_muted as _is_muted
+    pre_mute_count = len(signals)
+    kept_after_mute: list[dict] = []
+    for sig in signals:
+        if _is_muted(sig.get("signal_type", "")):
+            sig["metadata"] = sig.get("metadata") or {}
+            sig["metadata"]["muted_by_edge"] = True
+            # Mark strength to 0 so any downstream sort/filter ignores it,
+            # but keep the row so the UI can still surface the pattern as
+            # informational context.
+            sig["strength"] = 0
+            continue
+        kept_after_mute.append(sig)
+    if pre_mute_count != len(kept_after_mute):
+        logger.debug(
+            "edge mutes: dropped %d/%d signals (%s)",
+            pre_mute_count - len(kept_after_mute), pre_mute_count, symbol,
+        )
+    signals = kept_after_mute
+
     signals = _apply_backtest_edge_filters(signals)
 
+    # Compute the regime once for this scan — same rule the walk-forward
+    # used (ADX≥22 + price/SMA50/SMA200 alignment) so the kill/promote
+    # tables built from that backtest apply consistently.
+    regime = _classify_regime(technicals)
+
     # ── Dynamic signal weighting (boost proven signals, suppress poor ones) ─
+    # Three multipliers stack: live performance / static edge weight,
+    # universal promotion bonus, plus the regime-stratified kill/promote.
+    from app.services.signal_edge import signal_weight_multiplier
+    kept_after_regime: list[dict] = []
     for sig in signals:
         stype = sig.get("signal_type", "")
         sdir = sig.get("direction", "neutral")
-        if sdir != "neutral":
-            weight = _get_signal_weight(stype, sdir)
-            if weight != 1.0:
-                new_strength = max(1, min(10, round(sig["strength"] * weight)))
-                sig["strength"] = new_strength
+        if sdir == "neutral":
+            kept_after_regime.append(sig)
+            continue
+        regime_mult = signal_weight_multiplier(stype, sdir, regime=regime)
+        # Drop signals killed by regime-stratified rules.
+        if regime_mult == 0.0 and not _is_muted_universal_only(stype):
+            sig["metadata"] = sig.get("metadata") or {}
+            sig["metadata"]["killed_by_regime"] = regime
+            continue
+        weight = _get_signal_weight(stype, sdir) * regime_mult
+        if weight != 1.0:
+            new_strength = max(1, min(10, round(sig["strength"] * weight)))
+            sig["strength"] = new_strength
+            if regime_mult > 1.0:
+                sig["metadata"] = sig.get("metadata") or {}
+                sig["metadata"]["promoted_by_edge"] = True
+                sig["metadata"]["promoted_in_regime"] = regime
+        kept_after_regime.append(sig)
+    signals = kept_after_regime
 
     # ── Multi-signal confluence detection ────────────────────────────────────
     # Backtest of 2026-05-07 (25k signals) showed bullish confluence was
