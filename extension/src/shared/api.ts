@@ -124,17 +124,27 @@ export const api = {
     ),
 
   // Performance
-  getPerformanceSummary: () =>
-    request<{ data: { total_evaluated: number; total_wins: number; win_rate: number; avg_pnl_pct: number } }>("/api/performance/summary"),
+  getPerformanceSummary: (windowDays: number = 30) =>
+    request<{
+      data: {
+        total_evaluated: number;
+        total_wins: number;
+        win_rate: number;
+        avg_pnl_pct: number;
+        window_days: number | null;
+        last_evaluated_at: string | null;
+      };
+    }>(`/api/performance/summary?window_days=${windowDays}`),
 
-  // Manual scan (120s timeout — scan now fetches FII/DII, VIX, delivery volume, RS, etc.)
-  // Scan is asynchronous: POST returns 202 + job_id in <1s, then the client
-  // polls `getScanStatus()` until status is "completed" or "failed". This
-  // avoids HTTP timeouts on real scans which run 160-200s. See watchScan().
+  // Manual scan is asynchronous: POST returns 202 + job_id quickly, then the
+  // client polls `getScanStatus()` until status is "completed" or "failed".
+  // Both trigger and status get 30s — the spawn and the read-only status
+  // snapshot are O(ms) work, but the event loop is briefly saturated by the
+  // concurrent scan workers, so a tight 10s ceiling produces spurious aborts.
   triggerScan: () =>
-    request<ScanTriggerResponse>("/api/scan/trigger", { method: "POST" }, 10_000),
+    request<ScanTriggerResponse>("/api/scan/trigger", { method: "POST" }, 30_000),
   getScanStatus: () =>
-    request<ScanStatus>("/api/scan/status", {}, 10_000),
+    request<ScanStatus>("/api/scan/status", {}, 30_000),
 
   // ── Tier 1/2/3 added bindings ───────────────────────────────────────
   getNews: (limit = 20) =>

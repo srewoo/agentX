@@ -18,6 +18,20 @@ interface DashboardProps {
 }
 
 type ActionFilter = "ALL" | "BUY" | "SELL" | "HOLD";
+
+function formatRelative(iso: string): string {
+  const then = new Date(iso).getTime();
+  if (!Number.isFinite(then)) return "";
+  const diffMs = Date.now() - then;
+  const mins = Math.floor(diffMs / 60_000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs}h ago`;
+  const days = Math.floor(hrs / 24);
+  return `${days}d ago`;
+}
+
 type TimeframeFilter = "ALL" | "Intraday" | "Swing" | "Long-term";
 
 interface PerformanceSummary {
@@ -25,6 +39,8 @@ interface PerformanceSummary {
   total_wins: number;
   win_rate: number;
   avg_pnl_pct: number;
+  window_days: number | null;
+  last_evaluated_at: string | null;
 }
 
 interface MarketContext {
@@ -227,14 +243,31 @@ export default function Dashboard({ onSelectSymbol }: DashboardProps = {}) {
       // for a slow yfinance day).
       await api.triggerScan();
       const deadline = Date.now() + 6 * 60_000;
+      // Tolerate a few consecutive status-poll failures — the scan worker
+      // can briefly saturate the event loop and produce transient timeouts;
+      // aborting the whole scan on the first one is too harsh.
+      let consecutiveStatusErrors = 0;
+      const MAX_STATUS_ERRORS = 5;
       while (Date.now() < deadline) {
         await new Promise((r) => setTimeout(r, 2000));
-        const status = await api.getScanStatus();
-        setScanProgress(status);
-        if (status.status === "completed") break;
-        if (status.status === "failed") {
-          console.warn("[agentX] Scan failed:", status.error);
-          break;
+        try {
+          const status = await api.getScanStatus();
+          consecutiveStatusErrors = 0;
+          setScanProgress(status);
+          if (status.status === "completed") break;
+          if (status.status === "failed") {
+            console.warn("[agentX] Scan failed:", status.error);
+            break;
+          }
+        } catch (pollErr) {
+          consecutiveStatusErrors += 1;
+          if (consecutiveStatusErrors >= MAX_STATUS_ERRORS) {
+            throw pollErr;
+          }
+          console.warn(
+            `[agentX] Scan status poll failed (${consecutiveStatusErrors}/${MAX_STATUS_ERRORS}):`,
+            pollErr instanceof Error ? pollErr.message : pollErr,
+          );
         }
       }
       setCleared(false);
@@ -302,9 +335,22 @@ export default function Dashboard({ onSelectSymbol }: DashboardProps = {}) {
         </div>
       </div>
 
-      {/* Performance summary */}
+      {/* Performance summary — rolling window so numbers move as outcomes
+          evaluate. Lifetime aggregates barely shift once n grows past a
+          few thousand, which made the bar feel static. */}
       {perfSummary && (
-        <div className="flex items-center justify-center gap-3 px-3 py-1.5 border-b border-border bg-zinc-900/40 text-[11px]">
+        <div
+          className="flex items-center justify-center gap-3 px-3 py-1.5 border-b border-border bg-zinc-900/40 text-[11px]"
+          title={
+            perfSummary.last_evaluated_at
+              ? `Last evaluation: ${new Date(perfSummary.last_evaluated_at).toLocaleString()}`
+              : undefined
+          }
+        >
+          <span className="text-zinc-500">
+            {perfSummary.window_days ? `Last ${perfSummary.window_days}d` : "All-time"}
+          </span>
+          <span className="text-zinc-600">·</span>
           <span>
             Win Rate:{" "}
             <span className={perfSummary.win_rate >= 50 ? "text-profit font-medium" : "text-loss font-medium"}>
@@ -322,6 +368,14 @@ export default function Dashboard({ onSelectSymbol }: DashboardProps = {}) {
           <span className="text-zinc-400">
             Evaluated: {perfSummary.total_evaluated}
           </span>
+          {perfSummary.last_evaluated_at && (
+            <>
+              <span className="text-zinc-600">·</span>
+              <span className="text-zinc-500">
+                updated {formatRelative(perfSummary.last_evaluated_at)}
+              </span>
+            </>
+          )}
         </div>
       )}
 

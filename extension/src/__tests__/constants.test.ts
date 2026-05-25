@@ -61,6 +61,21 @@ describe("constants", () => {
     it("should default to Swing for unknown signal types", () => {
       expect(getSignalTimeframe("unknown_signal", 5)).toBe("Swing");
     });
+
+    it("should promote high-strength multi-bar patterns to Long-term", () => {
+      expect(getSignalTimeframe("head_and_shoulders", 7)).toBe("Swing");
+      expect(getSignalTimeframe("head_and_shoulders", 8)).toBe("Long-term");
+      expect(getSignalTimeframe("double_top", 8)).toBe("Long-term");
+      expect(getSignalTimeframe("inverse_head_and_shoulders", 9)).toBe("Long-term");
+      expect(getSignalTimeframe("consolidation_breakout", 8)).toBe("Long-term");
+    });
+
+    it("should promote high-strength candle patterns to Swing", () => {
+      expect(getSignalTimeframe("bullish_engulfing", 6)).toBe("Intraday");
+      expect(getSignalTimeframe("bullish_engulfing", 7)).toBe("Swing");
+      expect(getSignalTimeframe("gap_down", 7)).toBe("Swing");
+      expect(getSignalTimeframe("hammer", 8)).toBe("Swing");
+    });
   });
 
   describe("LLM_MODELS", () => {

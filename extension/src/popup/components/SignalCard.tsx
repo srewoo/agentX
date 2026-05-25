@@ -138,8 +138,18 @@ export default function SignalCard({ signal, onRead, onDismiss }: Props) {
       .catch(() => { /* fallback to heuristic remains */ });
   }, [expanded, atr, signal.symbol, exchange]);
 
-  const action = DIRECTION_ACTION[signal.direction] || "HOLD";
-  const actionColor = ACTION_COLORS[action] || "#F59E0B";
+  // Layer-1 (rule-based) action — what the deterministic engine produced.
+  const ruleAction = DIRECTION_ACTION[signal.direction] || "HOLD";
+  // Layer-2 (LLM judge) overrides:
+  //  - "drop": LLM disagreed, force HOLD so the user doesn't act on it.
+  //  - "downgrade": LLM kept the direction but flagged it as low-conviction —
+  //    keep the rule action but mute the colour so it doesn't read as a
+  //    confident BUY/SELL.
+  //  - "keep" / null: trust the rule engine, render normally.
+  const action = signal.llm_verdict === "drop" ? "HOLD" : ruleAction;
+  const baseActionColor = ACTION_COLORS[action] || "#F59E0B";
+  const actionColor = signal.llm_verdict === "downgrade" ? "#9CA3AF" : baseActionColor;
+  const actionDemoted = signal.llm_verdict === "drop" || signal.llm_verdict === "downgrade";
   const timeframe = getSignalTimeframe(signal.signal_type, signal.strength);
   const label = SIGNAL_TYPE_LABELS[signal.signal_type] || signal.signal_type;
   const plan = computeRiskPlan(signal, atr, settings);
@@ -210,24 +220,34 @@ export default function SignalCard({ signal, onRead, onDismiss }: Props) {
       onClick={handleExpand}
       onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); handleExpand(); } }}
     >
-      {/* Row 1: Symbol + BUY/SELL/HOLD badge + time */}
-      <div className="flex items-center justify-between mb-2">
-        <div className="flex items-center gap-2.5">
+      {/* Row 1: Symbol + BUY/SELL/HOLD badge + time. flex-wrap so the LLM
+          verdict chip doesn't crash into the right-hand timestamp/strength
+          bars on narrow cards (3-up grid in standalone popup). */}
+      <div className="flex items-center justify-between gap-2 mb-2 flex-wrap">
+        <div className="flex items-center gap-2 flex-wrap min-w-0">
           {!signal.read && (
             <span className="w-2 h-2 rounded-full bg-brand-light flex-shrink-0" aria-hidden="true" />
           )}
           <span className="font-bold text-base text-zinc-100">{signal.symbol}</span>
 
-          {/* BUY / SELL / HOLD badge */}
+          {/* BUY / SELL / HOLD badge — respects llm_verdict overrides */}
           <span
-            className="text-xs font-bold px-2 py-0.5 rounded-md border"
+            className="text-xs font-bold px-2 py-0.5 rounded-md border whitespace-nowrap"
             style={{
               color: actionColor,
               borderColor: `${actionColor}40`,
               backgroundColor: `${actionColor}15`,
             }}
+            title={
+              signal.llm_verdict === "drop"
+                ? `LLM judge overrode rule (${ruleAction}) → HOLD. ${signal.llm_reason || "Low-conviction context."}`
+                : signal.llm_verdict === "downgrade"
+                  ? `LLM judge kept ${ruleAction} but flagged low-conviction. ${signal.llm_reason || ""}`
+                  : undefined
+            }
           >
             {action}
+            {actionDemoted && <span className="ml-1 opacity-70">↓</span>}
           </span>
 
           {/* Timeframe tag */}
@@ -235,26 +255,37 @@ export default function SignalCard({ signal, onRead, onDismiss }: Props) {
             {timeframe}
           </span>
 
-          {/* Layer-2 LLM judge verdict — present only when llm_judging_enabled.
-              KEEP renders as a quiet endorsement; DOWNGRADE/DROP are louder so
-              the user sees that the LLM disagreed with the rule. */}
+          {/* Layer-2 LLM judge verdict — compact chip so it fits next to the
+              symbol/action/timeframe on a 3-up grid. Colour conveys verdict;
+              the leading "AI" tag + glyph keeps it scannable without the
+              verbose "LLM: DOWNGRADE" string that previously wrapped. */}
           {signal.llm_verdict && (
             <span
-              className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border ${
+              className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border whitespace-nowrap leading-none inline-flex items-center gap-1 ${
                 signal.llm_verdict === "drop"
                   ? "bg-red-500/15 text-red-400 border-red-500/30"
                   : signal.llm_verdict === "downgrade"
                     ? "bg-amber-500/15 text-amber-400 border-amber-500/30"
                     : "bg-emerald-500/10 text-emerald-400 border-emerald-500/30"
               }`}
-              title={signal.llm_reason || "LLM reviewed this signal"}
+              title={
+                signal.llm_reason ||
+                (signal.llm_verdict === "drop"
+                  ? "LLM judge: drop this signal"
+                  : signal.llm_verdict === "downgrade"
+                    ? "LLM judge: low conviction"
+                    : "LLM judge endorsed this signal")
+              }
             >
-              LLM: {signal.llm_verdict.toUpperCase()}
+              <span className="opacity-60">AI</span>
+              <span>
+                {signal.llm_verdict === "drop" ? "✕" : signal.llm_verdict === "downgrade" ? "↓" : "✓"}
+              </span>
             </span>
           )}
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-shrink-0">
           {isStale(signal.created_at, signal.read) && (
             <span
               className="text-[10px] font-semibold px-1.5 py-0.5 rounded border bg-amber-500/10 text-amber-400 border-amber-500/30"
@@ -263,7 +294,7 @@ export default function SignalCard({ signal, onRead, onDismiss }: Props) {
               STALE
             </span>
           )}
-          <span className="text-xs text-zinc-500">{timeAgo(signal.created_at)}</span>
+          <span className="text-xs text-zinc-500 whitespace-nowrap">{timeAgo(signal.created_at)}</span>
           {/* Strength bar */}
           <div className="flex gap-0.5">
             {Array.from({ length: 5 }).map((_, i) => (

@@ -92,10 +92,48 @@ export const DIRECTION_COLORS: Record<string, string> = {
 
 /**
  * Resolve the display timeframe for a signal.
- * Centralised here to avoid duplicating the breakout-strength override in multiple components.
+ *
+ * Beyond the static type → timeframe table we promote high-conviction
+ * patterns to longer horizons, because the same chart pattern at
+ * strength 9 implies a multi-week setup, not the 1–5 day "Swing" hold
+ * its base type suggests. Without this, the Long-term tab was almost
+ * always empty (only cup_and_handle / 52w extremes ever landed there).
+ *
+ * Promotion rules:
+ *   - High-strength multi-bar reversal/continuation patterns → Long-term
+ *   - High-strength swing patterns → still Swing (no demotion to Intraday)
+ *   - Single-day candle patterns never promote past Swing
  */
+const _LONG_TERM_PROMOTION_AT_STRENGTH_8: ReadonlySet<string> = new Set([
+  "breakout",
+  "head_and_shoulders",
+  "inverse_head_and_shoulders",
+  "double_top",
+  "double_bottom",
+  "consolidation_breakout",
+]);
+
+const _SWING_PROMOTION_AT_STRENGTH_7: ReadonlySet<string> = new Set([
+  // Intraday candle patterns escalate to Swing on a strong reading —
+  // they tend to play out over 2–4 sessions when conviction is high.
+  "bullish_engulfing",
+  "bearish_engulfing",
+  "hammer",
+  "shooting_star",
+  "gap_up",
+  "gap_down",
+]);
+
 export function getSignalTimeframe(signalType: string, strength: number): "Intraday" | "Swing" | "Long-term" {
+  // Legacy override kept for explicit breakout/strength=7 coverage.
   if (signalType === "breakout" && strength >= 7) return "Long-term";
+
+  if (strength >= 8 && _LONG_TERM_PROMOTION_AT_STRENGTH_8.has(signalType)) {
+    return "Long-term";
+  }
+  if (strength >= 7 && _SWING_PROMOTION_AT_STRENGTH_7.has(signalType)) {
+    return "Swing";
+  }
   return SIGNAL_TIMEFRAME[signalType] ?? "Swing";
 }
 
