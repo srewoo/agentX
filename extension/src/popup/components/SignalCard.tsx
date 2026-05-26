@@ -7,6 +7,7 @@ import { getSettings, saveSettings } from "../../shared/storage";
 import { paperTrades } from "../../shared/localStore";
 import { getEdgeFor } from "../../shared/edgeCache";
 import MiniChart from "./MiniChart";
+import SignalChatDrawer from "./SignalChatDrawer";
 
 interface Props {
   signal: Signal;
@@ -113,6 +114,7 @@ const TIMEFRAME_STYLE: Record<string, string> = {
 export default function SignalCard({ signal, onRead, onDismiss }: Props) {
   const exchange = useExchange();
   const [expanded, setExpanded] = useState(false);
+  const [chatOpen, setChatOpen] = useState(false);
   const [tradeAdded, setTradeAdded] = useState(false);
   const [muteMsg, setMuteMsg] = useState<string | null>(null);
   const [atr, setAtr] = useState<number | null>(
@@ -641,9 +643,21 @@ export default function SignalCard({ signal, onRead, onDismiss }: Props) {
                 className="text-zinc-500 hover:text-loss px-1">
                 Dismiss
               </button>
+              <button
+                aria-label="Ask agentX"
+                onClick={(e) => { e.stopPropagation(); setChatOpen(true); }}
+                className="px-2 py-0.5 rounded border border-emerald-700 text-emerald-300 hover:text-emerald-100">
+                Ask agentX
+              </button>
             </div>
           </div>
         </div>
+      )}
+      {chatOpen && (
+        <SignalChatDrawer
+          signalId={signal.id}
+          onClose={() => setChatOpen(false)}
+        />
       )}
     </div>
   );

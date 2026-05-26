@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../../shared/api";
 import type { PerformanceByTypeRow, BacktestRun } from "../../shared/types";
+import CohortPanel from "../components/CohortPanel";
 
 /**
  * Performance — read-only view over the orchestrator's self-tracked outcomes.
@@ -78,6 +79,12 @@ export default function Performance() {
 
   return (
     <div className="overflow-y-auto h-full p-3 space-y-4 text-zinc-200">
+      <div>
+        <h3 className="text-xs font-semibold text-zinc-400 uppercase tracking-wider mb-1.5">
+          Since rule change (cohort)
+        </h3>
+        <CohortPanel />
+      </div>
       <div>
         <h3 className="text-xs font-semibold text-zinc-400 uppercase tracking-wider mb-1.5">
           Live tracked outcomes

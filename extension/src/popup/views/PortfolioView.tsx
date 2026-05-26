@@ -2,6 +2,7 @@ import { usePortfolio } from "../hooks/usePortfolio";
 import { CardSkeleton } from "../layout/Skeleton";
 import { EmptyState } from "../layout/EmptyState";
 import { formatINRPrecise, formatPct, pctColorClass } from "../lib/format";
+import RiskDashboard from "../components/RiskDashboard";
 
 export default function PortfolioView() {
   const { data, isLoading, error } = usePortfolio();
@@ -37,6 +38,13 @@ export default function PortfolioView() {
 
   return (
     <div className="p-3 space-y-3">
+      <div
+        className="p-3 rounded-lg border"
+        style={{ background: "var(--bg-panel)", borderColor: "var(--border-default)" }}
+      >
+        <div className="text-[11px] tk-text-muted uppercase tracking-wider mb-1">Risk heat (open paper book)</div>
+        <RiskDashboard />
+      </div>
       <div
         className="p-3 rounded-lg border"
         style={{ background: "var(--bg-panel)", borderColor: "var(--border-default)" }}

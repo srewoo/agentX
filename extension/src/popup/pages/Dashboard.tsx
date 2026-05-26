@@ -4,6 +4,7 @@ import { Disclaimer } from "../components/Disclaimer";
 import TodaysPlan from "../components/TodaysPlan";
 import NewsPanel from "../components/NewsPanel";
 import InsightsCard from "../components/InsightsCard";
+import LiveMacroSnapshot from "../components/LiveMacroSnapshot";
 import { useSignals } from "../hooks/useSignals";
 import { useAudioAlerts } from "../hooks/useAudioAlerts";
 import { api } from "../../shared/api";
@@ -399,6 +400,8 @@ export default function Dashboard({ onSelectSymbol }: DashboardProps = {}) {
           )}
         </div>
       )}
+
+      <LiveMacroSnapshot />
 
       <div className="responsive-top">
         {/* Agent insights — recommendations from the autonomous loop */}

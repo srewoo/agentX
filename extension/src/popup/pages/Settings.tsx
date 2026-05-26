@@ -5,6 +5,7 @@ import type { AppSettings } from "../../shared/types";
 import { downloadFile } from "../../shared/localStore";
 import { saveSettings, getSettings } from "../../shared/storage";
 import { api } from "../../shared/api";
+import BrokerPanel from "../components/BrokerPanel";
 
 // Sensitive keys to scrub from JSON exports
 const SENSITIVE_EXPORT = new Set([
@@ -91,6 +92,12 @@ export default function Settings() {
   return (
     <div className="flex flex-col h-full">
       <div className="flex-1 overflow-y-auto px-3 py-3 space-y-4">
+
+        {/* Broker connection */}
+        <section>
+          <h3 className="text-xs font-semibold text-zinc-400 uppercase tracking-wider mb-2">Broker</h3>
+          <BrokerPanel />
+        </section>
 
         {/* Alert Settings */}
         <section>
