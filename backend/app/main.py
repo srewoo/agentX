@@ -415,6 +415,24 @@ app.include_router(alerts.router)
 app.include_router(screener.router)
 app.include_router(backtest.router)
 
+try:
+    from app.routers import options as options_router
+    app.include_router(options_router.router)
+except Exception as _e:
+    logging.getLogger(__name__).debug("options router not mounted: %s", _e)
+
+try:
+    from app.routers import signal_chat as signal_chat_router
+    app.include_router(signal_chat_router.router)
+except Exception as _e:
+    logging.getLogger(__name__).debug("signal_chat router not mounted: %s", _e)
+
+try:
+    from app.routers import broker as broker_router
+    app.include_router(broker_router.router)
+except Exception as _e:
+    logging.getLogger(__name__).debug("broker router not mounted: %s", _e)
+
 # Newly added routers
 if portfolio_router is not None:
     app.include_router(portfolio_router.router)

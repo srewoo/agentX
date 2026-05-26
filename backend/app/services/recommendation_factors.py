@@ -256,3 +256,48 @@ def entry_sl_targets(
     if direction_up:
         return price, max(0.01, price - sl_m * atr), price + t1_m * atr, price + t2_m * atr
     return price, price + sl_m * atr, max(0.01, price - t1_m * atr), max(0.01, price - t2_m * atr)
+
+
+def options_positioning_score(
+    options: Optional[dict[str, Any]],
+    *,
+    current_price: Optional[float] = None,
+    max_pain: Optional[float] = None,
+    uoa_direction: Optional[str] = None,
+    uoa_z: Optional[float] = None,
+) -> tuple[float, Optional[float], str]:
+    """Composite options-positioning score, in [-1, 1].
+
+    Inputs are optional — we degrade gracefully when any one is missing.
+    Combines:
+
+    * Max-pain distance — spot below max-pain tends to drift up into expiry
+      week and vice-versa. Effect strongest within 5 sessions of expiry.
+    * PCR direction — handled in fno_score; here we lightly reuse it as a
+      tie-breaker on signs.
+    * UOA flag — z-scored unusual options activity (call-side surge =
+      bullish; put-side = bearish).
+
+    Returns (score, distance_pct_or_None, direction_label).
+    """
+    score = 0.0
+    distance_pct: Optional[float] = None
+    if current_price and max_pain and max_pain > 0:
+        distance_pct = round((current_price - max_pain) / max_pain * 100.0, 2)
+        # Spot well *below* max pain → pin-up bias on expiry approach.
+        # Clamp to ±5% — beyond that the pin theory weakens because
+        # writers can't anchor that far.
+        bounded = max(-5.0, min(5.0, distance_pct))
+        score += -bounded / 5.0 * 0.6  # ±0.6 contribution
+
+    if options and isinstance(options.get("pcr_oi"), (int, float)):
+        pcr = float(options["pcr_oi"])
+        # PCR > 1 = more puts → contrarian bullish; PCR < 1 = call-heavy → bearish.
+        score += clip((pcr - 1.0) / 0.5) * 0.2
+
+    if uoa_direction in ("bullish", "bearish") and uoa_z is not None:
+        z = clip(uoa_z / 3.0)  # 3-sigma → full weight
+        score += (z if uoa_direction == "bullish" else -z) * 0.2
+
+    score = clip(score)
+    return score, distance_pct, _direction(score)

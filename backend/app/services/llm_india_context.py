@@ -166,6 +166,37 @@ SEASONALITY (apply when adjacent to these dates):
 # Helper: assemble the briefing per layer
 # ─────────────────────────────────────────────────────────────────────────
 
+async def briefing_async(
+    *,
+    include_flow: bool = True,
+    include_sector: bool = True,
+    include_red_flags: bool = True,
+    include_seasonality: bool = False,
+    include_live_snapshot: bool = True,
+) -> str:
+    """Async variant — prepends today's live macro snapshot ahead of the static playbook.
+
+    Prefer this over `briefing()` for any async-context LLM caller (judge,
+    debate, multi-perspective, analyst) so the model reasons against
+    today's FII/DII/VIX/USDINR/Brent rather than abstract rules.
+    """
+    base = briefing(
+        include_flow=include_flow,
+        include_sector=include_sector,
+        include_red_flags=include_red_flags,
+        include_seasonality=include_seasonality,
+    )
+    if not include_live_snapshot:
+        return base
+    try:
+        from app.services.market_snapshot import get_live_briefing_block
+        live = await get_live_briefing_block()
+        return f"{live}\n\n{base}"
+    except Exception:
+        # Snapshot must never break the prompt path.
+        return base
+
+
 def briefing(
     *,
     include_flow: bool = True,

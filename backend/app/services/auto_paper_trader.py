@@ -114,6 +114,49 @@ async def auto_open_from_recommendations(
         candidates.append((conv, rr, r))
     candidates.sort(key=lambda t: (-t[0], -t[1]))
 
+    # Snapshot open positions ONCE for correlation + risk-gate evaluation —
+    # the gate needs PortfolioState, and we don't want to hit the DB per
+    # candidate inside the loop.
+    open_positions_rows: list[dict] = []
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT symbol, direction, entry_price, position_size, shares "
+                "FROM paper_trades WHERE status='open'"
+            ) as cur:
+                open_positions_rows = [dict(r) for r in await cur.fetchall()]
+    except Exception:
+        open_positions_rows = []
+
+    # Capital floor for the risk gate: best-effort from settings, fallback 100k.
+    capital = 100_000.0
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                "SELECT value FROM settings WHERE key='paper_capital'"
+            ) as cur:
+                row = await cur.fetchone()
+                if row and row[0]:
+                    capital = float(row[0])
+    except Exception:
+        pass
+
+    # Lazy-import these so missing modules don't break the existing path.
+    try:
+        from app.services.risk_gate import (
+            TradeCandidate, PortfolioState, evaluate_trade, GateVerdict,
+        )
+        _risk_gate_available = True
+    except Exception:
+        _risk_gate_available = False
+
+    try:
+        from app.services.portfolio_correlation import correlation_to_open
+        _corr_available = True
+    except Exception:
+        _corr_available = False
+
     skip_counts: dict[str, int] = {}
     for conv, rr, r in candidates:
         if len(opened) >= budget:
@@ -133,6 +176,53 @@ async def auto_open_from_recommendations(
             continue
         # Strength = floor of conviction/10, clamped 1..10.
         strength = max(1, min(10, int(conv // 10)))
+
+        # ── pre-trade correlation check (≥ 0.7 to most-correlated open) ──
+        max_corr = 0.0
+        if _corr_available and open_positions_rows:
+            try:
+                open_syms = [p["symbol"] for p in open_positions_rows if p.get("symbol") and p["symbol"] != sym]
+                if open_syms:
+                    corr = await correlation_to_open(sym, open_syms)
+                    if isinstance(corr, dict):
+                        max_corr = float(corr.get("max_correlation") or 0.0)
+                    elif isinstance(corr, (int, float)):
+                        max_corr = float(corr)
+            except Exception:
+                max_corr = 0.0
+        if max_corr >= 0.7:
+            skip_counts["correlated_to_open"] = skip_counts.get("correlated_to_open", 0) + 1
+            logger.info("REJECTED auto-open %s: corr %.2f >= 0.70 against open book", sym, max_corr)
+            continue
+
+        # ── hard 10-rule risk gate ──
+        if _risk_gate_available:
+            try:
+                candidate = TradeCandidate(
+                    symbol=sym,
+                    direction=direction,
+                    entry=entry,
+                    stop=sl,
+                    target=tgt,
+                    qty=max(1, int(getattr(r, "shares", 0) or r.get("shares") or 1)),
+                    sector=str(getattr(r, "sector", "") or r.get("sector") or "Unknown"),
+                )
+                portfolio = PortfolioState(
+                    capital=capital,
+                    open_positions=open_positions_rows,
+                    correlation_to_open=max_corr,
+                )
+                gate = evaluate_trade(candidate, portfolio)
+                if gate.verdict == GateVerdict.REJECTED:
+                    skip_counts["risk_gate_rejected"] = skip_counts.get("risk_gate_rejected", 0) + 1
+                    logger.info("REJECTED auto-open %s by risk_gate: %s", sym, "; ".join(gate.reasons))
+                    continue
+                if gate.verdict == GateVerdict.MODIFIED and gate.modified_qty is not None:
+                    # The gate trimmed our size — propagate downstream.
+                    strength = max(1, min(strength, gate.modified_qty))
+            except Exception as e:
+                logger.debug("risk_gate evaluation skipped for %s: %s", sym, e)
+
         try:
             trade = await create_paper_trade(
                 symbol=sym,

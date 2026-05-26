@@ -304,6 +304,11 @@ async def _run_perspective(
         f'"red_flags":["risk1","risk2"]}}'
     )
     try:
+        try:
+            from app.services.market_snapshot import get_live_briefing_block
+            prompt = f"{await get_live_briefing_block()}\n\n{prompt}"
+        except Exception:
+            pass
         raw = await call_llm(
             provider=provider, model=model, api_key=api_key,
             prompt=prompt,
@@ -352,6 +357,11 @@ async def _run_synthesiser(
         f'"consensus":"strong_confirm|confirm|mixed|contradict|strong_contradict"}}'
     )
     try:
+        try:
+            from app.services.market_snapshot import get_live_briefing_block
+            prompt = f"{await get_live_briefing_block()}\n\n{prompt}"
+        except Exception:
+            pass
         raw = await call_llm(
             provider=provider, model=model, api_key=api_key,
             prompt=prompt,

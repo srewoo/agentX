@@ -373,6 +373,154 @@ async def performance_insights():
     return {"insights": insights, "count": len(insights)}
 
 
+def _wilson_lower_bound(wins: int, total: int, z: float = 1.96) -> float:
+    """Wilson score interval lower bound for a binomial proportion.
+
+    We surface this on the cohort dashboard so a 60% WR over 5 outcomes
+    isn't confused with the same WR over 500. Returns 0..100 as a percent.
+    """
+    if total <= 0:
+        return 0.0
+    p = wins / total
+    denom = 1 + z * z / total
+    centre = p + z * z / (2 * total)
+    margin = z * (((p * (1 - p) + z * z / (4 * total)) / total) ** 0.5)
+    return round(max(0.0, (centre - margin) / denom) * 100.0, 2)
+
+
+@router.get("/cohort")
+async def performance_cohort(since: Optional[str] = None):
+    """Per-signal-type WR / avg PnL / Wilson lower bound for outcomes since a date.
+
+    `since` should be ISO YYYY-MM-DD. Defaults to 2026-05-26 (post conviction
+    overhaul + mute rollout) so the dashboard reflects post-rule-change
+    behaviour without lifetime contamination.
+    """
+    import aiosqlite
+    from app.database import DB_PATH
+
+    floor = (since or "2026-05-26")
+    # Normalise: accept either YYYY-MM-DD or full ISO; we string-compare against
+    # entry_time which is stored as ISO timestamp.
+    try:
+        # Validate by parsing — raises if user passes garbage.
+        datetime.fromisoformat(floor.replace("Z", "+00:00")) if "T" in floor else datetime.strptime(floor, "%Y-%m-%d")
+    except Exception:
+        raise HTTPException(status_code=400, detail="since must be YYYY-MM-DD or ISO timestamp")
+
+    rows: list[dict[str, Any]] = []
+    totals = {"total": 0, "wins": 0, "losses": 0, "expired": 0, "open": 0, "pnl_sum": 0.0}
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """
+                SELECT signal_type, direction,
+                       COUNT(*) AS total,
+                       SUM(CASE WHEN outcome='win'    THEN 1 ELSE 0 END) AS wins,
+                       SUM(CASE WHEN outcome='loss'   THEN 1 ELSE 0 END) AS losses,
+                       SUM(CASE WHEN outcome='expired' THEN 1 ELSE 0 END) AS expired,
+                       SUM(CASE WHEN outcome='open' OR outcome IS NULL THEN 1 ELSE 0 END) AS open_cnt,
+                       AVG(CASE WHEN pnl_pct IS NOT NULL THEN pnl_pct END) AS avg_pnl
+                FROM signal_outcomes
+                WHERE entry_time >= ?
+                GROUP BY signal_type, direction
+                ORDER BY total DESC
+                """,
+                (floor,),
+            ) as cur:
+                async for r in cur:
+                    total = int(r["total"] or 0)
+                    wins = int(r["wins"] or 0)
+                    losses = int(r["losses"] or 0)
+                    resolved = wins + losses
+                    wr = round((wins / resolved) * 100.0, 2) if resolved else 0.0
+                    rows.append({
+                        "signal_type": r["signal_type"],
+                        "direction": r["direction"],
+                        "total": total,
+                        "wins": wins,
+                        "losses": losses,
+                        "expired": int(r["expired"] or 0),
+                        "open": int(r["open_cnt"] or 0),
+                        "win_rate": wr,
+                        "wilson_lb": _wilson_lower_bound(wins, resolved),
+                        "avg_pnl_pct": round(float(r["avg_pnl"] or 0.0), 2),
+                    })
+                    totals["total"] += total
+                    totals["wins"] += wins
+                    totals["losses"] += losses
+                    totals["expired"] += int(r["expired"] or 0)
+                    totals["open"] += int(r["open_cnt"] or 0)
+                    if r["avg_pnl"] is not None:
+                        totals["pnl_sum"] += float(r["avg_pnl"]) * total
+
+            # Recommendation-side cohort (tracked BUY/SELL only).
+            reco = {"total": 0, "wins": 0, "losses": 0, "expired": 0, "open": 0}
+            async with db.execute(
+                """
+                SELECT COUNT(*) AS total,
+                       SUM(CASE WHEN outcome='win'    THEN 1 ELSE 0 END) AS wins,
+                       SUM(CASE WHEN outcome='loss'   THEN 1 ELSE 0 END) AS losses,
+                       SUM(CASE WHEN outcome='expired' THEN 1 ELSE 0 END) AS expired,
+                       SUM(CASE WHEN outcome IS NULL  THEN 1 ELSE 0 END) AS open_cnt
+                FROM recommendation_outcomes
+                WHERE created_at >= ?
+                  AND action IN ('BUY','SELL')
+                  AND COALESCE(tracked,1) = 1
+                """,
+                (floor,),
+            ) as cur:
+                r = await cur.fetchone()
+                if r:
+                    reco = {
+                        "total": int(r["total"] or 0),
+                        "wins": int(r["wins"] or 0),
+                        "losses": int(r["losses"] or 0),
+                        "expired": int(r["expired"] or 0),
+                        "open": int(r["open_cnt"] or 0),
+                    }
+
+            # Engine considered (HOLD/AVOID, tracked=false) — visibility into
+            # what the engine looked at but didn't act on.
+            async with db.execute(
+                """
+                SELECT COUNT(*) AS held
+                FROM recommendation_outcomes
+                WHERE created_at >= ? AND COALESCE(tracked,1) = 0
+                """,
+                (floor,),
+            ) as cur:
+                r = await cur.fetchone()
+                considered_holds = int(r["held"] or 0) if r else 0
+    except Exception as e:
+        logger.exception("cohort query failed: %s", e)
+        raise HTTPException(status_code=500, detail="cohort query failed")
+
+    resolved = totals["wins"] + totals["losses"]
+    overall_wr = round((totals["wins"] / resolved) * 100.0, 2) if resolved else 0.0
+    reco_resolved = reco["wins"] + reco["losses"]
+    reco_wr = round((reco["wins"] / reco_resolved) * 100.0, 2) if reco_resolved else 0.0
+
+    return {
+        "since": floor,
+        "signals": {
+            "by_type": rows,
+            "totals": {
+                **totals,
+                "win_rate": overall_wr,
+                "wilson_lb": _wilson_lower_bound(totals["wins"], resolved),
+            },
+        },
+        "recommendations": {
+            **reco,
+            "win_rate": reco_wr,
+            "wilson_lb": _wilson_lower_bound(reco["wins"], reco_resolved),
+            "considered_holds": considered_holds,
+        },
+    }
+
+
 @router.post("/evaluate")
 async def trigger_evaluation():
     """Manually trigger evaluation of signal outcomes."""

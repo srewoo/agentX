@@ -8,7 +8,7 @@ on each slice, and measures how well signals predicted future price movement.
 Uses yfinance (free) via the existing data_fetcher. No LLM calls.
 """
 import logging
-from typing import Any
+from typing import Any, Optional
 
 import pandas as pd
 
@@ -30,6 +30,69 @@ BEARISH = "bearish"
 # Indian market round-trip transaction costs (brokerage + STT + SEBI + stamp duty)
 # Brokerage ~0.03% + STT 0.1% sell + SEBI/stamp ~0.015% ≈ 0.20% round-trip
 TRANSACTION_COST_PCT = 0.20
+
+
+def _evaluate_outcome_realistic(
+    direction: str,
+    entry_price: float,
+    future_price: float,
+    *,
+    qty: int = 1,
+    segment: str = "cash",
+    avg_daily_volume: Optional[float] = None,
+    apply_slippage: bool = True,
+) -> dict[str, Any]:
+    """Net P&L per `execution_costs.apply_costs` (real Indian-market brokerage +
+    STT + DP + exchange + GST + slippage).
+
+    Returns `pnl_pct` (net), `gross_pnl_pct`, `costs_pct` and the usual
+    win/neutral flags. Use this in lieu of `_evaluate_outcome` whenever
+    realistic post-cost performance is required (cohort dashboard, Monte
+    Carlo, drawdown stress).
+    """
+    if entry_price <= 0:
+        return {"pnl_pct": 0.0, "gross_pnl_pct": 0.0, "costs_pct": 0.0, "win": False, "neutral": False}
+    if direction not in (BULLISH, BEARISH):
+        raw_pnl = abs((future_price - entry_price) / entry_price * 100.0)
+        return {"pnl_pct": round(raw_pnl, 4), "gross_pnl_pct": round(raw_pnl, 4), "costs_pct": 0.0, "win": False, "neutral": True}
+
+    from app.services.execution_costs import apply_costs, simulate_slippage_fill
+
+    if apply_slippage:
+        entry_fill = simulate_slippage_fill(
+            bar_open=entry_price,
+            direction=direction,
+            avg_daily_volume=avg_daily_volume,
+        )
+    else:
+        entry_fill = entry_price
+
+    # For BEARISH we model as a short — swap entry/exit so apply_costs's
+    # buy/sell legs map correctly to "sell-then-buy-back".
+    if direction == BULLISH:
+        res = apply_costs(
+            entry=entry_fill, exit=future_price, qty=qty, segment=segment,
+            avg_daily_volume=avg_daily_volume,
+        )
+        notional = entry_fill * qty
+        net_pct = (res["net_pnl"] / notional) * 100.0 if notional else 0.0
+        gross_pct = (res["gross_pnl"] / notional) * 100.0 if notional else 0.0
+    else:
+        res = apply_costs(
+            entry=future_price, exit=entry_fill, qty=qty, segment=segment,
+            avg_daily_volume=avg_daily_volume,
+        )
+        notional = entry_fill * qty
+        net_pct = (res["net_pnl"] / notional) * 100.0 if notional else 0.0
+        gross_pct = (res["gross_pnl"] / notional) * 100.0 if notional else 0.0
+
+    return {
+        "pnl_pct": round(net_pct, 4),
+        "gross_pnl_pct": round(gross_pct, 4),
+        "costs_pct": round(gross_pct - net_pct, 4),
+        "win": net_pct > 0,
+        "neutral": False,
+    }
 
 
 def _evaluate_outcome(

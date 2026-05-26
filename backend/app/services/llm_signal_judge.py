@@ -142,6 +142,13 @@ async def judge_signals(
 
     expected_ids = {c["id"] for c in candidates}
     prompt = _build_prompt(candidates)
+    # Prepend today's live macro snapshot so the LLM grounds judgment in
+    # current FII/DII/VIX/USDINR/Brent rather than the static playbook alone.
+    try:
+        from app.services.market_snapshot import get_live_briefing_block
+        prompt = f"{await get_live_briefing_block()}\n\n{prompt}"
+    except Exception:
+        pass
     fallback = _build_fallback_chain(settings, provider)
 
     # Budget: per-candidate ~60 output tokens (id+verdict+short reason) plus

@@ -39,7 +39,13 @@ from app.services.market_data import (
     get_india_vix, get_vix_adjusted_thresholds, get_upcoming_results_dates,
     get_option_chain_analysis, refresh_earnings_calendar,
 )
-from app.services.market_regime import detect_market_regime
+from app.services.market_regime import (
+    detect_market_regime,
+    detect_market_regime_v2,
+    note_regime_observation,
+    factor_bias_for_regime,
+    is_regime_muted,
+)
 from app.services.recommendation_calibration import run_large_scale_calibration
 
 logger = logging.getLogger(__name__)
@@ -458,6 +464,28 @@ async def run_scan_cycle() -> list[dict]:
             if regime == "Volatile" and risk_mode == "aggressive":
                 risk_mode = "balanced"
                 logger.info("Volatile regime detected — auto-upgrading aggressive to balanced risk mode")
+
+            # 4-state v2 regime — used by the recommendation engine and the
+            # signal filter below. Track transitions so we can widen
+            # conviction thresholds for 5 sessions after a regime change.
+            try:
+                v2 = detect_market_regime_v2(nifty_df, vix=india_vix)
+                regime_v2 = v2.get("state", "unknown")
+                trans = note_regime_observation(regime_v2)
+                logger.info(
+                    "Regime v2: %s (conf=%d, %s; sessions_in_regime=%d, conv_mult=%.2f)",
+                    regime_v2, v2.get("confidence", 0), v2.get("why", ""),
+                    trans.get("sessions_in_regime", 0),
+                    trans.get("conviction_multiplier", 1.0),
+                )
+                # Stash on the local namespace for use further down the
+                # pipeline (signal filter + recommendation generation).
+                scan_thresholds["_regime_v2"] = regime_v2  # type: ignore[index]
+                scan_thresholds["_regime_conviction_multiplier"] = (
+                    trans.get("conviction_multiplier", 1.0)
+                )
+            except Exception as _e:
+                logger.debug("Regime v2 detection skipped: %s", _e)
     except Exception as e:
         logger.debug("Regime detection failed (non-critical): %s", e)
 
@@ -703,6 +731,25 @@ async def run_scan_cycle() -> list[dict]:
     # Filter by risk mode
     filtered = filter_by_risk_mode(all_signals, risk_mode)
 
+    # ── Regime-directional mutes ──────────────────────────────────────────
+    # Drop signals whose (regime, type, direction) combination historically
+    # fails — e.g. bull breakouts in trend_down or any bull momentum in panic.
+    _regime_v2_state = scan_thresholds.get("_regime_v2") if isinstance(scan_thresholds, dict) else None
+    if _regime_v2_state and _regime_v2_state not in (None, "unknown"):
+        kept: list[dict] = []
+        muted_count = 0
+        for sig in filtered:
+            if is_regime_muted(_regime_v2_state, sig.get("signal_type", ""), sig.get("direction", "")):
+                muted_count += 1
+                continue
+            kept.append(sig)
+        if muted_count:
+            logger.info(
+                "Regime mute (%s): dropped %d signals matching REGIME_DIRECTIONAL_MUTES",
+                _regime_v2_state, muted_count,
+            )
+        filtered = kept
+
     # Sort by strength desc; watchlist signals get priority boost
     for sig in filtered:
         if sig["symbol"] in watchlist_set:
@@ -796,14 +843,16 @@ async def run_scan_cycle() -> list[dict]:
             logger.warning("LLM judge layer failed (non-critical): %s", e)
 
     # Layer-3 (optional): bull/bear/judge debate over the strongest signals.
-    # Gated on debate_enabled. Runs *after* the Layer-2 judge so dropped
-    # signals (the LLM already vetoed them) don't waste extra LLM budget.
+    # Gated on debate_enabled AND strength >= 7 — strength 5-6 stays
+    # judge-only to keep cost flat. Burning 3× LLM calls on a borderline
+    # signal isn't worth it; only invest where the signal is already strong.
     try:
         from app.services.llm_debate import debate_top_signals, is_debate_enabled
         if is_debate_enabled(db_settings):
-            # Skip already-dropped signals — no point debating something the
-            # Layer-2 judge already vetoed.
-            debate_pool = [s for s in filtered if s.get("llm_verdict") != "drop"]
+            debate_pool = [
+                s for s in filtered
+                if s.get("llm_verdict") != "drop" and s.get("strength", 0) >= 7
+            ]
             debate_results = await debate_top_signals(debate_pool, db_settings)
             for sig in filtered:
                 r = debate_results.get(sig["id"])
@@ -825,7 +874,13 @@ async def run_scan_cycle() -> list[dict]:
             analyse_top_signals, is_multi_perspective_enabled,
         )
         if is_multi_perspective_enabled(db_settings):
-            mp_pool = [s for s in filtered if s.get("llm_verdict") != "drop"]
+            # Strength >= 9 only — 5-call MP analysis is reserved for the
+            # highest-conviction setups. See 9pt.md #3 for the gating
+            # ladder (5-6: judge; 7-8: +debate; 9-10: +MP).
+            mp_pool = [
+                s for s in filtered
+                if s.get("llm_verdict") != "drop" and s.get("strength", 0) >= 9
+            ]
             mp_results = await analyse_top_signals(mp_pool, db_settings)
             for sig in filtered:
                 mpa = mp_results.get(sig["id"])

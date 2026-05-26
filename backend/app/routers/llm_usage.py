@@ -58,6 +58,39 @@ async def _aggregate(conn, since_iso: str) -> dict:
     }
 
 
+async def _by_layer(conn, since_iso: str) -> list[dict]:
+    """Per-layer (route) cost breakdown — surfaces which LLM stage costs most.
+
+    Routes are tagged by call_llm callers: signal_judge, debate_arg,
+    debate_judge, perspective_*, perspective_synth, deep_analyst, etc.
+    """
+    cursor = await conn.execute(
+        """
+        SELECT
+          COALESCE(route, 'unknown')                          AS route,
+          COUNT(*)                                            AS calls,
+          COALESCE(SUM(prompt_tokens + completion_tokens), 0) AS tokens,
+          COALESCE(SUM(cost_usd), 0)                          AS cost_usd
+        FROM llm_usage
+        WHERE ts >= ?
+        GROUP BY route
+        ORDER BY cost_usd DESC
+        LIMIT 50
+        """,
+        (since_iso,),
+    )
+    rows = await cursor.fetchall()
+    return [
+        {
+            "route": r[0],
+            "calls": int(r[1] or 0),
+            "tokens": int(r[2] or 0),
+            "costUsd": round(float(r[3] or 0.0), 6),
+        }
+        for r in rows
+    ]
+
+
 async def _by_provider(conn, since_iso: str) -> list[dict]:
     cursor = await conn.execute(
         """
@@ -96,6 +129,8 @@ async def get_llm_usage() -> dict:
         today = await _aggregate(conn, day_start)
         mtd = await _aggregate(conn, month_start)
         by_provider = await _by_provider(conn, month_start)
+        by_layer_today = await _by_layer(conn, day_start)
+        by_layer_mtd = await _by_layer(conn, month_start)
 
     cap_remaining = max(cap_usd - today["costUsd"], 0.0) if cap_usd > 0 else 0.0
 
@@ -105,5 +140,7 @@ async def get_llm_usage() -> dict:
         "capUsd": round(cap_usd, 4),
         "capRemainingUsd": round(cap_remaining, 6),
         "byProvider": by_provider,
+        "byLayerToday": by_layer_today,
+        "byLayerMtd": by_layer_mtd,
         "usdInrRate": _usd_inr(),
     }

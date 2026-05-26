@@ -25,6 +25,7 @@ import pandas as pd
 
 from app.services.backtester import (
     BULLISH, BEARISH, MIN_LOOKBACK, TRANSACTION_COST_PCT, _evaluate_outcome,
+    _evaluate_outcome_realistic,
 )
 from app.services.data_fetcher import MAJOR_STOCKS, async_fetch_history
 from app.services.signal_engine import scan_symbol
@@ -158,16 +159,27 @@ async def _scan_fold(
                 if fut < total_bars:
                     fp = safe_float(close_values[fut])
                     if fp:
-                        # Pass the per-trade realistic cost in lieu of the
-                        # flat 0.20% default — small-caps now pay more, big
-                        # liquid names pay less.
-                        res = _evaluate_outcome(
-                            row["direction"], entry, fp,
-                            transaction_cost_pct=rt_cost,
-                        )
+                        # Net-of-cost via apply_costs (brokerage + STT + DP +
+                        # slippage). Falls back to the legacy flat-cost
+                        # evaluator if any input is malformed.
+                        try:
+                            res = _evaluate_outcome_realistic(
+                                row["direction"], entry, fp,
+                                qty=1,
+                                segment="cash",
+                                avg_daily_volume=adv_inr_i / max(entry, 1.0) if adv_inr_i else None,
+                            )
+                        except Exception:
+                            res = _evaluate_outcome(
+                                row["direction"], entry, fp,
+                                transaction_cost_pct=rt_cost,
+                            )
                         row[f"pnl_{w}d"] = res["pnl_pct"]
                         row[f"win_{w}d"] = res["win"]
                         row[f"neutral_{w}d"] = res["neutral"]
+                        if "gross_pnl_pct" in res:
+                            row[f"gross_pnl_{w}d"] = res["gross_pnl_pct"]
+                            row[f"costs_pct_{w}d"] = res["costs_pct"]
             out.append(row)
     return out
 
@@ -193,6 +205,36 @@ def _fold_metrics(trades: list[dict[str, Any]], eval_windows: list[int]) -> dict
         # given this many samples". A high point estimate with n=10 should
         # have a low lower bound, killing the "100% on n=26" red flag.
         metrics[f"win_rate_lb95_{w}d"] = _wilson_lb(wins, evaluated)
+
+        # Monte Carlo over signal order — robustness check on the WR/Sharpe
+        # point estimates. p5 < 45% suggests the strategy is fragile and
+        # might be a lucky chronological draw rather than real edge.
+        try:
+            from app.services.execution_costs import monte_carlo_signal_order
+            mc = monte_carlo_signal_order(pnls)
+            metrics[f"mc_wr_p5_{w}d"] = mc.get("wr_p5")
+            metrics[f"mc_wr_p50_{w}d"] = mc.get("wr_p50")
+            metrics[f"mc_wr_p95_{w}d"] = mc.get("wr_p95")
+            metrics[f"mc_sharpe_p5_{w}d"] = mc.get("sharpe_p5")
+        except Exception:
+            pass
+
+        # Worst peak-to-trough equity drawdown across the chronological
+        # sequence. Negative number; -0.25 = 25% drawdown.
+        if pnls:
+            equity = []
+            cum = 0.0
+            for p in pnls:
+                cum += p / 100.0
+                equity.append(cum)
+            peak = equity[0]
+            max_dd = 0.0
+            for v in equity:
+                peak = max(peak, v)
+                dd = v - peak
+                if dd < max_dd:
+                    max_dd = dd
+            metrics[f"max_dd_chronological_{w}d"] = round(max_dd, 4)
     return metrics
 
 

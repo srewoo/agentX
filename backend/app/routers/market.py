@@ -322,3 +322,16 @@ async def scan_status():
     Safe to poll at 1-2s intervals.
     """
     return await get_scan_status()
+
+
+@router.get("/snapshot")
+async def market_snapshot_endpoint(force: bool = False):
+    """Today's macro tuple (NIFTY/FII/DII/VIX/USDINR/Brent) used by LLM prompts.
+
+    The same data is injected into every LLM call. Surfaced via API so the
+    extension can display it in the Live tab and so manual debugging can
+    confirm what the model was actually told.
+    """
+    from app.services.market_snapshot import get_market_snapshot, snapshot_to_dict
+    snap = await get_market_snapshot(force_refresh=force)
+    return {"data": snapshot_to_dict(snap), "briefing": snap.to_briefing_block()}

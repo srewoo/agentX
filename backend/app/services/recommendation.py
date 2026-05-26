@@ -41,6 +41,7 @@ from app.services.recommendation_factors import (
     entry_sl_targets,
     fii_dii_score,
     fno_score,
+    options_positioning_score,
     fundamentals_score,
     momentum_score,
     news_sentiment_score,
@@ -64,25 +65,27 @@ WEIGHTS_CALM: dict[str, float] = {
     "trend": 0.16,
     "momentum": 0.12,
     "volume_delivery": 0.12,
-    "fno_oi": 0.12,
+    "fno_oi": 0.06,              # halved — overlaps with new options_positioning
     "fii_dii": 0.08,
     "rel_strength": 0.08,
-    "news_sentiment": 0.06,
+    "news_sentiment": 0.04,      # -0.02 → options
     "volatility": 0.04,
-    "fundamentals": 0.10,        # NEW — quality gate
-    "weekly_trend": 0.12,        # NEW — higher-TF confirmation
+    "fundamentals": 0.10,
+    "weekly_trend": 0.12,
+    "options_positioning": 0.08, # NEW — max-pain + UOA + PCR composite
 }
 WEIGHTS_RISK_OFF: dict[str, float] = {
     "trend": 0.12,
     "momentum": 0.06,
-    "volume_delivery": 0.16,     # delivery % matters more in fear
-    "fno_oi": 0.10,
-    "fii_dii": 0.12,             # foreign flow drives risk-off swings
+    "volume_delivery": 0.16,
+    "fno_oi": 0.06,              # halved — overlaps with new options_positioning
+    "fii_dii": 0.12,
     "rel_strength": 0.12,
     "news_sentiment": 0.04,
     "volatility": 0.06,
-    "fundamentals": 0.14,        # quality compounders survive fear
+    "fundamentals": 0.14,
     "weekly_trend": 0.08,
+    "options_positioning": 0.04, # smaller weight in risk-off (less reliable in panic)
 }
 for _w in (WEIGHTS_CALM, WEIGHTS_RISK_OFF):
     assert abs(sum(_w.values()) - 1.0) < 1e-9, f"weights must sum to 1: {sum(_w.values())}"
@@ -115,14 +118,31 @@ def _select_weights(india_vix: Optional[float], regime: Optional[str] = None) ->
     """
     is_risk_off = regime == "risk_off" or (india_vix is not None and india_vix > 18.0)
     regime_key = "risk_off" if is_risk_off else "calm"
+    base: Optional[dict[str, float]] = None
     try:
         from app.services.recommendation_tuner import get_learned_weights
         learned = get_learned_weights(regime_key) or get_learned_weights("all")
         if learned and set(learned) == set(WEIGHTS_CALM):
-            return learned
+            base = learned
     except Exception as e:  # tuner is best-effort; never break recs over this
         logger.debug("learned-weights lookup failed: %s", e)
-    return WEIGHTS_RISK_OFF if is_risk_off else WEIGHTS_CALM
+    if base is None:
+        base = WEIGHTS_RISK_OFF if is_risk_off else WEIGHTS_CALM
+
+    # Apply 4-state regime bias (ADR-5: per-regime factor mix). The bias
+    # multiplies factor weights, then we renormalise so the vector sums to
+    # 1.0 — preserves the contract for downstream scorers.
+    if regime in {"trend_up", "trend_down", "range_bound", "panic"}:
+        try:
+            from app.services.market_regime import factor_bias_for_regime
+            bias = factor_bias_for_regime(regime)
+            if bias:
+                tilted = {k: max(0.0, v * bias.get(k, 1.0)) for k, v in base.items()}
+                total = sum(tilted.values()) or 1.0
+                base = {k: v / total for k, v in tilted.items()}
+        except Exception as e:
+            logger.debug("regime-bias application skipped: %s", e)
+    return base
 
 _HORIZON_TO_DAYS: dict[Horizon, int] = {"intraday": 1, "swing": 10, "positional": 60}
 _HORIZON_TO_PERIOD: dict[Horizon, str] = {"intraday": "5d", "swing": "6mo", "positional": "1y"}
@@ -231,6 +251,20 @@ def _score_all(
     s_m, v_m, d_m = momentum_score(tech)
     s_v, v_v, d_v = volume_delivery_score(tech, delivery_pct)
     s_f, v_f, d_f, fno_sig = fno_score(options, pchg_1d)
+    # Options-positioning composite (max-pain distance + PCR + UOA z-score).
+    # Pulls max_pain / current_price / UOA fields from the `options` dict if
+    # the caller has populated them. Gracefully degrades when absent.
+    _max_pain = (options or {}).get("max_pain") if isinstance(options, dict) else None
+    _current_price = (options or {}).get("underlying_price") if isinstance(options, dict) else None
+    _uoa_dir = (options or {}).get("uoa_direction") if isinstance(options, dict) else None
+    _uoa_z = (options or {}).get("uoa_z") if isinstance(options, dict) else None
+    s_op, v_op, d_op = options_positioning_score(
+        options,
+        current_price=_current_price,
+        max_pain=_max_pain,
+        uoa_direction=_uoa_dir,
+        uoa_z=_uoa_z,
+    )
     s_fi, v_fi, d_fi, fii_sig = fii_dii_score(fii_dii)
     s_r, v_r, d_r = rs_score(rs_rank)
     s_atr, v_atr, d_atr = volatility_score(tech)
@@ -264,6 +298,7 @@ def _score_all(
         SignalContribution(name="volatility", weight=_w("volatility"), value=v_atr, score=s_atr, direction=d_atr),
         SignalContribution(name="fundamentals", weight=_w("fundamentals"), value=v_fund, score=s_fund, direction=d_fund),
         SignalContribution(name="weekly_trend", weight=_w("weekly_trend"), value=v_wk, score=s_wk, direction=d_wk),
+        SignalContribution(name="options_positioning", weight=_w("options_positioning"), value=v_op, score=s_op, direction=d_op),
     ]
     return contributions, fno_sig, fii_sig
 
@@ -336,6 +371,18 @@ def calibrated_conviction(
         multiplier *= 0.90
     elif regime in {"trend_up", "trend_down"}:
         multiplier *= 1.05
+
+    # After a regime transition, widen all conviction thresholds by 25%
+    # for 5 sessions (ADR-5). Implemented as: divide computed conviction by
+    # the widening multiplier — fewer setups qualify until the new regime
+    # settles. Falls back to 1.0 when no recent transition.
+    try:
+        from app.services.market_regime import get_recent_transition_multiplier
+        widening = get_recent_transition_multiplier()
+        if widening and widening > 1.0:
+            multiplier = multiplier / widening
+    except Exception:
+        pass
 
     conviction = max(0, min(100, int(round(base * multiplier))))
     note = (

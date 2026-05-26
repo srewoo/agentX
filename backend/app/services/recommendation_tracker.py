@@ -52,6 +52,10 @@ _TRACKER_COLUMNS: dict[str, str] = {
     "weighted_score": "REAL",
     "factor_agreement": "REAL",
     "data_quality": "TEXT",
+    # tracked=0 means the engine considered the rec but action was HOLD/AVOID;
+    # outcome evaluator skips these, but the cohort dashboard counts them so
+    # we can see what the engine almost-took.
+    "tracked": "INTEGER DEFAULT 1",
 }
 
 
@@ -84,8 +88,11 @@ async def store_recommendation(rec) -> None:
     rec is directional (BUY or SELL). HOLD / AVOID are skipped — they have
     no entry to evaluate and would drag the dataset.
     """
-    if rec is None or rec.action not in ("BUY", "SELL"):
+    if rec is None:
         return
+    if rec.action not in ("BUY", "SELL", "HOLD", "AVOID"):
+        return
+    tracked = 1 if rec.action in ("BUY", "SELL") else 0
     await _ensure_tracker_columns()
     rec_id = f"{rec.symbol}:{rec.horizon}:{rec.generated_at.isoformat()}"
     signals_json = json.dumps([
@@ -98,14 +105,15 @@ async def store_recommendation(rec) -> None:
                 """INSERT OR IGNORE INTO recommendation_outcomes
                    (rec_id, symbol, horizon, action, conviction, entry, stoploss,
                     target1, timeframe_days, signals_json, sector, created_at,
-                    regime, weighted_score, factor_agreement, data_quality)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    regime, weighted_score, factor_agreement, data_quality, tracked)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     rec_id, rec.symbol, rec.horizon, rec.action, rec.conviction,
                     float(rec.entry), float(rec.stoploss), float(rec.target1),
                     int(rec.timeframe_days), signals_json, rec.sector,
                     rec.generated_at.isoformat(),
                     rec.regime, rec.weighted_score, rec.factor_agreement, rec.data_quality,
+                    tracked,
                 ),
             )
             await db.commit()
@@ -136,7 +144,9 @@ async def evaluate_recommendation_outcomes() -> dict[str, Any]:
             """SELECT rec_id, symbol, action, entry, stoploss, target1,
                       timeframe_days, created_at
                FROM recommendation_outcomes
-               WHERE outcome IS NULL"""
+               WHERE outcome IS NULL
+                 AND COALESCE(tracked, 1) = 1
+                 AND action IN ('BUY','SELL')"""
         ) as cur:
             unresolved = await cur.fetchall()
 

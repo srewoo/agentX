@@ -99,6 +99,14 @@ def is_debate_enabled(settings: dict[str, Any]) -> bool:
     return val in ("true", "1", "yes", "on")
 
 
+async def _live_macro_prefix() -> str:
+    try:
+        from app.services.market_snapshot import get_live_briefing_block
+        return await get_live_briefing_block() + "\n\n"
+    except Exception:
+        return ""
+
+
 def _argument_prompt(side: str, signal: dict) -> str:
     return (
         f"SIGNAL UNDER REVIEW (JSON):\n"
@@ -134,10 +142,11 @@ async def _argue_one_side(
     fallback: list,
 ) -> Optional[DebateArgument]:
     system_message = _BULL_PROMPT if side == "bull" else _BEAR_PROMPT
+    live = await _live_macro_prefix()
     try:
         raw = await call_llm(
             provider=provider, model=model, api_key=api_key,
-            prompt=_argument_prompt(side, signal),
+            prompt=live + _argument_prompt(side, signal),
             system_message=system_message,
             fallback_chain=fallback,
             route="debate_arg",
@@ -181,10 +190,11 @@ async def debate_signal(
         return None
 
     # Judge depends on both sides.
+    live = await _live_macro_prefix()
     try:
         raw = await call_llm(
             provider=provider, model=model, api_key=api_key,
-            prompt=_judge_prompt(signal, bull, bear),
+            prompt=live + _judge_prompt(signal, bull, bear),
             system_message=_JUDGE_PROMPT,
             fallback_chain=fallback,
             route="debate_judge",

@@ -197,4 +197,126 @@ export const api = {
     request<{ runs: BacktestRun[]; count: number }>(
       `/api/performance/backtest-history?limit=${limit}`
     ),
+
+  // ── 9pt.md additions ─────────────────────────────────────────────────
+
+  // #1 Cohort dashboard — WR/avg PnL/Wilson LB since a date floor.
+  getCohort: (since?: string) =>
+    request<{
+      since: string;
+      signals: {
+        by_type: Array<{
+          signal_type: string; direction: string; total: number;
+          wins: number; losses: number; expired: number; open: number;
+          win_rate: number; wilson_lb: number; avg_pnl_pct: number;
+        }>;
+        totals: { total: number; wins: number; losses: number; expired: number;
+          open: number; win_rate: number; wilson_lb: number };
+      };
+      recommendations: { total: number; wins: number; losses: number;
+        expired: number; open: number; win_rate: number; wilson_lb: number;
+        considered_holds: number };
+    }>(`/api/performance/cohort${since ? `?since=${encodeURIComponent(since)}` : ""}`),
+
+  // #2 Live market snapshot (FII/DII/VIX/USDINR/Brent + sector rotation).
+  getMarketSnapshot: (force = false) =>
+    request<{
+      data: {
+        as_of: string;
+        nifty_close: number | null; nifty_pct: number | null;
+        bank_nifty_close: number | null; bank_nifty_pct: number | null;
+        india_vix: number | null; usd_inr: number | null; brent_usd: number | null;
+        fii_net_cr: number | null; dii_net_cr: number | null;
+        sector_rotation: string | null;
+        sector_movers: Array<{ sector: string; pct5d: number }>;
+        stale: boolean;
+      };
+      briefing: string;
+    }>(`/api/market/snapshot${force ? "?force=true" : ""}`),
+
+  // #3 Per-layer LLM cost telemetry.
+  getLlmUsage: () =>
+    request<{
+      today: { tokens: number; costUsd: number; costInr: number };
+      mtd: { tokens: number; costUsd: number; costInr: number };
+      capUsd: number; capRemainingUsd: number;
+      byProvider: Array<{ provider: string; tokens: number; costUsd: number }>;
+      byLayerToday: Array<{ route: string; calls: number; tokens: number; costUsd: number }>;
+      byLayerMtd: Array<{ route: string; calls: number; tokens: number; costUsd: number }>;
+      usdInrRate: number;
+    }>("/api/llm/usage"),
+
+  // #4 Conversational chat per signal.
+  getSignalChat: (signalId: string, sessionId = "default") =>
+    request<{ signal_id: string; session_id: string; messages: Array<{ role: string; content: string }> }>(
+      `/api/signals/${encodeURIComponent(signalId)}/chat?session_id=${encodeURIComponent(sessionId)}`
+    ),
+  postSignalChat: (signalId: string, message: string, sessionId = "default") =>
+    request<{ signal_id: string; session_id: string; reply: string }>(
+      `/api/signals/${encodeURIComponent(signalId)}/chat`,
+      { method: "POST", body: JSON.stringify({ message, session_id: sessionId }) },
+      60_000,
+    ),
+  // Returns the SSE URL — caller wires their own EventSource.
+  signalChatStreamUrl: async (signalId: string) =>
+    `${await getBackendUrl()}/api/signals/${encodeURIComponent(signalId)}/chat/stream`,
+  getSignalReasoning: (signalId: string) =>
+    request<{
+      signal_id: string;
+      judge: { verdict: string | null; reason: string | null };
+      debate: { synthesis: string | null };
+      multi_perspective: { consensus: string | null; synthesis: string | null };
+    }>(`/api/signals/${encodeURIComponent(signalId)}/reasoning`),
+
+  // #7 Options
+  getOptionsView: (symbol: string) =>
+    request<{
+      symbol: string;
+      chain: Record<string, unknown>;
+      positioning: {
+        spot: number | null; max_pain: number | null;
+        distance_pct_to_max_pain: number | null;
+        anchor_direction: string; pcr_signal: string | null; pcr_oi: number | null;
+      };
+      unusual_activity: Array<{ strike: number | null; oi: number | null; oi_change: number | null; iv: number | null }>;
+    }>(`/api/options/${encodeURIComponent(symbol)}`),
+  getIvRankScreener: (gte = 80, universe = "nifty50", limit = 25) =>
+    request<{ data: Array<{ symbol: string; atm_iv: number; iv_rank_proxy: number; pcr_oi: number; max_pain: number; spot: number }>; universe: string; gte: number }>(
+      `/api/options/screener/iv-rank?gte=${gte}&universe=${encodeURIComponent(universe)}&limit=${limit}`
+    ),
+
+  // #8 Portfolio risk dashboard.
+  getRiskDashboard: () =>
+    request<{
+      open_positions: Array<Record<string, unknown>>;
+      correlation_matrix: Array<{ symbol: string; max_correlation: number | null; most_correlated_with: string | null }>;
+      paper_sector_exposure: Array<{ sector: string; exposure_pct: number }>;
+      alerts: Array<{ severity: string; kind: string; message: string }>;
+    }>("/api/portfolio/risk-dashboard"),
+
+  // #6 Broker
+  getBrokerStatus: () =>
+    request<{ broker: string; credentials_present: boolean; last_check_iso: string | null; last_check_ok: boolean }>("/api/broker/status"),
+  testBroker: (broker?: string, probeSymbol = "RELIANCE") =>
+    request<{ broker: string; ok: boolean; message: string; probe?: unknown }>(
+      "/api/broker/test",
+      { method: "POST", body: JSON.stringify({ broker, probe_symbol: probeSymbol }) },
+      30_000,
+    ),
+  getKiteLoginUrl: () =>
+    request<{ login_url: string; redirect_hint: string | null; note: string }>("/api/broker/kite/login-url"),
+  kiteExchangeToken: (requestToken: string) =>
+    request<{ ok: boolean; broker: string; message: string }>(
+      "/api/broker/kite/exchange-token",
+      { method: "POST", body: JSON.stringify({ request_token: requestToken }) },
+      30_000,
+    ),
+  getTradeJournal: (limit = 100, symbol?: string, mode?: "dry_run" | "live") => {
+    const qs = new URLSearchParams({ limit: String(limit) });
+    if (symbol) qs.set("symbol", symbol);
+    if (mode) qs.set("mode", mode);
+    return request<{ data: Array<Record<string, unknown>>; count: number }>(
+      `/api/broker/journal?${qs.toString()}`
+    );
+  },
 };

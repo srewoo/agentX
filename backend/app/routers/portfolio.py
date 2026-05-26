@@ -147,3 +147,103 @@ async def get_sector_exposure():
     except Exception as e:
         logger.exception("portfolio.sector_exposure failed: %s", e)
         raise HTTPException(status_code=500, detail="Failed to compute sector exposure")
+
+
+@router.get("/risk-dashboard")
+async def get_risk_dashboard():
+    """Portfolio-level risk heat: per-sector exposure + correlation matrix
+    of open paper positions. Used by the popup's portfolio tab to
+    visualise concentration and overlap at a glance.
+    """
+    import aiosqlite
+    from app.database import DB_PATH
+    try:
+        from app.services.portfolio_correlation import correlation_to_open
+    except Exception:
+        correlation_to_open = None  # type: ignore[assignment]
+
+    symbols: list[str] = []
+    positions: list[dict] = []
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT symbol, direction, entry_price, shares, position_size, "
+                "       stop_loss, target, status "
+                "FROM paper_trades WHERE status='open'"
+            ) as cur:
+                async for r in cur:
+                    pos = dict(r)
+                    positions.append(pos)
+                    if pos["symbol"] not in symbols:
+                        symbols.append(pos["symbol"])
+    except Exception as e:
+        logger.exception("risk-dashboard: open positions query failed: %s", e)
+        raise HTTPException(status_code=500, detail="failed to read positions")
+
+    # Per-symbol pairwise correlation matrix.
+    matrix: list[dict] = []
+    if correlation_to_open is not None and len(symbols) >= 2:
+        for sym in symbols:
+            try:
+                peers = [s for s in symbols if s != sym]
+                c = await correlation_to_open(sym, peers)
+                if isinstance(c, dict):
+                    matrix.append({
+                        "symbol": sym,
+                        "max_correlation": c.get("max_correlation"),
+                        "most_correlated_with": c.get("most_correlated_with"),
+                    })
+            except Exception:
+                continue
+
+    # Sector exposure for the *paper-trade* book (separate from portfolio
+    # holdings — this is what the auto-trader is actually risking right now).
+    paper_sector_buckets: dict[str, float] = {}
+    total_size = sum(float(p.get("position_size") or 0.0) for p in positions) or 1.0
+    for p in positions:
+        sector = "Unknown"  # paper_trades has no sector column; this is best-effort
+        size = float(p.get("position_size") or 0.0)
+        paper_sector_buckets[sector] = paper_sector_buckets.get(sector, 0.0) + size
+    paper_sector_exposure = [
+        {"sector": k, "exposure_pct": round(v / total_size * 100.0, 1)}
+        for k, v in paper_sector_buckets.items()
+    ]
+    paper_sector_exposure.sort(key=lambda r: r["exposure_pct"], reverse=True)
+
+    return {
+        "open_positions": positions,
+        "correlation_matrix": matrix,
+        "paper_sector_exposure": paper_sector_exposure,
+        "alerts": _portfolio_alerts(positions, matrix, paper_sector_exposure),
+    }
+
+
+def _portfolio_alerts(
+    positions: list[dict],
+    matrix: list[dict],
+    sector_exposure: list[dict],
+) -> list[dict]:
+    """Tag pile-ups, high correlation clusters, and sector over-exposure."""
+    out: list[dict] = []
+    # Highly-correlated cluster ≥ 0.7.
+    for m in matrix:
+        c = m.get("max_correlation")
+        if isinstance(c, (int, float)) and c >= 0.7:
+            out.append({
+                "severity": "warn",
+                "kind": "correlation",
+                "message": (
+                    f"{m['symbol']} is {c:.2f} correlated to "
+                    f"{m.get('most_correlated_with')}"
+                ),
+            })
+    # > 25% sector concentration.
+    for s in sector_exposure:
+        if s["exposure_pct"] > 25.0:
+            out.append({
+                "severity": "warn",
+                "kind": "sector_concentration",
+                "message": f"{s['sector']} = {s['exposure_pct']}% of paper book (cap 25%)",
+            })
+    return out
