@@ -263,10 +263,39 @@ async def get_stock_info_async(
 
 
 async def get_stock_quote(symbol: str) -> dict[str, Any]:
-    """Fetch a live stock quote. NSE first, yfinance fallback."""
+    """Fetch a live stock quote. Broker (real-time L1) → NSE → yfinance.
+
+    If the user has configured AngelOne / Kite in Settings we try the
+    broker first — it returns real-time data, whereas NSE's public quote
+    endpoint can lag during market hours and yfinance is 15-min delayed.
+    Broker failure cascades to NSE then yfinance so the call never blocks.
+    """
     clean_symbol = symbol.replace(".NS", "").replace(".BO", "")
 
-    # Try NSE (fast, reliable)
+    # Try the user's configured broker first (live ticks).
+    try:
+        from app.services.broker import get_broker_client
+        from app.services.orchestrator import _get_settings as _load_settings
+        settings = await _load_settings()
+        client = get_broker_client(settings)
+        if client is not None:
+            q = await client.get_quote(clean_symbol, exchange="NSE")
+            if q and q.ltp:
+                return {
+                    "symbol": symbol,
+                    "lastPrice": q.ltp,
+                    "open": q.open,
+                    "high": q.high,
+                    "low": q.low,
+                    "previousClose": q.close,
+                    "totalTradedVolume": q.volume,
+                    "source": client.name,
+                }
+    except Exception as e:
+        # Broker layer must never block fallbacks.
+        logger.debug("Broker quote failed for %s: %s", clean_symbol, e)
+
+    # Try NSE (fast, reliable, free).
     try:
         nse_quote = await nse_fetch_quote(clean_symbol)
         if nse_quote and nse_quote.get("lastPrice"):

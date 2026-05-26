@@ -12,10 +12,29 @@ import logging
 import re
 from typing import Any, Optional
 
+from pydantic import ValidationError
+
 from app.utils import parse_llm_json, safe_float
 from app.services.llm_client import call_llm, SUPPORTED_MODELS
 from app.services.fundamentals import get_fundamentals
+from app.services.llm_india_context import briefing as _india_briefing
+from app.services.llm_schemas import SignalEnrichment
 from app.services.market_data import get_market_context
+
+
+_INDIAN_ANALYST_SYS = (
+    _india_briefing(
+        include_flow=True, include_sector=True,
+        include_red_flags=True, include_seasonality=False,
+    )
+    + "\n\nROLE: You are a concise Indian-equities analyst. Explain why a "
+    "detected signal matters using the context above — name the *specific* "
+    "Indian-market factor that supports or threatens it (e.g. 'rupee at 86.4 "
+    "is a USD-INR tailwind for IT exporters', 'F&O ban list — entries "
+    "blocked', 'sector index breakdown'). DO NOT predict prices or give "
+    "buy/sell calls. Keep it factual, grounded in the data shown, ≤ 3 "
+    "sentences. Return ONLY valid JSON."
+)
 
 logger = logging.getLogger(__name__)
 
@@ -343,22 +362,24 @@ Return ONLY valid JSON:
             model=model,
             api_key=api_key,
             prompt=prompt,
-            system_message="You are a concise Indian stock market analyst. Explain signals clearly without making predictions. Return ONLY valid JSON.",
+            system_message=_INDIAN_ANALYST_SYS,
             max_tokens=_PROVIDER_MAX_OUTPUT_TOKENS.get(provider, 2048),
             fallback_chain=fallback_chain,
         )
         result = parse_llm_json(response, {"summary": "", "key_factor": "", "risk": ""})
-        summary = _sanitize_for_prompt(result.get("summary", ""), max_len=500)
-        key = _sanitize_for_prompt(result.get("key_factor", ""), max_len=200)
-        risk = _sanitize_for_prompt(result.get("risk", ""), max_len=200)
-        parts = [
-            p for p in [
-                summary,
-                key and f"Key factor: {key}",
-                risk and f"Risk: {risk}",
-            ] if p and p != "N/A"
-        ]
-        return " ".join(parts)
+        # Validate through Pydantic — keeps lengths bounded and gives us a
+        # typed object for downstream chaining (chart annotations, replay,
+        # eval) without each consumer re-implementing string-trimming.
+        try:
+            enrichment = SignalEnrichment(
+                summary=_sanitize_for_prompt(result.get("summary", ""), max_len=500),
+                key_factor=_sanitize_for_prompt(result.get("key_factor", ""), max_len=200),
+                risk=_sanitize_for_prompt(result.get("risk", ""), max_len=200),
+            )
+        except ValidationError as ve:
+            logger.warning("Analyst output failed schema for %s: %s", symbol, ve)
+            return ""
+        return enrichment.as_display_string()
     except Exception as e:
         logger.warning("Failed to enrich signal for %s: %s", symbol, e)
         return ""

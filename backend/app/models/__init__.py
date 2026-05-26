@@ -57,6 +57,13 @@ class UpdateSettingsRequest(BaseModel):
     gemini_api_key: Optional[str] = Field(None, max_length=200)
     claude_api_key: Optional[str] = Field(None, max_length=200)
     llm_judging_enabled: Optional[bool] = None
+    # Bull/Bear/Judge adversarial debate over top signals.
+    # Costs ~3 LLM calls per debated signal × top-3 signals = max 9 calls/scan.
+    debate_enabled: Optional[bool] = None
+    # Multi-perspective analyst (#14): 4 specialist LLM agents + synthesiser.
+    # Most expensive layer — 5 calls per analysed signal × top-5 = up to 25
+    # calls per scan. Off by default.
+    multi_perspective_enabled: Optional[bool] = None
     # Advisor + autonomous paper trading toggles — previously frontend-only.
     auto_paper_trade: Optional[bool] = None
     auto_paper_min_strength: Optional[int] = Field(None, ge=1, le=10)
@@ -70,6 +77,18 @@ class UpdateSettingsRequest(BaseModel):
     dedupe_signals: Optional[bool] = None
     audio_alerts: Optional[bool] = None
     audio_strength_threshold: Optional[int] = Field(None, ge=1, le=10)
+
+    # ── Broker integration ────────────────────────────────────────────────
+    broker: Optional[Literal["", "angelone", "kite"]] = None
+    # AngelOne SmartAPI (all four required to log in).
+    angelone_api_key: Optional[str] = Field(None, max_length=200)
+    angelone_client_code: Optional[str] = Field(None, max_length=50)
+    angelone_mpin: Optional[str] = Field(None, max_length=20)
+    angelone_totp_secret: Optional[str] = Field(None, max_length=200)
+    # Kite Connect.
+    kite_api_key: Optional[str] = Field(None, max_length=200)
+    kite_api_secret: Optional[str] = Field(None, max_length=200)
+    kite_access_token: Optional[str] = Field(None, max_length=200)
 
 
 class CreateAlertRequest(BaseModel):

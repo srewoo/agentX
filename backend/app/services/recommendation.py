@@ -345,11 +345,63 @@ def calibrated_conviction(
     return conviction, round(agreement, 3), note
 
 
-def action_from_score(weighted: float, *, regime: str = "neutral") -> Action:
-    threshold = 0.20 if regime == "risk_off" else 0.15
-    if weighted > threshold:
+def action_from_score(
+    weighted: float,
+    *,
+    regime: str = "neutral",
+    factor_agreement: Optional[float] = None,
+    signal_count: int = 0,
+    deterministic_consensus: Optional[str] = None,
+    llm_verdict: Optional[str] = None,
+) -> Action:
+    """Map the multi-factor weighted score to a BUY/SELL/HOLD action.
+
+    History: the pre-2026-05-26 thresholds (±0.15 / ±0.20 risk-off) were
+    so timid that strength-10 deterministic signals routinely produced
+    HOLD recs because cross-factor disagreement diluted the score. The
+    ``recommendation_outcomes`` tracker accumulated **1 row in months** —
+    no end-to-end accuracy signal at all.
+
+    New conviction rules:
+    1. **Lower base thresholds** (±0.10 / ±0.15 risk-off). Less timid.
+    2. **High-agreement bypass**: when ≥ 3 deterministic signals point
+       the same way *and* factor_agreement ≥ 0.7 *and* LLM judge didn't
+       drop, halve the threshold — the multi-factor stack is allowed to
+       trust the rule layer's conviction.
+    3. **Regime-adaptive thresholds**: in strong trends, the
+       in-trend-direction threshold is relaxed; counter-trend stays
+       firm.
+    """
+    # ── Base thresholds (lower than the old ±0.15) ─────────────────────
+    if regime == "risk_off":
+        pos_threshold = 0.15
+        neg_threshold = 0.15
+    elif regime == "trend_up":
+        pos_threshold = 0.08   # easier to take BUY in confirmed uptrend
+        neg_threshold = 0.15
+    elif regime == "trend_down":
+        pos_threshold = 0.15
+        neg_threshold = 0.08
+    else:
+        pos_threshold = 0.10
+        neg_threshold = 0.10
+
+    # ── High-agreement bypass ──────────────────────────────────────────
+    strong_consensus = (
+        signal_count >= 3
+        and (factor_agreement or 0) >= 0.7
+        and llm_verdict != "drop"
+        and deterministic_consensus in (None, "bullish", "bearish")
+    )
+    if strong_consensus:
+        # The deterministic stack agrees; halve the gate so a borderline
+        # weighted score still passes.
+        pos_threshold *= 0.5
+        neg_threshold *= 0.5
+
+    if weighted > pos_threshold:
         return "BUY"
-    if weighted < -threshold:
+    if weighted < -neg_threshold:
         return "SELL"
     return "HOLD"
 
@@ -546,10 +598,44 @@ async def generate_recommendation(
     conviction, agreement, calibration_note = calibrated_conviction(
         weighted, contributions, risk_reward=rr, regime=regime,
     )
-    action = action_from_score(weighted, regime=regime)
-    if action in ("BUY", "SELL") and conviction < 45:
+    # Count directional contributors and pick majority direction so the
+    # conviction bypass can fire when the deterministic stack aligns.
+    directional_count = 0
+    bullish_count = 0
+    bearish_count = 0
+    for c in contributions:
+        if not isinstance(c, dict):
+            continue
+        if c.get("direction") in ("bullish", "bearish"):
+            directional_count += 1
+            if c["direction"] == "bullish":
+                bullish_count += 1
+            else:
+                bearish_count += 1
+    if bullish_count > bearish_count:
+        det_consensus: Optional[str] = "bullish"
+    elif bearish_count > bullish_count:
+        det_consensus = "bearish"
+    else:
+        det_consensus = None
+
+    action = action_from_score(
+        weighted,
+        regime=regime,
+        factor_agreement=agreement,
+        signal_count=directional_count,
+        deterministic_consensus=det_consensus,
+        # We don't have the LLM judge verdict at this layer (it acts on
+        # individual signals, not the aggregated rec), so leave None
+        # — the bypass requires this NOT be "drop".
+        llm_verdict=None,
+    )
+    # Lowered the post-call conviction-cap from 45 → 35: the new thresholds
+    # already gate sub-meaningful scores, so the secondary cap was a
+    # belt-and-braces filter that killed too many good signals.
+    if action in ("BUY", "SELL") and conviction < 35:
         action = "HOLD"
-        calibration_note += " Directional call demoted to HOLD because calibrated conviction is below 45."
+        calibration_note += " Directional call demoted to HOLD because calibrated conviction is below 35."
 
     portfolio_context = None
     if action in ("BUY", "SELL"):
@@ -842,10 +928,23 @@ def _apply_cross_sectional_rank(recs: list[Recommendation]) -> list[Recommendati
         blended = blend_absolute_and_cross_sectional(
             r.weighted_score, cs_score, cs_weight=0.4,
         )
-        # Re-derive action + conviction from the blended score.
-        new_action = action_from_score(blended, regime=r.regime or "neutral")
+        # Re-derive action + conviction from the blended score. Pass the
+        # signal-count / agreement context so the new high-agreement
+        # bypass also applies to cross-sectional re-ranks (otherwise
+        # cross-sectional re-grading could revert good calls to HOLD).
         new_conviction, agreement, _note = calibrated_conviction(
             blended, r.signals, risk_reward=r.risk_reward, regime=r.regime or "neutral",
+        )
+        # Count directional signals on the underlying contribution list.
+        dir_count = sum(
+            1 for s in (r.signals or [])
+            if getattr(s, "direction", None) in ("bullish", "bearish")
+        )
+        new_action = action_from_score(
+            blended,
+            regime=r.regime or "neutral",
+            factor_agreement=agreement,
+            signal_count=dir_count,
         )
         out.append(r.model_copy(update={
             "weighted_score": round(blended, 4),

@@ -34,6 +34,10 @@ export const SIGNAL_TYPE_LABELS: Record<string, string> = {
   macd_divergence: "MACD Divergence",
   confluence: "Multi-Signal Confluence",
   options_flow: "Options Flow",
+  // New bullish detectors with documented academic edge.
+  pead: "Post-Earnings Drift",
+  quality_breakout: "Quality Breakout",
+  unusual_options_activity: "Unusual Options Activity",
 };
 
 // Derived timeframe for each signal type
@@ -69,6 +73,12 @@ export const SIGNAL_TIMEFRAME: Record<string, "Intraday" | "Swing" | "Long-term"
   macd_divergence: "Swing",
   confluence: "Swing",
   options_flow: "Swing",
+  // PEAD drift plays out over ~30-60 sessions → Long-term.
+  pead: "Long-term",
+  // Quality Breakout is fundamentally-gated → multi-week hold by design.
+  quality_breakout: "Long-term",
+  // Unusual options flow is typically a short-fuse signal.
+  unusual_options_activity: "Swing",
 };
 
 // Derive action label from direction

@@ -10,6 +10,9 @@ import { api } from "../../shared/api";
 const SENSITIVE_EXPORT = new Set([
   "llm_api_key", "openai_api_key", "gemini_api_key", "claude_api_key", "api_key",
   "telegram_bot_token",
+  // Broker credentials must never appear in user-exported config dumps.
+  "angelone_api_key", "angelone_client_code", "angelone_mpin", "angelone_totp_secret",
+  "kite_api_key", "kite_api_secret", "kite_access_token",
 ]);
 
 export default function Settings() {
@@ -363,6 +366,162 @@ export default function Settings() {
                 />
               </label>
             </div>
+
+            {/* Bull/Bear/Judge debate — costs more, only acts on the top-3
+                strongest directional signals. Pair this with the Layer-2
+                judge: judge filters individually, debate stress-tests the
+                strongest survivors. */}
+            <div>
+              <label className="flex items-center justify-between text-xs text-zinc-300">
+                <span>
+                  Bull/Bear/Judge debate
+                  <span className="text-[10px] text-zinc-600 block">
+                    3 LLM agents debate the top 3 strong signals — judge winner flips the badge
+                  </span>
+                </span>
+                <input
+                  type="checkbox"
+                  checked={
+                    settings.debate_enabled === true ||
+                    String(settings.debate_enabled).toLowerCase() === "true"
+                  }
+                  onChange={(e) => set("debate_enabled", e.target.checked)}
+                  className="accent-brand"
+                />
+              </label>
+            </div>
+
+            {/* Multi-perspective specialist analyst — heaviest layer. */}
+            <div>
+              <label className="flex items-center justify-between text-xs text-zinc-300">
+                <span>
+                  Multi-perspective analyst
+                  <span className="text-[10px] text-zinc-600 block">
+                    Technical/Fundamental/Sentiment/Macro specialists on top 5 signals — slow + costly
+                  </span>
+                </span>
+                <input
+                  type="checkbox"
+                  checked={
+                    settings.multi_perspective_enabled === true ||
+                    String(settings.multi_perspective_enabled).toLowerCase() === "true"
+                  }
+                  onChange={(e) => set("multi_perspective_enabled", e.target.checked)}
+                  className="accent-brand"
+                />
+              </label>
+            </div>
+          </div>
+        </section>
+
+        {/* Broker integration — AngelOne SmartAPI + Kite Connect ───────── */}
+        <section>
+          <h3 className="text-xs font-semibold text-zinc-400 uppercase tracking-wider mb-2">
+            Broker (real-time data + Greeks)
+          </h3>
+          <div className="space-y-3">
+            <div>
+              <label className="text-xs text-zinc-400 block mb-1">Data source</label>
+              <select
+                value={settings.broker || ""}
+                onChange={(e) => set("broker", e.target.value as AppSettings["broker"])}
+                className="w-full bg-zinc-800 border border-border rounded px-2 py-1.5 text-sm text-zinc-100"
+              >
+                <option value="">yfinance (delayed, default)</option>
+                <option value="angelone">AngelOne SmartAPI</option>
+                <option value="kite">Zerodha Kite Connect</option>
+              </select>
+              <div className="text-[10px] text-zinc-500 mt-1">
+                Selecting a broker enables real-time L1 quotes + native option Greeks.
+                Credentials are encrypted at rest.
+              </div>
+            </div>
+
+            {settings.broker === "angelone" && (
+              <>
+                <div>
+                  <label className="text-xs text-zinc-400 block mb-1">API Key</label>
+                  <input
+                    type="password"
+                    value={settings.angelone_api_key || ""}
+                    onChange={(e) => set("angelone_api_key", e.target.value)}
+                    placeholder="From smartapi.angelbroking.com"
+                    className="w-full bg-zinc-800 border border-border rounded px-2 py-1.5 text-xs text-zinc-100 placeholder-zinc-600 focus:outline-none focus:border-brand"
+                  />
+                </div>
+                <div>
+                  <label className="text-xs text-zinc-400 block mb-1">Client Code</label>
+                  <input
+                    type="text"
+                    value={settings.angelone_client_code || ""}
+                    onChange={(e) => set("angelone_client_code", e.target.value)}
+                    placeholder="e.g. A12345"
+                    className="w-full bg-zinc-800 border border-border rounded px-2 py-1.5 text-xs text-zinc-100 placeholder-zinc-600 focus:outline-none focus:border-brand"
+                  />
+                </div>
+                <div>
+                  <label className="text-xs text-zinc-400 block mb-1">MPIN</label>
+                  <input
+                    type="password"
+                    value={settings.angelone_mpin || ""}
+                    onChange={(e) => set("angelone_mpin", e.target.value)}
+                    placeholder="4-6 digit MPIN"
+                    className="w-full bg-zinc-800 border border-border rounded px-2 py-1.5 text-xs text-zinc-100 placeholder-zinc-600 focus:outline-none focus:border-brand"
+                  />
+                </div>
+                <div>
+                  <label className="text-xs text-zinc-400 block mb-1">TOTP Secret</label>
+                  <input
+                    type="password"
+                    value={settings.angelone_totp_secret || ""}
+                    onChange={(e) => set("angelone_totp_secret", e.target.value)}
+                    placeholder="base32 secret from broker portal"
+                    className="w-full bg-zinc-800 border border-border rounded px-2 py-1.5 text-xs text-zinc-100 placeholder-zinc-600 focus:outline-none focus:border-brand"
+                  />
+                  <div className="text-[10px] text-zinc-500 mt-1">
+                    Server uses this with pyotp to auto-generate the 2FA code at login.
+                  </div>
+                </div>
+              </>
+            )}
+
+            {settings.broker === "kite" && (
+              <>
+                <div>
+                  <label className="text-xs text-zinc-400 block mb-1">API Key</label>
+                  <input
+                    type="password"
+                    value={settings.kite_api_key || ""}
+                    onChange={(e) => set("kite_api_key", e.target.value)}
+                    placeholder="From kite.trade developer console"
+                    className="w-full bg-zinc-800 border border-border rounded px-2 py-1.5 text-xs text-zinc-100 placeholder-zinc-600 focus:outline-none focus:border-brand"
+                  />
+                </div>
+                <div>
+                  <label className="text-xs text-zinc-400 block mb-1">API Secret</label>
+                  <input
+                    type="password"
+                    value={settings.kite_api_secret || ""}
+                    onChange={(e) => set("kite_api_secret", e.target.value)}
+                    placeholder="From kite.trade developer console"
+                    className="w-full bg-zinc-800 border border-border rounded px-2 py-1.5 text-xs text-zinc-100 placeholder-zinc-600 focus:outline-none focus:border-brand"
+                  />
+                </div>
+                <div>
+                  <label className="text-xs text-zinc-400 block mb-1">Access Token</label>
+                  <input
+                    type="password"
+                    value={settings.kite_access_token || ""}
+                    onChange={(e) => set("kite_access_token", e.target.value)}
+                    placeholder="Refresh daily after Zerodha web login"
+                    className="w-full bg-zinc-800 border border-border rounded px-2 py-1.5 text-xs text-zinc-100 placeholder-zinc-600 focus:outline-none focus:border-brand"
+                  />
+                  <div className="text-[10px] text-zinc-500 mt-1">
+                    Kite tokens expire daily ~6 AM IST. Paste the latest after logging in.
+                  </div>
+                </div>
+              </>
+            )}
           </div>
         </section>
 

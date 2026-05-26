@@ -153,6 +153,15 @@ PROMOTED_SIGNALS: set[tuple[str, str]] = {
     ("rsi_extreme", "bearish"),          # lb95 49.96, +0.34% avg PnL
     ("macd_divergence", "bullish"),      # lb95 49.90, +0.49% avg PnL
     ("evening_star", "bearish"),         # lb95 49.40, +0.28% avg PnL
+    # 2026-05-26: new bullish detectors with documented academic edge.
+    # Walk-forward win-rates are pending; these are promoted prospectively
+    # because their underlying anomaly literature (PEAD, quality
+    # breakout) is among the most-replicated in equities research, and
+    # the in-detector gates (delivery %, fundamentals composite, gap
+    # magnitude, volume multiple) sharply restrict false positives. Will
+    # be re-validated against the next walk-forward run.
+    ("pead", "bullish"),
+    ("quality_breakout", "bullish"),
 }
 
 # Weight multiplier applied to a promoted signal's contribution in the

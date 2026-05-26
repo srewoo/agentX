@@ -635,6 +635,8 @@ def scan_symbol(
     thresholds: Optional[dict] = None,
     delivery_pct: Optional[float] = None,
     exchange: str = "NSE",
+    fundamentals: Optional[dict] = None,
+    earnings_recent_days: Optional[int] = None,
 ) -> list[dict[str, Any]]:
     """
     Run all detectors on a symbol's data. Returns list of signals found.
@@ -759,6 +761,34 @@ def scan_symbol(
                     psig["strength"] = max(1, psig["strength"] - 2)
 
             signals.append(psig)
+
+    # ── New bullish detectors with documented academic edge ─────────────
+    # PEAD (post-earnings drift) and Quality Breakout — added to recover
+    # bullish coverage after the 2026-05-25 audit muted the broken legs
+    # of rsi_extreme/macd_crossover/bullish_engulfing. Both require richer
+    # context (earnings calendar, fundamentals, delivery %) so they're
+    # opt-in: if the caller didn't pass those, the detectors silently skip.
+    try:
+        from app.services.bullish_signals import (
+            detect_pead, detect_quality_breakout,
+        )
+        pead = detect_pead(
+            symbol, df, technicals,
+            earnings_recent_days=earnings_recent_days,
+            delivery_pct=delivery_pct,
+        )
+        if pead:
+            signals.append(pead)
+        qbo = detect_quality_breakout(
+            symbol, df, technicals,
+            fundamentals=fundamentals,
+            delivery_pct=delivery_pct,
+        )
+        if qbo:
+            signals.append(qbo)
+    except Exception as e:
+        # Never let a new-detector bug block the main scan.
+        logger.debug("new bullish detectors failed for %s: %s", symbol, e)
 
     # ── Walk-forward-driven mute list ────────────────────────────────────
     # Drop signals whose OOS edge is negative across thousands of trades.

@@ -146,10 +146,27 @@ export default function SignalCard({ signal, onRead, onDismiss }: Props) {
   //    keep the rule action but mute the colour so it doesn't read as a
   //    confident BUY/SELL.
   //  - "keep" / null: trust the rule engine, render normally.
-  const action = signal.llm_verdict === "drop" ? "HOLD" : ruleAction;
+  // Layer-3 (Bull/Bear/Judge debate) overrides — only present on the top-N
+  // strong signals when debate_enabled. Treated as an *additional* veto:
+  //  - rule says bullish but debate winner = "bear" → flip to HOLD
+  //  - rule says bearish but debate winner = "bull" → flip to HOLD
+  //  - winner == "inconclusive"        → demote like downgrade (muted, ↓)
+  //  - winner agrees with rule direction → no override (trust both layers)
+  const debateContradicts =
+    (signal.direction === "bullish" && signal.debate_winner === "bear") ||
+    (signal.direction === "bearish" && signal.debate_winner === "bull");
+  const debateInconclusive = signal.debate_winner === "inconclusive";
+
+  const droppedByJudge = signal.llm_verdict === "drop";
+  const downgradedByJudge = signal.llm_verdict === "downgrade";
+
+  const action =
+    droppedByJudge || debateContradicts ? "HOLD" : ruleAction;
   const baseActionColor = ACTION_COLORS[action] || "#F59E0B";
-  const actionColor = signal.llm_verdict === "downgrade" ? "#9CA3AF" : baseActionColor;
-  const actionDemoted = signal.llm_verdict === "drop" || signal.llm_verdict === "downgrade";
+  const actionColor =
+    downgradedByJudge || debateInconclusive ? "#9CA3AF" : baseActionColor;
+  const actionDemoted =
+    droppedByJudge || downgradedByJudge || debateContradicts || debateInconclusive;
   const timeframe = getSignalTimeframe(signal.signal_type, signal.strength);
   const label = SIGNAL_TYPE_LABELS[signal.signal_type] || signal.signal_type;
   const plan = computeRiskPlan(signal, atr, settings);
@@ -230,7 +247,7 @@ export default function SignalCard({ signal, onRead, onDismiss }: Props) {
           )}
           <span className="font-bold text-base text-zinc-100">{signal.symbol}</span>
 
-          {/* BUY / SELL / HOLD badge — respects llm_verdict overrides */}
+          {/* BUY / SELL / HOLD badge — respects llm_verdict + debate overrides */}
           <span
             className="text-xs font-bold px-2 py-0.5 rounded-md border whitespace-nowrap"
             style={{
@@ -238,13 +255,21 @@ export default function SignalCard({ signal, onRead, onDismiss }: Props) {
               borderColor: `${actionColor}40`,
               backgroundColor: `${actionColor}15`,
             }}
-            title={
-              signal.llm_verdict === "drop"
-                ? `LLM judge overrode rule (${ruleAction}) → HOLD. ${signal.llm_reason || "Low-conviction context."}`
-                : signal.llm_verdict === "downgrade"
-                  ? `LLM judge kept ${ruleAction} but flagged low-conviction. ${signal.llm_reason || ""}`
-                  : undefined
-            }
+            title={(() => {
+              if (droppedByJudge) {
+                return `LLM judge overrode rule (${ruleAction}) → HOLD. ${signal.llm_reason || "Low-conviction context."}`;
+              }
+              if (debateContradicts) {
+                return `Bull/Bear debate winner = ${signal.debate_winner} contradicts rule (${ruleAction}) → HOLD. ${signal.debate_synthesis || ""}`;
+              }
+              if (downgradedByJudge) {
+                return `LLM judge kept ${ruleAction} but flagged low-conviction. ${signal.llm_reason || ""}`;
+              }
+              if (debateInconclusive) {
+                return `Bull/Bear debate was inconclusive — treat ${ruleAction} as low-conviction. ${signal.debate_synthesis || ""}`;
+              }
+              return undefined;
+            })()}
           >
             {action}
             {actionDemoted && <span className="ml-1 opacity-70">↓</span>}
@@ -280,6 +305,35 @@ export default function SignalCard({ signal, onRead, onDismiss }: Props) {
               <span className="opacity-60">AI</span>
               <span>
                 {signal.llm_verdict === "drop" ? "✕" : signal.llm_verdict === "downgrade" ? "↓" : "✓"}
+              </span>
+            </span>
+          )}
+
+          {/* Layer-3 debate verdict chip — green when the debate winner
+              matches the rule direction, red when it contradicts, amber
+              when inconclusive. Only renders when debate ran on this
+              signal (top-N high-conviction cohort). */}
+          {signal.debate_winner && (
+            <span
+              className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border whitespace-nowrap leading-none inline-flex items-center gap-1 ${
+                debateContradicts
+                  ? "bg-red-500/15 text-red-400 border-red-500/30"
+                  : debateInconclusive
+                    ? "bg-amber-500/15 text-amber-400 border-amber-500/30"
+                    : "bg-emerald-500/10 text-emerald-400 border-emerald-500/30"
+              }`}
+              title={
+                signal.debate_synthesis ||
+                (debateContradicts
+                  ? `Debate: ${signal.debate_winner} (contradicts rule)`
+                  : debateInconclusive
+                    ? "Debate: inconclusive"
+                    : `Debate: ${signal.debate_winner} (confirms rule)`)
+              }
+            >
+              <span className="opacity-60">DBT</span>
+              <span>
+                {debateContradicts ? "✕" : debateInconclusive ? "↓" : "✓"}
               </span>
             </span>
           )}
@@ -424,6 +478,61 @@ export default function SignalCard({ signal, onRead, onDismiss }: Props) {
                 LLM review ({signal.llm_verdict}):
               </span>{" "}
               {signal.llm_reason}
+            </div>
+          )}
+          {/* Multi-perspective analyst breakdown — only when multi_perspective
+              ran for this signal. Shows synth + per-perspective contributions. */}
+          {signal.mp_synthesis && (
+            <div className="text-xs leading-relaxed rounded-lg p-2.5 border bg-violet-500/5 border-violet-500/20 text-zinc-200 space-y-1.5">
+              <div className="flex items-center justify-between gap-2">
+                <span className="font-semibold text-violet-300">Specialist desks</span>
+                <span className="text-[10px] text-zinc-400">
+                  {signal.mp_consensus?.replace(/_/g, " ")} · score{" "}
+                  {(signal.mp_aggregate_score ?? 0).toFixed(2)}
+                </span>
+              </div>
+              <p>{signal.mp_synthesis}</p>
+              {signal.mp_perspectives_json && (
+                <div className="grid grid-cols-2 gap-1.5 mt-1">
+                  {(() => {
+                    try {
+                      const parsed = JSON.parse(signal.mp_perspectives_json) as Array<{
+                        perspective: string; score: number; confidence: number; summary: string;
+                      }>;
+                      return parsed.map((p) => (
+                        <div
+                          key={p.perspective}
+                          className={`rounded border p-1.5 ${
+                            p.score > 0.15
+                              ? "border-emerald-500/30 bg-emerald-500/5"
+                              : p.score < -0.15
+                                ? "border-red-500/30 bg-red-500/5"
+                                : "border-zinc-700 bg-zinc-900/40"
+                          }`}
+                        >
+                          <div className="flex items-center justify-between">
+                            <span className="text-[10px] uppercase tracking-wide text-zinc-400">
+                              {p.perspective}
+                            </span>
+                            <span
+                              className={`text-[10px] font-bold ${
+                                p.score >= 0 ? "text-emerald-400" : "text-red-400"
+                              }`}
+                            >
+                              {p.score >= 0 ? "+" : ""}{p.score.toFixed(2)}
+                            </span>
+                          </div>
+                          <p className="text-[11px] text-zinc-300 mt-0.5 leading-snug">
+                            {p.summary}
+                          </p>
+                        </div>
+                      ));
+                    } catch {
+                      return null;
+                    }
+                  })()}
+                </div>
+              )}
             </div>
           )}
           {deepAnalysis && (

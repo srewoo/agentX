@@ -358,14 +358,19 @@ class TestScanSymbol:
             sample_ohlcv_50,
             sample_technicals,
             sample_sr,
-            previous_price=sample_ohlcv_50["Close"].iloc[-1] * 0.93,  # 7% lower to trigger spike
+            previous_price=sample_ohlcv_50["Close"].iloc[-1] * 0.93,  # 7% lower
             sentiment_score=0.7,
         )
         assert isinstance(signals, list)
-        # Should at least detect price spike and sentiment shift
+        # The fixture's technicals classify as trend_up (ADX 28.5, SMA50 >
+        # SMA200, price > SMA50). Per the 2026-05-21 walk-forward kill set,
+        # ("trend_up", "price_spike", "bullish") is suppressed — so we no
+        # longer expect price_spike here. Sentiment_shift is regime-agnostic
+        # and remains the stable assertion for end-to-end pipeline health.
         types_found = {s["signal_type"] for s in signals}
-        assert PRICE_SPIKE in types_found
         assert SENTIMENT_SHIFT in types_found
+        # Pipeline should produce at least a few signals on realistic data.
+        assert len(signals) >= 2
 
     def test_given_no_previous_price_when_scanned_then_skips_price_spike(
         self, sample_ohlcv_50, sample_technicals, sample_sr
@@ -486,10 +491,14 @@ class TestBacktestEdgeFilters:
         assert _apply_backtest_edge_filters(signals) == []
 
     def test_soft_weak_pattern_is_downgraded_without_confirmation(self):
+        # rsi_extreme bullish is in SOFT_CONFIRMATION_REQUIRED — without
+        # an independent confirmer it stays in the list but gets a strength
+        # downgrade. (double_bottom bullish was moved to HARD by the
+        # 2026-05-21 walk-forward; HARD's behavior is covered separately.)
         signals = [
             {
                 "symbol": "RELIANCE",
-                "signal_type": "double_bottom",
+                "signal_type": "rsi_extreme",
                 "direction": "bullish",
                 "strength": 9,
                 "reason": "pattern",

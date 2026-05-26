@@ -44,6 +44,18 @@ export interface Signal {
   llm_summary: string | null;
   llm_verdict: "keep" | "drop" | "downgrade" | null;
   llm_reason: string | null;
+  // Bull/Bear/Judge debate verdict — populated only when debate_enabled
+  // and the signal made the top-N debated cohort.
+  debate_winner?: "bull" | "bear" | "inconclusive" | null;
+  debate_synthesis?: string | null;
+  debate_confidence?: number | null;
+  // Multi-perspective specialist analyst output — populated only when
+  // multi_perspective_enabled and the signal made the top-N cohort.
+  mp_aggregate_score?: number | null;
+  mp_consensus?: "strong_confirm" | "confirm" | "mixed" | "contradict" | "strong_contradict" | null;
+  mp_synthesis?: string | null;
+  /** JSON string of per-perspective records: {perspective, score, confidence, summary}. */
+  mp_perspectives_json?: string | null;
   exchange?: "NSE" | "BSE";
   current_price: number | null;
   metadata: Record<string, unknown>;
@@ -157,6 +169,21 @@ export interface AppSettings {
   openai_api_key: string;
   gemini_api_key: string;
   claude_api_key: string;
+
+  // ── Broker integration (real-time quotes + option Greeks) ─────────
+  /** Which broker to use for live data. "" = fall back to yfinance. */
+  broker?: "" | "angelone" | "kite";
+
+  // AngelOne SmartAPI credentials (all four required to authenticate).
+  angelone_api_key?: string;
+  angelone_client_code?: string;
+  angelone_mpin?: string;
+  angelone_totp_secret?: string;
+
+  // Kite Connect credentials. access_token is refreshed ~daily.
+  kite_api_key?: string;
+  kite_api_secret?: string;
+  kite_access_token?: string;
   // ── added by Tier 1/2/3 buildout ─────────────────────────────────
   onboarding_complete?: boolean;
   theme?: "dark" | "light";
@@ -197,6 +224,18 @@ export interface AppSettings {
   /** Layer-2 LLM judge: when on, the orchestrator runs one batched LLM call
    *  per scan that endorses/downgrades/drops each deterministic candidate. */
   llm_judging_enabled?: boolean;
+
+  /** Bull/Bear/Judge debate: when on, the top-3 strength-≥7 directional
+   *  signals get stress-tested by three LLM agents (bull case, bear case,
+   *  judge). The judge's winner flips the badge override the same way
+   *  llm_verdict=drop does. Up to 9 extra LLM calls per scan — off by default. */
+  debate_enabled?: boolean;
+
+  /** Multi-perspective specialist analyst: 4 LLM agents (technical,
+   *  fundamental, sentiment, macro) + synthesiser on top-5 signals. Most
+   *  expensive layer — up to 25 LLM calls per scan. Surfaces a per-
+   *  perspective contribution breakdown on the signal card. Off by default. */
+  multi_perspective_enabled?: boolean;
 }
 
 export interface FundamentalsResponse {

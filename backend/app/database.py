@@ -63,6 +63,18 @@ _SIGNALS_LATE_COLUMNS = {
     "llm_verdict": "TEXT",   # 'keep' | 'drop' | 'downgrade' | None
     "llm_reason": "TEXT",    # short LLM explanation (<= ~200 chars)
     "exchange": "TEXT",      # 'NSE' | 'BSE' — populated by the orchestrator
+    # Bull/Bear/Judge debate persistence — only populated for the top-N
+    # debated signals when debate_enabled=true.
+    "debate_winner": "TEXT",     # 'bull' | 'bear' | 'inconclusive' | None
+    "debate_synthesis": "TEXT",  # <= 400 char judge synthesis sentence
+    "debate_confidence": "REAL", # 0..1 calibrated by the judge
+    # Multi-perspective analyst output — only populated for top-N signals
+    # when multi_perspective_enabled. Stored as the synthesis sentence
+    # plus a JSON blob of per-perspective scores for the UI to render.
+    "mp_aggregate_score": "REAL",  # -1..1 weighted aggregate
+    "mp_consensus": "TEXT",        # 'strong_confirm' | 'confirm' | 'mixed' | 'contradict' | 'strong_contradict'
+    "mp_synthesis": "TEXT",        # <= 400 char CIO-style synthesis
+    "mp_perspectives_json": "TEXT", # JSON list of {perspective, score, confidence, summary}
 }
 
 # Live edge overrides populated by the weekly autonomous backtest. Keyed by

@@ -17,10 +17,11 @@ import json
 import logging
 from typing import Any, Optional
 
-from pydantic import BaseModel, Field, ValidationError, field_validator
+from pydantic import ValidationError
 
 from app.services.llm_analyst import _get_api_key, _build_fallback_chain
 from app.services.llm_client import call_llm
+from app.services.llm_schemas import JudgeResponse, JudgeVerdict
 
 logger = logging.getLogger(__name__)
 
@@ -28,30 +29,26 @@ logger = logging.getLogger(__name__)
 _MAX_CANDIDATES_PER_CALL = 40
 
 
-class JudgeVerdict(BaseModel):
-    """One LLM verdict for one Layer-1 candidate."""
-    id: str
-    verdict: str = Field(pattern="^(keep|drop|downgrade)$")
-    reason: str = Field(max_length=240)
-
-    @field_validator("reason")
-    @classmethod
-    def _strip(cls, v: str) -> str:
-        return v.strip()
-
+from app.services.llm_india_context import briefing as _india_briefing
 
 _SYSTEM_PROMPT = (
-    "You are a senior Indian equities risk reviewer. You are given a list of "
-    "candidate trading signals already validated by deterministic rules "
-    "(technicals, patterns, volume, RSI, MACD, etc.). Your job is to apply "
-    "qualitative judgment on top: spot setups that look statistically valid "
-    "but are practically weak (counter-trend, illiquid, post-earnings drift, "
-    "sector in a known drawdown, broken fundamentals, recent corporate "
-    "action distortion, etc.). For each candidate, return one of: "
-    "'keep' — endorse as-is; 'downgrade' — keep but warn the user it's "
-    "lower-conviction than the rule strength suggests; 'drop' — recommend "
-    "the user ignore this signal entirely. Be conservative: when unsure, "
-    "prefer 'keep'. Respond with strict JSON only — no prose, no markdown."
+    _india_briefing(
+        include_flow=True,
+        include_sector=False,
+        include_red_flags=True,
+        include_seasonality=False,
+    )
+    + "\n\nROLE: You are a senior Indian-equities risk reviewer reading a list "
+    "of candidate signals that have already cleared deterministic rule checks. "
+    "For each, apply qualitative judgment using the context above: spot setups "
+    "that look statistically valid but are practically weak (counter-trend in "
+    "a strong-trend regime, ASM/GSM-flagged scrips, F&O ban, fresh promoter "
+    "selling, broken fundamentals after a sector derating, mismatched session "
+    "context). Return one of: 'keep' — endorse as-is; 'downgrade' — keep but "
+    "warn it's lower-conviction than the rule strength suggests; 'drop' — tell "
+    "the user to ignore. Be conservative; when unsure, prefer 'keep'. The "
+    "reason field should name the specific red flag (≤ 200 chars). Respond "
+    "with strict JSON only — no prose, no markdown."
 )
 
 
@@ -79,9 +76,13 @@ def _build_prompt(candidates: list[dict]) -> str:
 
 
 def _parse_response(raw: str, expected_ids: set[str]) -> dict[str, JudgeVerdict]:
-    """Parse LLM response into a {id: JudgeVerdict} map. Strict — caller fails open."""
-    # Some providers wrap JSON in markdown despite instructions. Trim defensively.
+    """Parse LLM response into a {id: JudgeVerdict} map. Strict — caller fails open.
+
+    Uses the Pydantic ``JudgeResponse`` envelope so a malformed verdict
+    drops cleanly (logged) instead of poisoning the batch.
+    """
     text = raw.strip()
+    # Some providers wrap JSON in markdown despite instructions. Trim defensively.
     if text.startswith("```"):
         text = text.strip("`")
         if text.lower().startswith("json"):
@@ -90,12 +91,17 @@ def _parse_response(raw: str, expected_ids: set[str]) -> dict[str, JudgeVerdict]
     data = json.loads(text)
     verdicts_raw = data.get("verdicts") if isinstance(data, dict) else None
     if not isinstance(verdicts_raw, list):
+        # Envelope-level shape failure — let the outer judge log + fail open.
         raise ValueError("response missing 'verdicts' array")
 
+    # Per-entry Pydantic validation so a single bad row doesn't poison the
+    # whole batch (matches the prior fail-tolerant semantic). The
+    # JudgeResponse envelope is still the canonical shape — see
+    # llm_schemas.py — but we apply it row-by-row here.
     out: dict[str, JudgeVerdict] = {}
     for entry in verdicts_raw:
         try:
-            v = JudgeVerdict(**entry)
+            v = JudgeVerdict.model_validate(entry)
         except ValidationError as e:
             logger.debug("judge: dropping invalid verdict entry: %s (%s)", entry, e)
             continue

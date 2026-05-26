@@ -1,0 +1,17 @@
+# Optional broker SDKs for real-time L1 quotes + native option Greeks.
+#
+# Install with:
+#   source .venv/bin/activate
+#   pip install -r requirements-broker.txt
+#
+# Both are loaded lazily by app/services/broker.py — the core backend
+# never imports them at boot, so a failed install here does NOT break
+# anything else. Install only the one you actually use.
+
+# AngelOne SmartAPI (TOTP-based 2FA login, option chain with Greeks).
+# Pulls in Twisted as a transitive dep — heavy.
+smartapi-python>=1.4.0
+pyotp>=2.9.0
+
+# Zerodha Kite Connect (request_token → access_token flow, refreshed daily).
+kiteconnect>=5.0.0

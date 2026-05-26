@@ -287,8 +287,10 @@ async def _store_signals(signals: list[dict]) -> None:
                 """INSERT OR REPLACE INTO signals
                    (id, symbol, signal_type, direction, strength, reason, risk,
                     llm_summary, llm_verdict, llm_reason, exchange,
-                    current_price, metadata, created_at, read, dismissed)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    current_price, metadata, created_at, read, dismissed,
+                    debate_winner, debate_synthesis, debate_confidence,
+                    mp_aggregate_score, mp_consensus, mp_synthesis, mp_perspectives_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     sig["id"], sig["symbol"], sig["signal_type"], sig["direction"],
                     sig["strength"], sig["reason"], sig.get("risk"),
@@ -298,6 +300,13 @@ async def _store_signals(signals: list[dict]) -> None:
                     sig.get("current_price"),
                     json.dumps(sig.get("metadata", {})),
                     sig["created_at"], 0, 0,
+                    sig.get("debate_winner"),
+                    sig.get("debate_synthesis"),
+                    sig.get("debate_confidence"),
+                    sig.get("mp_aggregate_score"),
+                    sig.get("mp_consensus"),
+                    sig.get("mp_synthesis"),
+                    sig.get("mp_perspectives_json"),
                 ),
             )
         await db.commit()
@@ -517,15 +526,27 @@ async def run_scan_cycle() -> list[dict]:
                     logger.debug("Skipping %s — in F&O ban period", sym)
                     return []
 
-                # ── Earnings blackout period ──────────────────────────────────
+                # ── Earnings handling ────────────────────────────────────────
+                # The earnings calendar returns signed ``days_to_event``:
+                #   - positive  → results upcoming → enter blackout, skip
+                #   - negative  → results just happened → PEAD candidate window
+                # Previously we skipped on *both* — which made PEAD impossible
+                # to detect (the very setup we want to flag was being filtered
+                # out before reaching the engine).
+                earnings_recent_days_sym: Optional[int] = None
                 try:
-                    earnings_info = await get_upcoming_results_dates(sym, window_days=3)
+                    earnings_info = await get_upcoming_results_dates(sym, window_days=5)
                     if earnings_info.get("has_upcoming_results"):
                         days = earnings_info.get("days_to_event", 0)
-                        logger.debug("Skipping %s — earnings/results in %d days", sym, days)
-                        return []
+                        if days is not None and days > 0:
+                            # True upcoming-earnings blackout — skip scanning.
+                            logger.debug("Skipping %s — earnings in %d days", sym, days)
+                            return []
+                        if days is not None and days <= 0:
+                            # Results landed 0-5 sessions ago → PEAD candidate.
+                            earnings_recent_days_sym = abs(days)
                 except Exception:
-                    pass  # Non-critical — proceed without earnings check
+                    pass  # Non-critical — proceed without earnings context
 
                 sr = compute_support_resistance(df)
                 await asyncio.sleep(0)
@@ -550,10 +571,31 @@ async def run_scan_cycle() -> list[dict]:
                 sym_delivery_pct = None
                 vol_current = technicals.get("volume_current")
                 vol_avg = technicals.get("volume_avg_20")
-                if vol_current and vol_avg and vol_avg > 0 and (vol_current / vol_avg) >= 1.5:
+                vol_elevated = (
+                    vol_current and vol_avg and vol_avg > 0
+                    and (vol_current / vol_avg) >= 1.5
+                )
+                if vol_elevated:
                     try:
                         delivery_data = await get_delivery_volume(sym)
                         sym_delivery_pct = delivery_data.get("delivery_pct")
+                    except Exception:
+                        pass
+
+                # ── Lazy fundamentals for PEAD / Quality Breakout ───────────
+                # Fetch only when the symbol is *interesting* (in watchlist,
+                # has elevated volume, OR has just-reported earnings). Skips
+                # the rest of the universe entirely to keep cost bounded.
+                sym_fundamentals = None
+                interesting = (
+                    sym in watchlist_set
+                    or vol_elevated
+                    or earnings_recent_days_sym is not None
+                )
+                if interesting:
+                    try:
+                        from app.services.fundamentals import get_fundamentals as _gf
+                        sym_fundamentals = await _gf(sym, exchange=sym_exchange)
                     except Exception:
                         pass
 
@@ -567,6 +609,8 @@ async def run_scan_cycle() -> list[dict]:
                     thresholds=scan_thresholds,
                     delivery_pct=sym_delivery_pct,
                     exchange=sym_exchange,
+                    fundamentals=sym_fundamentals,
+                    earnings_recent_days=earnings_recent_days_sym,
                 )
             except Exception as e:
                 _bad_symbol_strikes[sym] = _bad_symbol_strikes.get(sym, 0) + 1
@@ -751,8 +795,102 @@ async def run_scan_cycle() -> list[dict]:
         except Exception as e:
             logger.warning("LLM judge layer failed (non-critical): %s", e)
 
+    # Layer-3 (optional): bull/bear/judge debate over the strongest signals.
+    # Gated on debate_enabled. Runs *after* the Layer-2 judge so dropped
+    # signals (the LLM already vetoed them) don't waste extra LLM budget.
+    try:
+        from app.services.llm_debate import debate_top_signals, is_debate_enabled
+        if is_debate_enabled(db_settings):
+            # Skip already-dropped signals — no point debating something the
+            # Layer-2 judge already vetoed.
+            debate_pool = [s for s in filtered if s.get("llm_verdict") != "drop"]
+            debate_results = await debate_top_signals(debate_pool, db_settings)
+            for sig in filtered:
+                r = debate_results.get(sig["id"])
+                if r is None:
+                    continue
+                sig["debate_winner"] = r.verdict.winner
+                sig["debate_synthesis"] = r.verdict.synthesis
+                sig["debate_confidence"] = r.verdict.calibrated_confidence
+    except Exception as e:
+        logger.warning("Debate layer failed (non-critical): %s", e)
+
+    # Layer-4 (optional): multi-perspective specialist analyst. Runs 4
+    # LLM agents (technical / fundamental / sentiment / macro) + a
+    # synthesiser on the top-N signals. Gated on multi_perspective_enabled.
+    # Skip already-dropped signals — no point investing 5 LLM calls in a
+    # setup the judge already vetoed.
+    try:
+        from app.services.llm_multi_perspective import (
+            analyse_top_signals, is_multi_perspective_enabled,
+        )
+        if is_multi_perspective_enabled(db_settings):
+            mp_pool = [s for s in filtered if s.get("llm_verdict") != "drop"]
+            mp_results = await analyse_top_signals(mp_pool, db_settings)
+            for sig in filtered:
+                mpa = mp_results.get(sig["id"])
+                if mpa is None:
+                    continue
+                sig["mp_aggregate_score"] = mpa.aggregate_score
+                sig["mp_consensus"] = mpa.consensus
+                sig["mp_synthesis"] = mpa.synthesis
+                sig["mp_perspectives_json"] = json.dumps([
+                    {
+                        "perspective": p.perspective,
+                        "score": p.score,
+                        "confidence": p.confidence,
+                        "summary": p.summary,
+                    }
+                    for p in mpa.perspectives
+                ])
+    except Exception as e:
+        logger.warning("Multi-perspective analyst failed (non-critical): %s", e)
+
     # Persist to DB
     await _store_signals(filtered)
+
+    # ── Auto-generate recommendations for top signals ─────────────────────
+    # Without this, the `recommendation_outcomes` tracker only accumulates
+    # rows when a user manually opens a stock detail — typically <5 a day.
+    # The accuracy loop needs a steady stream, so each scan generates recos
+    # for the top high-conviction non-dropped signals. Capped tight (3 per
+    # scan) and cache-backed, so the marginal cost is bounded. HOLD/AVOID
+    # recs are no-ops at the tracker layer (see store_recommendation).
+    try:
+        candidates_for_rec = [
+            s for s in filtered
+            if s.get("direction") in ("bullish", "bearish")
+            and s.get("strength", 0) >= 7
+            and s.get("llm_verdict") != "drop"
+        ]
+        candidates_for_rec.sort(key=lambda s: s.get("strength", 0), reverse=True)
+        # Dedupe by symbol — one rec per stock per scan.
+        seen_syms: set[str] = set()
+        rec_targets: list[dict] = []
+        for s in candidates_for_rec:
+            sym = s["symbol"]
+            if sym in seen_syms:
+                continue
+            seen_syms.add(sym)
+            rec_targets.append(s)
+            if len(rec_targets) >= 3:
+                break
+        if rec_targets:
+            from app.services.recommendation import generate_recommendation
+            for s in rec_targets:
+                try:
+                    await generate_recommendation(s["symbol"], horizon="swing")
+                except Exception as e:
+                    logger.debug(
+                        "auto-reco for %s skipped: %s", s["symbol"], e,
+                    )
+            logger.info(
+                "auto-reco: generated %d recommendations from top signals",
+                len(rec_targets),
+            )
+    except Exception as e:
+        # Tracker accumulation is a nice-to-have — never break the scan.
+        logger.warning("auto-reco loop failed: %s", e)
 
     elapsed = (datetime.now(timezone.utc) - start_time).total_seconds()
     scan_ts = datetime.now(timezone.utc).isoformat()
@@ -835,6 +973,13 @@ class SignalOrchestrator:
         # Separated from run_scan_cycle so /api/scan/status stays snappy.
         self._auto_paper_task = asyncio.create_task(self._auto_paper_loop())
         self._module_a_task = asyncio.create_task(self._module_a_loop())
+        # Stop-loss monitor — own cadence, independent of the scan loop so
+        # exits fire when the market breaches the stop rather than waiting
+        # for the next 5-min scan cycle.
+        from app.services.stop_loss_monitor import stop_loss_loop
+        self._sl_monitor_task = asyncio.create_task(
+            stop_loss_loop(poll_seconds=60, should_run=lambda: self._running)
+        )
         await asyncio.sleep(0)
         logger.info("Signal orchestrator started (scan + weekly backtest + calibration)")
 
@@ -844,6 +989,7 @@ class SignalOrchestrator:
             self._task, self._backtest_task, self._calibration_task,
             getattr(self, "_auto_paper_task", None),
             getattr(self, "_module_a_task", None),
+            getattr(self, "_sl_monitor_task", None),
         ):
             if t:
                 t.cancel()
@@ -1228,8 +1374,10 @@ def _next_weekly_at(weekday: int, hour: int, minute: int) -> datetime:
 
 
 def _next_weekly_backtest_dt() -> datetime:
-    """Monday 10:30 IST."""
-    return _next_weekly_at(weekday=0, hour=10, minute=30)
+    """Monday 14:00 IST — mid-session so the latest weekly bars are settled
+    and the scan/auto-paper loops aren't competing for I/O during the
+    morning open volatility window."""
+    return _next_weekly_at(weekday=0, hour=14, minute=0)
 
 
 def _next_weekly_calibration_dt() -> datetime:

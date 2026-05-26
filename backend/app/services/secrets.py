@@ -73,6 +73,12 @@ SECRET_KEYS: frozenset[str] = frozenset({
     "twilio_account_sid",
     "kite_access_token",
     "kite_api_secret",
+    "kite_api_key",
+    # AngelOne SmartAPI credentials — all four sealed at rest.
+    "angelone_api_key",
+    "angelone_client_code",
+    "angelone_mpin",
+    "angelone_totp_secret",
     "msg91_auth_key",
     "gupshup_api_key",
 })

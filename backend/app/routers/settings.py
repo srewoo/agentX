@@ -20,12 +20,16 @@ ALLOWED_KEYS = {
     # Configurable signal thresholds
     "rsi_overbought", "rsi_oversold", "price_spike_pct",
     "volume_spike_ratio", "breakout_min_score",
-    "llm_judging_enabled",
+    "llm_judging_enabled", "debate_enabled", "multi_perspective_enabled",
     # Advisor + autonomous-paper-trading toggles
     "auto_paper_trade", "auto_paper_min_strength", "auto_paper_max_open",
     "capital", "risk_per_trade_pct", "atr_sl_mult", "atr_target_mult",
     "regime_filter", "roundtrip_cost_pct", "dedupe_signals",
     "audio_alerts", "audio_strength_threshold",
+    # Broker integration (AngelOne SmartAPI + Kite Connect).
+    "broker",
+    "angelone_api_key", "angelone_client_code", "angelone_mpin", "angelone_totp_secret",
+    "kite_api_key", "kite_api_secret", "kite_access_token",
 }
 
 # Keys whose VALUES must never be returned to clients. We expose only a
@@ -38,6 +42,10 @@ _SECRET_KEYS = frozenset(SECRET_KEYS & ALLOWED_KEYS) if False else frozenset({
     "gemini_api_key",
     "claude_api_key",
     "llm_api_key",
+    # Broker credentials must never round-trip to the client either; the
+    # UI sees only the `<key>_configured` boolean flag.
+    "angelone_api_key", "angelone_client_code", "angelone_mpin", "angelone_totp_secret",
+    "kite_api_key", "kite_api_secret", "kite_access_token",
 })
 
 
