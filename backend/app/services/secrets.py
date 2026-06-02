@@ -79,6 +79,16 @@ SECRET_KEYS: frozenset[str] = frozenset({
     "angelone_client_code",
     "angelone_mpin",
     "angelone_totp_secret",
+    # Upstox data-source token (daily OAuth token) + app creds.
+    "upstox_access_token",
+    "upstox_api_key",
+    "upstox_api_secret",
+    # Twelve Data keyed fallback.
+    "twelvedata_api_key",
+    # Financial Modeling Prep (fundamentals + earnings calendar) and
+    # Finnhub (macro / forex) — both sealed at rest.
+    "fmp_api_key",
+    "finnhub_api_key",
     "msg91_auth_key",
     "gupshup_api_key",
 })

@@ -89,6 +89,16 @@ class UpdateSettingsRequest(BaseModel):
     kite_api_key: Optional[str] = Field(None, max_length=200)
     kite_api_secret: Optional[str] = Field(None, max_length=200)
     kite_access_token: Optional[str] = Field(None, max_length=200)
+    # ── Upstox data source (authenticated primary) ───────────────────────
+    # Daily OAuth access token (expires ~03:30 IST) + app credentials.
+    upstox_access_token: Optional[str] = Field(None, max_length=4000)
+    upstox_api_key: Optional[str] = Field(None, max_length=200)
+    upstox_api_secret: Optional[str] = Field(None, max_length=200)
+    # ── Twelve Data keyed fallback ───────────────────────────────────────
+    twelvedata_api_key: Optional[str] = Field(None, max_length=200)
+    # ── Financial Modeling Prep + Finnhub (fundamentals / earnings / macro) ─
+    fmp_api_key: Optional[str] = Field(None, max_length=200)
+    finnhub_api_key: Optional[str] = Field(None, max_length=200)
 
 
 class CreateAlertRequest(BaseModel):

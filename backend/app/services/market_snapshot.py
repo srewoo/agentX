@@ -130,6 +130,19 @@ async def _fetch_vix() -> Optional[float]:
         return None
 
 
+async def _fetch_usd_inr() -> Optional[float]:
+    """USD/INR: Finnhub first (real-time, well-maintained), yfinance fallback."""
+    try:
+        from app.services.finnhub_fetcher import get_usd_inr
+        rate = await get_usd_inr()
+        if rate is not None:
+            return rate
+    except Exception as e:
+        logger.debug("market_snapshot finnhub usd_inr failed: %s", e)
+    last, _ = await _safe_last_close("INR=X", period="5d")
+    return last
+
+
 async def _compute_sector_rotation() -> tuple[Optional[str], list[dict[str, Any]]]:
     """Rank top 3 NSE sector indices by 5-day change for a rotation hint."""
     sectors = {
@@ -205,7 +218,7 @@ async def get_market_snapshot(force_refresh: bool = False) -> MarketSnapshot:
             _compute_sector_rotation(),
             return_exceptions=False,
         )
-        usd_inr_t = await _safe_last_close("INR=X", period="5d")
+        usd_inr = await _fetch_usd_inr()
         brent_t = await _safe_last_close("BZ=F", period="5d")
 
         snapshot = MarketSnapshot(
@@ -215,7 +228,7 @@ async def get_market_snapshot(force_refresh: bool = False) -> MarketSnapshot:
             bank_nifty_close=bn_t[0],
             bank_nifty_pct=bn_t[1],
             india_vix=vix,
-            usd_inr=usd_inr_t[0],
+            usd_inr=usd_inr,
             brent_usd=brent_t[0],
             fii_net_cr=fii_dii[0],
             dii_net_cr=fii_dii[1],

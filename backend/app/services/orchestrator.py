@@ -515,6 +515,14 @@ async def run_scan_cycle() -> list[dict]:
                     _scan_state.completed_symbols += 1
                 return []
 
+            # SYMBOL_BLOCKLIST — names where the strategy historically loses
+            # money regardless of detector mix (e.g. ITC, SBIN per 5y walk-fwd).
+            from app.services.signal_edge import is_symbol_blocked
+            if is_symbol_blocked(sym):
+                async with _scan_state.lock:
+                    _scan_state.completed_symbols += 1
+                return []
+
             # Lightweight progress hook — lets /api/scan/status report which
             # symbol is currently being scanned without taking the lock
             # inside the hot path of each detector.
@@ -750,6 +758,28 @@ async def run_scan_cycle() -> list[dict]:
             )
         filtered = kept
 
+    # ── PROMOTED-ONLY strict mode ────────────────────────────────────────
+    # Highest-conviction config from the 2026-05-26 walk-forward:
+    #   Symbol blocklist + mutes + PROMOTED-only override
+    #   = 282 trades, 50.0% WR, +0.79% avg net P&L per trade.
+    # Enable via settings table: key=strict_promoted_only, value="true".
+    # Default off — the broader (post-mute) signal set is still profitable
+    # at +0.24% avg P&L; strict mode trades volume for higher per-trade edge.
+    strict_promoted = str(db_settings.get("strict_promoted_only", "false")).strip().lower() in (
+        "true", "1", "yes", "on",
+    )
+    if strict_promoted:
+        from app.services.signal_edge import PROMOTED_SIGNALS as _PROMOTED
+        before = len(filtered)
+        filtered = [
+            s for s in filtered
+            if (s.get("signal_type"), s.get("direction")) in _PROMOTED
+        ]
+        logger.info(
+            "strict_promoted_only: kept %d / %d signals (only PROMOTED_SIGNALS combos)",
+            len(filtered), before,
+        )
+
     # Sort by strength desc; watchlist signals get priority boost
     for sig in filtered:
         if sig["symbol"] in watchlist_set:
@@ -827,7 +857,64 @@ async def run_scan_cycle() -> list[dict]:
         except Exception as e:
             logger.warning(f"LLM enrichment failed: {e}")
 
-    # Layer-2: optional LLM judge over the deterministic candidate list.
+    # Layer-2a: deterministic meta-judge — primary filter when a fresh
+    # trained model exists with proven OOS AUC. Costs ~0.5ms per signal vs
+    # ~₹0.10 per scan for the LLM judge, and trains on actual signal_outcomes.
+    # GATED: only deploys when the model's holdout AUC > 0.55, otherwise we
+    # short-circuit because a low-AUC model adds noise (proven empirically in
+    # 2026-05-26 full_stack_proof: AUC ~0.5 meta-judge cost us −0.73pp
+    # vs mutes alone). Set by the trainer in meta-judge .meta.json.
+    mj_model = None
+    try:
+        from app.services.meta_judge_trainer import load_active
+        candidate = load_active()
+        if candidate is not None:
+            holdout_auc = (
+                (candidate.train_meta or {})
+                .get("holdout_metrics", {})
+                .get("auc", 0.0)
+            )
+            if holdout_auc and float(holdout_auc) >= 0.55:
+                mj_model = candidate
+                logger.info("meta_judge: active (holdout AUC=%.3f)", float(holdout_auc))
+            else:
+                logger.info(
+                    "meta_judge: model present but holdout AUC=%.3f < 0.55; "
+                    "skipping to avoid adding noise (mutes + PROMOTED override carry it)",
+                    float(holdout_auc) if holdout_auc else 0.0,
+                )
+    except Exception as _e:
+        logger.debug("meta_judge load skipped: %s", _e)
+
+    if mj_model is not None and filtered:
+        mj_kept = 0
+        mj_dropped = 0
+        kept_signals: list[dict] = []
+        for sig in filtered:
+            try:
+                # The meta-judge accepts a raw signal dict — it extracts
+                # categoricals + numeric features itself.
+                p_win = mj_model.predict_proba(sig)
+                sig["meta_judge_p_win"] = round(p_win, 4)
+                if mj_model.keep(sig):
+                    sig["llm_verdict"] = sig.get("llm_verdict") or "keep"
+                    kept_signals.append(sig)
+                    mj_kept += 1
+                else:
+                    sig["llm_verdict"] = "drop"
+                    sig["llm_reason"] = f"meta_judge p_win={p_win:.2f} below threshold"
+                    mj_dropped += 1
+                    # Drop from downstream processing.
+            except Exception as e:
+                logger.debug("meta_judge prediction failed for signal: %s", e)
+                kept_signals.append(sig)
+        logger.info(
+            "meta_judge: kept %d, dropped %d of %d candidates (threshold=%.2f)",
+            mj_kept, mj_dropped, len(filtered), mj_model.threshold,
+        )
+        filtered = kept_signals
+
+    # Layer-2b: optional LLM judge over the deterministic candidate list.
     # Single batched call per scan — fail-open so a provider outage or parse
     # error never blocks the deterministic signals from being stored.
     if judge_enabled(db_settings):
@@ -1016,6 +1103,7 @@ class SignalOrchestrator:
         self._calibration_task: Optional[asyncio.Task] = None
         self._auto_paper_task: Optional[asyncio.Task] = None
         self._module_a_task: Optional[asyncio.Task] = None
+        self._daily_backtest_task: Optional[asyncio.Task] = None
         self._running = False
 
     async def start(self) -> None:
@@ -1024,6 +1112,7 @@ class SignalOrchestrator:
         self._running = True
         self._task = asyncio.create_task(self._loop())
         self._backtest_task = asyncio.create_task(self._backtest_loop())
+        self._daily_backtest_task = asyncio.create_task(self._daily_backtest_loop())
         self._calibration_task = asyncio.create_task(self._calibration_loop())
         # Separated from run_scan_cycle so /api/scan/status stays snappy.
         self._auto_paper_task = asyncio.create_task(self._auto_paper_loop())
@@ -1044,6 +1133,7 @@ class SignalOrchestrator:
             self._task, self._backtest_task, self._calibration_task,
             getattr(self, "_auto_paper_task", None),
             getattr(self, "_module_a_task", None),
+            getattr(self, "_daily_backtest_task", None),
             getattr(self, "_sl_monitor_task", None),
         ):
             if t:
@@ -1071,6 +1161,11 @@ class SignalOrchestrator:
                     continue
 
                 await run_scan_cycle()
+                try:
+                    from app.services.runtime_status import record_run
+                    await record_run("scan")
+                except Exception:
+                    pass
 
                 # Wait for next cycle
                 await asyncio.sleep(interval_minutes * 60)
@@ -1084,10 +1179,10 @@ class SignalOrchestrator:
     async def _backtest_loop(self) -> None:
         """Weekly autonomous backtest of NIFTY 50 — persisted for trend analysis.
 
-        Sleeps until the next Sunday 18:00 IST, then runs a 1y/5d backtest on
-        the watchlist + a curated NIFTY-50 subset. Results persist to the
-        backtest_runs table; /api/performance/insights diffs runs to detect
-        signal-engine drift over time.
+        Sleeps until the next Monday 14:00 IST (see `_next_weekly_backtest_dt`),
+        then runs a 1y/5d backtest on the watchlist + a curated NIFTY-50 subset.
+        Results persist to the backtest_runs table; /api/performance/insights
+        diffs runs to detect signal-engine drift over time.
         """
         # Initial delay — let the rest of the app finish booting before pulling
         # 50 stocks of history. 5 minutes is enough for any first-time setup.
@@ -1237,6 +1332,15 @@ class SignalOrchestrator:
                         len(open_res.get("opened", [])),
                         len(close_res.get("closed", [])),
                     )
+                    try:
+                        from app.services.runtime_status import record_run
+                        await record_run("auto_paper", summary={
+                            "opened": len(open_res.get("opened", [])),
+                            "closed": len(close_res.get("closed", [])),
+                            "skipped": open_res.get("skipped_reason_counts", {}),
+                        })
+                    except Exception:
+                        pass
                 await asyncio.sleep(max(60, interval_min * 60))
             except asyncio.CancelledError:
                 break
@@ -1287,16 +1391,25 @@ class SignalOrchestrator:
                 logger.warning("Module A loop error: %s", e)
                 await asyncio.sleep(3600)
 
-    async def _run_weekly_backtest(self) -> None:
-        """Execute the weekly backtest and persist the result row."""
+    async def _run_backtest_job(
+        self,
+        all_syms: list[str],
+        *,
+        period: str = "1y",
+        run_kind: str = "weekly",
+        refresh_edges: bool = True,
+    ) -> None:
+        """Execute a backtest over ``all_syms`` and persist the result row.
+
+        Shared by the weekly loop (broad universe, refreshes the live
+        signal_edge overrides) and the daily loop (small universe,
+        ``refresh_edges=False`` so a thin daily sample never clobbers the
+        broader weekly edge table). Records a runtime heartbeat either way.
+        """
         from app.services.backtester import run_backtest
         import json
-        symbols = await _get_watchlist_symbols()
-        # Always include the top liquid NIFTY names so we have a stable baseline
-        baseline = [s["symbol"] for s in MAJOR_STOCKS[:25]]
-        all_syms = list(dict.fromkeys(baseline + symbols))[:50]  # de-dupe, cap at 50
 
-        logger.info("Weekly autonomous backtest starting on %d symbols", len(all_syms))
+        logger.info("%s backtest starting on %d symbols", run_kind, len(all_syms))
         per_symbol: list[dict] = []
         all_pnl: list[float] = []
         all_wins = 0
@@ -1314,7 +1427,7 @@ class SignalOrchestrator:
         async def _run_one(sym: str) -> dict:
             async with sem:
                 return await asyncio.wait_for(
-                    run_backtest(sym, period="1y", eval_windows=[1, 3, 5, 10]),
+                    run_backtest(sym, period=period, eval_windows=[1, 3, 5, 10]),
                     timeout=_BACKTEST_PER_SYMBOL_TIMEOUT,
                 )
 
@@ -1373,42 +1486,120 @@ class SignalOrchestrator:
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     datetime.now(timezone.utc).isoformat(),
-                    "1y", 5, len(all_syms),
+                    period, 5, len(all_syms),
                     sum(r.get("total_signals", 0) for r in per_symbol),
                     avg_pnl, win_rate, best, worst,
-                    json.dumps({"per_symbol": per_symbol, "by_type_avg_pnl_5d": type_avg}),
+                    json.dumps({
+                        "run_kind": run_kind,
+                        "per_symbol": per_symbol,
+                        "by_type_avg_pnl_5d": type_avg,
+                    }),
                 ),
             )
             await db.commit()
         logger.info(
-            "Weekly backtest complete: %d stocks · WR %.1f%% · avg PnL %.2f%% · best %s · worst %s",
-            len(all_syms), win_rate, avg_pnl, best, worst,
+            "%s backtest complete: %d stocks · WR %.1f%% · avg PnL %.2f%% · best %s · worst %s",
+            run_kind, len(all_syms), win_rate, avg_pnl, best, worst,
         )
+        try:
+            from app.services.runtime_status import record_run
+            await record_run(
+                f"backtest_{run_kind}",
+                summary={"symbols": len(all_syms), "win_rate": win_rate, "avg_pnl": avg_pnl},
+            )
+        except Exception as e:
+            logger.debug("runtime_status record (backtest) failed: %s", e)
 
         # Refresh signal_edge overrides — closes the loop so the Edge/Avoid
         # badges and the recommendation engine see live numbers, not the
         # frozen baseline. Sample-size guardrail lives inside the writer.
-        try:
-            from app.services.signal_edge import write_edge_overrides
-            edge_payload: dict[tuple[str, str], dict] = {}
-            for (stype, direction), s in type_dir_stats.items():
-                trades = int(s["trades"])
-                if trades <= 0:
+        # Only the broad (weekly) run does this; a thin daily sample must not
+        # overwrite the broader edge table.
+        if refresh_edges:
+            try:
+                from app.services.signal_edge import write_edge_overrides
+                edge_payload: dict[tuple[str, str], dict] = {}
+                for (stype, direction), s in type_dir_stats.items():
+                    trades = int(s["trades"])
+                    if trades <= 0:
+                        continue
+                    resolved = int(s["wins"]) + int(s["losses"])
+                    wr = round((s["wins"] / resolved) * 100, 2) if resolved else 0.0
+                    edge_payload[(stype, direction)] = {
+                        "win_rate": wr,
+                        "avg_pnl": round(s["pnl_sum"] / trades, 4),
+                        "trades": trades,
+                    }
+                written = await write_edge_overrides(edge_payload)
+                logger.info("Edge overrides refreshed: %d/%d keys persisted", written, len(edge_payload))
+            except Exception as e:
+                logger.warning("Edge override refresh failed (non-critical): %s", e)
+
+    async def _run_weekly_backtest(self) -> None:
+        """Weekly broad-universe backtest — watchlist + top-25 NIFTY, refreshes edges."""
+        symbols = await _get_watchlist_symbols()
+        baseline = [s["symbol"] for s in MAJOR_STOCKS[:25]]
+        all_syms = list(dict.fromkeys(baseline + symbols))[:50]  # de-dupe, cap at 50
+        await self._run_backtest_job(all_syms, period="1y", run_kind="weekly", refresh_edges=True)
+
+    async def _run_daily_backtest(self) -> None:
+        """Daily lightweight backtest — small liquid universe, does NOT touch edges.
+
+        A fast pulse so /insights and the automation-status panel show a fresh
+        number every trading day without the cost of the 50-symbol weekly run.
+        """
+        db_settings = await _get_settings()
+        n = int(db_settings.get("daily_backtest_symbols", 10))
+        symbols = await _get_watchlist_symbols()
+        baseline = [s["symbol"] for s in MAJOR_STOCKS[:n]]
+        all_syms = list(dict.fromkeys(baseline + symbols))[: max(5, n)]
+        await self._run_backtest_job(all_syms, period="1y", run_kind="daily", refresh_edges=False)
+
+    async def _daily_backtest_loop(self) -> None:
+        """Run a lightweight backtest once per day at 11:00 IST.
+
+        Gated by the ``daily_backtest_enabled`` setting (default on). Skips
+        weekends — a backtest on a non-trading day adds nothing new. 11:00 IST
+        is mid-session, so it runs on bars through the previous close (today's
+        bar is still forming); that's the intended daily pulse.
+        """
+        await asyncio.sleep(420)  # boot grace; offset from the other loops
+        while self._running:
+            try:
+                next_run = _next_daily_at(hour=11, minute=0)
+                wait_s = max(60, (next_run - datetime.now(timezone.utc)).total_seconds())
+                logger.info("Next daily backtest at %s UTC (in %.1fh)", next_run.isoformat(), wait_s / 3600)
+                await asyncio.sleep(wait_s)
+                if not self._running:
+                    break
+                db_settings = await _get_settings()
+                if str(db_settings.get("daily_backtest_enabled", "true")).lower() not in {"1", "true", "yes", "on"}:
+                    logger.info("Daily backtest disabled by settings")
                     continue
-                resolved = int(s["wins"]) + int(s["losses"])
-                wr = round((s["wins"] / resolved) * 100, 2) if resolved else 0.0
-                edge_payload[(stype, direction)] = {
-                    "win_rate": wr,
-                    "avg_pnl": round(s["pnl_sum"] / trades, 4),
-                    "trades": trades,
-                }
-            written = await write_edge_overrides(edge_payload)
-            logger.info("Edge overrides refreshed: %d/%d keys persisted", written, len(edge_payload))
-        except Exception as e:
-            logger.warning("Edge override refresh failed (non-critical): %s", e)
+                # IST weekday at fire time — skip Sat/Sun.
+                now_ist = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
+                if now_ist.weekday() >= 5:
+                    continue
+                await self._run_daily_backtest()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("Daily backtest loop error: %s", e)
+                await asyncio.sleep(3600)
 
     def is_running(self) -> bool:
         return self._running
+
+
+def _next_daily_at(hour: int, minute: int) -> datetime:
+    """Return the next IST `hh:mm` slot (today or tomorrow) expressed in UTC."""
+    IST_OFFSET = timedelta(hours=5, minutes=30)
+    now_utc = datetime.now(timezone.utc)
+    now_ist = now_utc + IST_OFFSET
+    target_ist = now_ist.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if now_ist >= target_ist:
+        target_ist += timedelta(days=1)
+    return (target_ist - IST_OFFSET).replace(tzinfo=timezone.utc)
 
 
 def _next_weekly_at(weekday: int, hour: int, minute: int) -> datetime:

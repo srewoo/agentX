@@ -131,25 +131,41 @@ async def get_block_deals() -> list[dict]:
 # ── Options Chain Analysis ───────────────────────────────────
 
 def _sync_analyze_option_chain(symbol: str) -> Optional[dict]:
-    """
-    Fetch and analyze options chain data for a symbol.
-    Returns PCR, max pain, unusual OI buildup signals.
-    """
+    """Fetch the NSE option chain and analyze it (PCR, max pain, unusual OI)."""
     try:
         from nse import NSE
         from pathlib import Path
         nse = NSE(Path("/tmp/agentx_nse"))
         data = nse.optionChain(symbol)
         nse.exit()
-
         if not data or not isinstance(data, dict):
             return None
-
         records = data.get("records", {})
-        strikes = records.get("data", [])
-        expiry_dates = records.get("expiryDates", [])
-        underlying_value = records.get("underlyingValue")
+        return _analyze_option_chain_records(
+            symbol,
+            records.get("data", []),
+            records.get("expiryDates", []),
+            records.get("underlyingValue"),
+        )
+    except Exception as e:
+        logger.debug("NSE option chain fetch failed for %s: %s", symbol, e)
+        return None
 
+
+def _analyze_option_chain_records(
+    symbol: str,
+    strikes: list,
+    expiry_dates: list,
+    underlying_value,
+) -> Optional[dict]:
+    """Compute PCR / max-pain / unusual-OI from NSE-shaped option-chain records.
+
+    Source-agnostic: each ``strikes`` item carries ``CE``/``PE`` sub-dicts with
+    ``openInterest``, ``changeinOpenInterest``, ``totalTradedVolume``,
+    ``impliedVolatility``, ``strikePrice``, ``expiryDate`` — so the Upstox
+    adapter can feed the exact same shape the NSE scraper produces.
+    """
+    try:
         if not strikes or not underlying_value:
             return None
 
@@ -263,7 +279,29 @@ def _sync_analyze_option_chain(symbol: str) -> Optional[dict]:
 
 
 async def get_option_chain_analysis(symbol: str) -> Optional[dict]:
-    """Async: options chain analysis with PCR, max pain, unusual OI."""
+    """Async: options chain analysis with PCR, max pain, unusual OI.
+
+    Upstox (authenticated) is tried first when a token is configured — it is
+    not subject to NSE's anti-bot 403. Falls back to the NSE scraper.
+    """
+    try:
+        from app.services.data_fetcher import _get_data_settings
+        from app.services import upstox_fetcher, source_health
+        settings = await _get_data_settings()
+        if upstox_fetcher.has_token(settings) and not source_health.is_down("upstox"):
+            recs = await upstox_fetcher.upstox_fetch_option_chain(
+                symbol, token=settings["upstox_access_token"],
+            )
+            if recs:
+                analysis = _analyze_option_chain_records(
+                    symbol, recs["strikes"], recs["expiry_dates"], recs["underlying_value"],
+                )
+                if analysis:
+                    analysis["source"] = "upstox"
+                    return analysis
+    except Exception as e:
+        logger.debug("Upstox option chain failed for %s: %s", symbol, e)
+
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, _sync_analyze_option_chain, symbol)
 

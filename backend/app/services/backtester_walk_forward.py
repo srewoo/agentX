@@ -146,6 +146,23 @@ async def _scan_fold(
             avg_daily_value_inr=adv_inr_i if adv_inr_i > 0 else max(entry, 1.0) * 1e6,
             daily_vol_pct=vol_pct_i if vol_pct_i > 0 else 1.5,
         )
+        # Pre-compute engineered features the meta-judge can train on.
+        # These are *legitimate-at-decision-time* (the engine sees them too
+        # at scan time, we just didn't persist them before).
+        sma20 = float(window_df["Close"].rolling(20).mean().iloc[-1]) if len(window_df) >= 20 else 0.0
+        sma50 = float(window_df["Close"].rolling(50).mean().iloc[-1]) if len(window_df) >= 50 else 0.0
+        sma200 = float(window_df["Close"].rolling(200).mean().iloc[-1]) if len(window_df) >= 200 else 0.0
+        dist_sma20 = ((entry - sma20) / sma20 * 100.0) if sma20 else 0.0
+        dist_sma50 = ((entry - sma50) / sma50 * 100.0) if sma50 else 0.0
+        dist_sma200 = ((entry - sma200) / sma200 * 100.0) if sma200 else 0.0
+        # 20-day return regime
+        if len(window_df) >= 20:
+            ret_20d = float((entry - close_values[i - 20]) / close_values[i - 20] * 100.0)
+        else:
+            ret_20d = 0.0
+        rsi_now = float(tech.get("rsi") or 50.0) if isinstance(tech, dict) else 50.0
+        atr_pct = (vol_pct_i if vol_pct_i > 0 else 1.5)
+
         for sig in sigs:
             row: dict[str, Any] = {
                 "symbol": symbol, "bar_index": i, "entry_price": entry,
@@ -153,6 +170,14 @@ async def _scan_fold(
                 "direction": sig.get("direction", "neutral"),
                 "regime": regime,
                 "rt_cost_pct": rt_cost,
+                # Engineered features for the meta-judge.
+                "strength": int(sig.get("strength", 5)),
+                "dist_sma20_pct": round(dist_sma20, 2),
+                "dist_sma50_pct": round(dist_sma50, 2),
+                "dist_sma200_pct": round(dist_sma200, 2),
+                "ret_20d_pct": round(ret_20d, 2),
+                "rsi": round(rsi_now, 1),
+                "atr_pct": round(atr_pct, 2),
             }
             for w in eval_windows:
                 fut = i + w

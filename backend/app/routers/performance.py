@@ -357,7 +357,31 @@ async def performance_insights():
     except Exception as e:
         logger.debug("WoW comparison failed: %s", e)
 
-    # 3) Static recommended mutes (always present as informational)
+    # 3) OOS shipping-gate verdict from the latest walk-forward run.
+    try:
+        from pathlib import Path as _Path
+        from app.services.oos_gate import latest_verdict
+        gate = latest_verdict(_Path(__file__).resolve().parents[2] / "backtest_results")
+        verdict = gate.get("verdict", "UNKNOWN")
+        sev = {"PASS": "good", "REVIEW": "warn", "FAIL": "warn", "UNKNOWN": "info"}.get(verdict, "info")
+        m = gate.get("metrics", {})
+        insights.append({
+            "kind": "oos_gate",
+            "severity": sev,
+            "title": (
+                f"OOS shipping gate: {verdict}"
+                + (f" — WR {m.get('win_rate')}%, avg P&L {m.get('avg_pnl_pct')}%, "
+                   f"{m.get('total_trades')} trades" if m else "")
+            ),
+            "verdict": verdict,
+            "shippable": gate.get("shippable", False),
+            "reasons": gate.get("reasons", []),
+            "metrics": m,
+        })
+    except Exception as e:
+        logger.debug("OOS gate insight failed: %s", e)
+
+    # 4) Static recommended mutes (always present as informational)
     insights.append({
         "kind": "recommended_mutes",
         "severity": "info",
@@ -519,6 +543,221 @@ async def performance_cohort(since: Optional[str] = None):
             "considered_holds": considered_holds,
         },
     }
+
+
+@router.post("/meta-judge/train")
+async def trigger_meta_judge_train(n_stumps: int = 25, target_tpr: float = 0.70):
+    """Re-train the deterministic meta-judge from signal_outcomes.
+
+    Idempotent — re-running on the same DB produces the same model.
+    Returns the train summary including OOS holdout metrics so the
+    operator can decide whether to deploy the updated model.
+    """
+    try:
+        from app.services.meta_judge_trainer import train_and_save
+        result = await train_and_save(n_stumps=n_stumps, target_tpr=target_tpr)
+        return {"data": result}
+    except Exception as e:
+        logger.exception("meta-judge train failed: %s", e)
+        raise HTTPException(status_code=500, detail=f"train failed: {e}")
+
+
+@router.get("/meta-judge/status")
+async def meta_judge_status():
+    """Inspect the currently-loaded meta-judge (if any)."""
+    try:
+        from app.services.meta_judge_trainer import _MODEL_PATH
+        if not _MODEL_PATH.exists():
+            return {"loaded": False, "reason": "no model file"}
+        meta_path = _MODEL_PATH.with_suffix(".meta.json")
+        if not meta_path.exists():
+            return {"loaded": True, "meta": None}
+        import json as _j
+        return {"loaded": True, "meta": _j.loads(meta_path.read_text())}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/audited")
+async def audited_metrics(since: Optional[str] = None):
+    """Audited, public-grade performance metrics over tracked outcomes.
+
+    Profit factor, expectancy, max drawdown, Sharpe, Brier score and a
+    calibration curve — overall and split by horizon and by regime. The
+    recommendation cohort carries `conviction`, so its calibration tells you
+    whether the engine's confidence is honest. Signal outcomes are P&L-only
+    (no stored probability), so Brier/calibration are null there.
+
+    `since` (YYYY-MM-DD, default 2026-05-26) floors both cohorts to
+    post-rule-change data so lifetime contamination doesn't skew the audit.
+    """
+    import aiosqlite
+    from app.database import DB_PATH
+    from app.services.performance_metrics import compute_metrics, group_metrics
+
+    floor = since or "2026-05-26"
+    try:
+        datetime.strptime(floor, "%Y-%m-%d") if "T" not in floor else datetime.fromisoformat(floor.replace("Z", "+00:00"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="since must be YYYY-MM-DD or ISO timestamp")
+
+    reco_trades: list[dict[str, Any]] = []
+    signal_trades: list[dict[str, Any]] = []
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """SELECT conviction, pnl_pct, outcome, bars_held, timeframe_days,
+                          horizon, regime
+                   FROM recommendation_outcomes
+                   WHERE pnl_pct IS NOT NULL AND created_at >= ?""",
+                (floor,),
+            ) as cur:
+                async for r in cur:
+                    conv = r["conviction"]
+                    reco_trades.append({
+                        "pnl_pct": r["pnl_pct"],
+                        "outcome": r["outcome"],
+                        # conviction (0-100) → predicted P(win); the calibration
+                        # curve is the test of whether that mapping holds.
+                        "predicted_prob": (float(conv) / 100.0) if conv is not None else None,
+                        "hold_days": r["bars_held"] or r["timeframe_days"],
+                        "horizon": r["horizon"],
+                        "regime": r["regime"],
+                    })
+            async with db.execute(
+                """SELECT pnl_pct, outcome, hold_days
+                   FROM signal_outcomes
+                   WHERE pnl_pct IS NOT NULL AND entry_time >= ?""",
+                (floor,),
+            ) as cur:
+                async for r in cur:
+                    signal_trades.append({
+                        "pnl_pct": r["pnl_pct"],
+                        "outcome": r["outcome"],
+                        "hold_days": r["hold_days"],
+                    })
+    except Exception as e:
+        logger.exception("audited metrics query failed: %s", e)
+        raise HTTPException(status_code=500, detail="audited metrics query failed")
+
+    return {
+        "since": floor,
+        "recommendations": {
+            "overall": compute_metrics(reco_trades),
+            "by_horizon": group_metrics(reco_trades, key=lambda t: t.get("horizon")),
+            "by_regime": group_metrics(reco_trades, key=lambda t: t.get("regime")),
+        },
+        "signals": {
+            "overall": compute_metrics(signal_trades),
+        },
+        "note": (
+            "Win rate alone is a vanity metric. Expectancy and profit factor "
+            "are what compound; the calibration curve shows whether conviction "
+            "is honest. All numbers are post-cost on tracked outcomes only."
+        ),
+    }
+
+
+@router.get("/oos-gate")
+async def oos_shipping_gate(horizon: str = "5d"):
+    """Out-of-sample shipping gate verdict from the latest walk-forward run.
+
+    Returns PASS / REVIEW / FAIL / UNKNOWN. A config is only `shippable`
+    when held-out, cost-aware numbers clear positive expectancy + a win-rate
+    floor + Monte-Carlo p5 (ADR-9 fragility) + a minimum sample. This is the
+    gate the user-facing 'this is a money-maker' claim must pass first.
+    """
+    if horizon not in {"1d", "3d", "5d", "10d"}:
+        raise HTTPException(status_code=400, detail="horizon must be 1d, 3d, 5d, or 10d")
+    from pathlib import Path as _Path
+    from app.services.oos_gate import latest_verdict
+    results_dir = _Path(__file__).resolve().parents[2] / "backtest_results"
+    return {"data": latest_verdict(results_dir, horizon=horizon)}
+
+
+@router.get("/automation-status")
+async def automation_status():
+    """Is the autonomous engine actually running? Evidence, not assumptions.
+
+    Returns market-open state, the last-run heartbeat for each loop
+    (scan / auto-paper / daily+weekly backtest), the next scheduled backtest
+    times, whether auto-paper is enabled, and the current open-position count.
+    """
+    import aiosqlite
+    from app.database import DB_PATH
+    from app.services.runtime_status import get_status
+    from app.services.orchestrator import (
+        is_market_open, orchestrator, _get_settings,
+        _next_daily_at, _next_weekly_backtest_dt,
+    )
+
+    heartbeats = await get_status()
+    db_settings = await _get_settings()
+    auto_paper_enabled = str(
+        db_settings.get("auto_paper_trade_enabled", "true")
+    ).lower() in {"1", "true", "yes", "on"}
+    daily_backtest_enabled = str(
+        db_settings.get("daily_backtest_enabled", "true")
+    ).lower() in {"1", "true", "yes", "on"}
+
+    open_positions = 0
+    last_backtest_at = None
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                "SELECT COUNT(*) FROM paper_trades WHERE status='open'"
+            ) as cur:
+                row = await cur.fetchone()
+                open_positions = int(row[0]) if row else 0
+            async with db.execute(
+                "SELECT MAX(run_at) FROM backtest_runs"
+            ) as cur:
+                row = await cur.fetchone()
+                last_backtest_at = row[0] if row else None
+    except Exception as e:
+        logger.debug("automation-status db read failed: %s", e)
+
+    return {
+        "data": {
+            "orchestrator_running": orchestrator.is_running(),
+            "market_open": is_market_open(),
+            "auto_paper_enabled": auto_paper_enabled,
+            "daily_backtest_enabled": daily_backtest_enabled,
+            "open_positions": open_positions,
+            "heartbeats": heartbeats,
+            "last_backtest_at": last_backtest_at,
+            "next_daily_backtest_utc": _next_daily_at(11, 0).isoformat(),
+            "next_weekly_backtest_utc": _next_weekly_backtest_dt().isoformat(),
+        }
+    }
+
+
+class MetaJudgeExplainRequest(BaseModel):
+    features: dict[str, Any] = Field(
+        description="Trade feature dict (signal_type, direction, regime, factor scores, etc.)"
+    )
+    top_k: Optional[int] = Field(default=None, ge=1, le=50)
+
+
+@router.post("/meta-judge/explain")
+async def meta_judge_explain(body: MetaJudgeExplainRequest):
+    """Exact per-feature attribution for the meta-judge's verdict on a trade.
+
+    Returns the additive contribution of each feature to the decision margin
+    (SHAP-grade for this stump ensemble: Σ contributions == margin), plus the
+    resulting P(win) and keep/drop verdict.
+    """
+    from app.services.meta_judge_trainer import _MODEL_PATH
+    from app.services.meta_judge import MetaJudge
+    if not _MODEL_PATH.exists():
+        raise HTTPException(status_code=404, detail="no trained meta-judge model — train it first")
+    try:
+        model = MetaJudge.load(_MODEL_PATH)
+        return {"data": model.explain(body.features, top_k=body.top_k)}
+    except Exception as e:
+        logger.exception("meta-judge explain failed: %s", e)
+        raise HTTPException(status_code=500, detail=f"explain failed: {e}")
 
 
 @router.post("/evaluate")

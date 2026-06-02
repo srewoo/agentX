@@ -3,7 +3,7 @@ import type {
   Signal, StockQuote, TechnicalsResponse, AIAnalysisResponse, WatchlistItem, AppSettings, HealthResponse,
   NewsItem, CorporateAction, OptionsAnalysis, BlockDeal, BacktestResult, ScreenerParams, FundamentalsResponse,
   SignalEdgeResponse, InsightsResponse, BacktestRun, PerformanceByTypeRow, DeepSignalAnalysis,
-  ScanTriggerResponse, ScanStatus,
+  ScanTriggerResponse, ScanStatus, AutomationStatus,
 } from "./types";
 
 const DEFAULT_TIMEOUT_MS = 30_000; // 30 seconds
@@ -105,6 +105,8 @@ export const api = {
   getSettings: () => request<{ settings: AppSettings }>("/api/settings"),
   updateSettings: (settings: Partial<AppSettings>) =>
     request<{ ok: boolean }>("/api/settings", { method: "POST", body: JSON.stringify(settings) }),
+  testUpstox: () =>
+    request<{ ok: boolean; message: string; user?: string }>("/api/settings/test-upstox", { method: "POST" }),
 
   // Alerts
   getAlerts: () =>
@@ -180,6 +182,10 @@ export const api = {
 
   // Autonomous-loop endpoints
   getInsights: () => request<InsightsResponse>("/api/performance/insights"),
+
+  // Is the autonomous engine actually running? (heartbeats + schedule)
+  getAutomationStatus: () =>
+    request<{ data: AutomationStatus }>("/api/performance/automation-status"),
 
   // Performance breakdown by signal type (live + tracked outcomes).
   getPerformanceByType: (signalType?: string, direction?: string) => {

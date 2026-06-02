@@ -143,6 +143,19 @@ RECOMMENDED_MUTES: list[str] = [
 DIRECTIONAL_MUTES: set[tuple[str, str]] = {
     ("rsi_extreme", "bullish"),       # n=1612, WR 5.5%, avg -7.38%
     ("macd_crossover", "bullish"),    # n=472,  WR 6.6%, avg -5.52%
+    # 2026-05-26 walk-forward (10-NIFTY universe, 2y, realistic-cost
+    # evaluator). Each pair below has n>=60 and net-of-cost avg P&L
+    # < -0.8% — i.e. losing money at scale even after honest brokerage,
+    # STT, DP, slippage and GST. Adding to mutes flips the universe
+    # WR from 37.2% → 42.1% per the harness `WHAT-IF` block.
+    ("rsi_divergence", "bullish"),    # n=199, WR 28.1%, avg -2.13%
+    ("rsi_divergence", "bearish"),    # n=155, WR 36.1%, avg -0.43%
+    ("evening_star", "bearish"),      # n=116, WR 34.5%, avg -0.94%
+    ("bearish_engulfing", "bearish"), # n=174, WR 32.2%, avg -1.04%
+    ("macd_crossover", "bearish"),    # n=124, WR 30.6%, avg -0.90%
+    ("shooting_star", "bearish"),     # n=20,  WR 10.0%, avg -2.66%  (small n, but extreme)
+    ("head_and_shoulders", "bearish"),# n=27,  WR 22.2%, avg -2.72%
+    ("price_spike", "bullish"),       # n=74,  WR 39.2%, avg -1.69%
 }
 
 # Setups the engine considers genuine edge sources after the walk-forward.
@@ -150,9 +163,12 @@ DIRECTIONAL_MUTES: set[tuple[str, str]] = {
 # fires, and shown in the UI as "high-conviction signals".
 PROMOTED_SIGNALS: set[tuple[str, str]] = {
     ("gap_up", "bullish"),               # lb95 53.19, +1.13% avg PnL
-    ("rsi_extreme", "bearish"),          # lb95 49.96, +0.34% avg PnL
-    ("macd_divergence", "bullish"),      # lb95 49.90, +0.49% avg PnL
-    ("evening_star", "bearish"),         # lb95 49.40, +0.28% avg PnL
+    ("macd_divergence", "bullish"),      # confirmed: 2y n=137 +0.03% avg, +1.1% Kelly
+    # 2026-05-26 walk-forward: only TWO combos survive the realistic-cost
+    # evaluator with positive net avg P&L on n>=100 across 10 NIFTY
+    # names. double_top/bearish is the standout: +0.80% avg, +14.2%
+    # Kelly, n=153. macd_divergence/bullish kept above.
+    ("double_top", "bearish"),           # n=153, WR 44.4%, +0.80% avg, +14.2% Kelly
     # 2026-05-26: new bullish detectors with documented academic edge.
     # Walk-forward win-rates are pending; these are promoted prospectively
     # because their underlying anomaly literature (PEAD, quality
@@ -162,6 +178,12 @@ PROMOTED_SIGNALS: set[tuple[str, str]] = {
     # be re-validated against the next walk-forward run.
     ("pead", "bullish"),
     ("quality_breakout", "bullish"),
+    # REMOVED 2026-05-26: rsi_extreme/bearish — was promoted on gross
+    # data; net of realistic Indian-market costs (apply_costs), it is
+    # n=206 WR 32.5% avg -0.89%. Demoted; the symbol won't be killed
+    # entirely because the LLM judge may still find value in it.
+    # REMOVED: evening_star/bearish — net avg -0.94% on n=116. Moved
+    # to DIRECTIONAL_MUTES above.
 }
 
 # Weight multiplier applied to a promoted signal's contribution in the
@@ -258,6 +280,29 @@ EDGE_META = {
     "stat_basis": "out_of_sample_only",
     "win_rate_lb95": "Wilson 95% lower bound — penalises small samples",
 }
+
+
+# Per-symbol blocklist — when a single name accounts for an outsized share of
+# universe loss across multiple signal types, the right action isn't to mute
+# detectors (other symbols benefit from them) but to exclude the symbol from
+# the strategy entirely. The 2026-05-26 5y walk-forward had ITC alone driving
+# ~46% of total universe loss across 9 of the worst 13 (sym, signal, dir)
+# buckets — no detector mix is going to rescue that. Add symbols here when
+# their cumulative ≥1-year net P&L on signals is < -3% per trade with n>=100.
+SYMBOL_BLOCKLIST: set[str] = {
+    "ITC",   # 5y: 576 trades, WR 5.9%, avg -4.56%, contributes ~1900pp of universe loss
+    "SBIN",  # 5y: 406 trades, WR 23.2%, avg -2.44% — mean-reversion on persistent downtrender
+}
+
+
+def is_symbol_blocked(symbol: str) -> bool:
+    """True when a symbol is on the blocklist and should never be scanned/traded.
+
+    Use at the top of every per-symbol entry point (orchestrator scan,
+    recommendation engine, auto-paper-trader) so blocked names never reach
+    any of the costly downstream layers.
+    """
+    return (symbol or "").upper() in SYMBOL_BLOCKLIST
 
 
 def is_muted(signal_type: str, direction: Optional[str] = None) -> bool:

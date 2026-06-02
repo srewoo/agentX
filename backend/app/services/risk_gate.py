@@ -46,6 +46,13 @@ MIN_AVG_DAILY_VOLUME = 100_000  # Liquidity floor (shares/day)
 MARKET_OPEN_HHMM = (9, 15)
 MARKET_CLOSE_HHMM = (15, 30)
 
+# Quality gates — "a lower number of better signals beats many weak ones."
+MAX_SPREAD_PCT = 1.0           # Reject when bid-ask spread > 1% of mid (slippage trap)
+ATR_CHOP_PCT = 5.0             # ATR% above this is "high volatility"…
+ADX_CHOP_MAX = 20.0            # …and ADX below this is "no trend" → choppy, skip
+# Data-quality labels the recommendation engine emits that we refuse to trade on.
+BAD_DATA_QUALITY = {"poor", "stale", "missing", "low", "insufficient"}
+
 
 # ─────────────────────────────────────────────────────────────────────────
 # Daily-loss circuit breaker
@@ -198,6 +205,14 @@ class TradeCandidate:
     avg_daily_volume: Optional[float] = None
     is_fno_banned: bool = False
     is_in_earnings_blackout: bool = False
+    # Quality-gate inputs — all optional; a gate is inert when its input is
+    # absent, so callers that can't supply (e.g. EOD feed has no bid/ask)
+    # simply don't trigger that rule rather than being blocked spuriously.
+    bid: Optional[float] = None
+    ask: Optional[float] = None
+    atr_pct: Optional[float] = None
+    adx: Optional[float] = None
+    data_quality: Optional[str] = None
 
 
 @dataclass
@@ -224,6 +239,9 @@ def evaluate_trade(
     2. F&O ban list      — block if symbol is in current ban period
     3. Earnings blackout — block if a result is announced within 3 days
     4. Liquidity         — reject when avg daily volume < floor
+    4a. Data quality     — reject when the feed flagged stale/poor data
+    4b. Bid-ask spread   — reject when spread > 1% of mid (slippage trap)
+    4c. ATR-chop         — reject high-volatility / no-trend (high ATR%, low ADX)
     5. Risk:Reward       — reject when R:R < 1.5
     6. Daily-loss CB     — reject if circuit breaker active
     7. Max open positions
@@ -265,6 +283,40 @@ def evaluate_trade(
         res.reasons.append(
             f"illiquid: avg daily volume {candidate.avg_daily_volume:.0f} "
             f"< floor {MIN_AVG_DAILY_VOLUME}"
+        )
+        return res
+
+    # ── 4a. Data quality ────────────────────────────────────────────────
+    if candidate.data_quality is not None and (
+        str(candidate.data_quality).strip().lower() in BAD_DATA_QUALITY
+    ):
+        res.verdict = GateVerdict.REJECTED
+        res.reasons.append(f"data quality '{candidate.data_quality}' is untradeable")
+        return res
+
+    # ── 4b. Bid-ask spread (slippage trap) ──────────────────────────────
+    if (
+        candidate.bid is not None and candidate.ask is not None
+        and candidate.bid > 0 and candidate.ask > 0
+    ):
+        mid = (candidate.bid + candidate.ask) / 2.0
+        spread_pct = (candidate.ask - candidate.bid) / mid * 100.0 if mid > 0 else 0.0
+        if spread_pct > MAX_SPREAD_PCT:
+            res.verdict = GateVerdict.REJECTED
+            res.reasons.append(
+                f"wide spread {spread_pct:.2f}% > {MAX_SPREAD_PCT}% — execution slippage trap"
+            )
+            return res
+
+    # ── 4c. ATR-chop (volatile but trendless) ───────────────────────────
+    if (
+        candidate.atr_pct is not None and candidate.adx is not None
+        and candidate.atr_pct > ATR_CHOP_PCT and candidate.adx < ADX_CHOP_MAX
+    ):
+        res.verdict = GateVerdict.REJECTED
+        res.reasons.append(
+            f"choppy: ATR {candidate.atr_pct:.1f}% > {ATR_CHOP_PCT}% with ADX "
+            f"{candidate.adx:.1f} < {ADX_CHOP_MAX} (high volatility, no trend)"
         )
         return res
 

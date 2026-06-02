@@ -6,6 +6,8 @@ import { downloadFile } from "../../shared/localStore";
 import { saveSettings, getSettings } from "../../shared/storage";
 import { api } from "../../shared/api";
 import BrokerPanel from "../components/BrokerPanel";
+import UpstoxPanel from "../components/UpstoxPanel";
+import AutomationStatusPanel from "../components/AutomationStatusPanel";
 
 // Sensitive keys to scrub from JSON exports
 const SENSITIVE_EXPORT = new Set([
@@ -14,6 +16,8 @@ const SENSITIVE_EXPORT = new Set([
   // Broker credentials must never appear in user-exported config dumps.
   "angelone_api_key", "angelone_client_code", "angelone_mpin", "angelone_totp_secret",
   "kite_api_key", "kite_api_secret", "kite_access_token",
+  // Data-source keys.
+  "twelvedata_api_key", "fmp_api_key", "finnhub_api_key",
 ]);
 
 export default function Settings() {
@@ -95,8 +99,60 @@ export default function Settings() {
 
         {/* Broker connection */}
         <section>
+          <h3 className="text-xs font-semibold text-zinc-400 uppercase tracking-wider mb-2">Automation status</h3>
+          <AutomationStatusPanel />
+        </section>
+
+        <section>
           <h3 className="text-xs font-semibold text-zinc-400 uppercase tracking-wider mb-2">Broker</h3>
           <BrokerPanel />
+        </section>
+
+        {/* Upstox market-data source */}
+        <section>
+          <h3 className="text-xs font-semibold text-zinc-400 uppercase tracking-wider mb-2">Market data</h3>
+          <UpstoxPanel />
+
+          {/* Optional enrichment data sources. Both are optional — without a
+              key the related feature stays inert (no behaviour change). */}
+          <div className="space-y-3 mt-3">
+            <div>
+              <label className="text-xs text-zinc-400 block mb-1">
+                Financial Modeling Prep API Key
+                {settings.fmp_api_key_configured && (
+                  <span className="text-emerald-500 ml-1">✓ set</span>
+                )}
+              </label>
+              <input
+                type="password"
+                value={settings.fmp_api_key || ""}
+                onChange={(e) => set("fmp_api_key", e.target.value)}
+                placeholder={settings.fmp_api_key_configured ? "•••••• (saved)" : "Optional — earnings calendar + fundamentals"}
+                className="w-full bg-zinc-800 border border-border rounded px-2 py-1.5 text-xs text-zinc-100 placeholder-zinc-600 focus:outline-none focus:border-brand"
+              />
+              <p className="text-[10px] text-zinc-600 mt-1">
+                Enables the earnings-blackout risk gate (skips trades within ±3 days of results).
+              </p>
+            </div>
+            <div>
+              <label className="text-xs text-zinc-400 block mb-1">
+                Finnhub API Key
+                {settings.finnhub_api_key_configured && (
+                  <span className="text-emerald-500 ml-1">✓ set</span>
+                )}
+              </label>
+              <input
+                type="password"
+                value={settings.finnhub_api_key || ""}
+                onChange={(e) => set("finnhub_api_key", e.target.value)}
+                placeholder={settings.finnhub_api_key_configured ? "•••••• (saved)" : "Optional — real-time USD/INR macro"}
+                className="w-full bg-zinc-800 border border-border rounded px-2 py-1.5 text-xs text-zinc-100 placeholder-zinc-600 focus:outline-none focus:border-brand"
+              />
+              <p className="text-[10px] text-zinc-600 mt-1">
+                Improves the live-macro snapshot (USD/INR); falls back to yfinance when unset.
+              </p>
+            </div>
+          </div>
         </section>
 
         {/* Alert Settings */}

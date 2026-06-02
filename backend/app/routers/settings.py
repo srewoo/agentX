@@ -23,6 +23,10 @@ ALLOWED_KEYS = {
     "llm_judging_enabled", "debate_enabled", "multi_perspective_enabled",
     # Advisor + autonomous-paper-trading toggles
     "auto_paper_trade", "auto_paper_min_strength", "auto_paper_max_open",
+    "auto_paper_trade_enabled", "auto_paper_min_conviction", "auto_paper_max_per_day",
+    "auto_paper_max_open_positions", "auto_paper_interval_minutes",
+    # Daily lightweight backtest pulse (runs 11:00 IST).
+    "daily_backtest_enabled", "daily_backtest_symbols",
     "capital", "risk_per_trade_pct", "atr_sl_mult", "atr_target_mult",
     "regime_filter", "roundtrip_cost_pct", "dedupe_signals",
     "audio_alerts", "audio_strength_threshold",
@@ -30,6 +34,11 @@ ALLOWED_KEYS = {
     "broker",
     "angelone_api_key", "angelone_client_code", "angelone_mpin", "angelone_totp_secret",
     "kite_api_key", "kite_api_secret", "kite_access_token",
+    # Upstox data source (daily OAuth token + app creds) + Twelve Data fallback.
+    "upstox_access_token", "upstox_api_key", "upstox_api_secret",
+    "twelvedata_api_key",
+    # Financial Modeling Prep (fundamentals + earnings calendar) + Finnhub (macro).
+    "fmp_api_key", "finnhub_api_key",
 }
 
 # Keys whose VALUES must never be returned to clients. We expose only a
@@ -46,6 +55,9 @@ _SECRET_KEYS = frozenset(SECRET_KEYS & ALLOWED_KEYS) if False else frozenset({
     # UI sees only the `<key>_configured` boolean flag.
     "angelone_api_key", "angelone_client_code", "angelone_mpin", "angelone_totp_secret",
     "kite_api_key", "kite_api_secret", "kite_access_token",
+    "upstox_access_token", "upstox_api_key", "upstox_api_secret",
+    "twelvedata_api_key",
+    "fmp_api_key", "finnhub_api_key",
 })
 
 
@@ -129,3 +141,21 @@ async def update_settings(body: UpdateSettingsRequest):
     # Never echo secret values back. Redact so tests and clients see the
     # `_configured` flag instead of the raw key.
     return {"settings": _redact_secrets(updates), "ok": True}
+
+
+@router.post("/test-upstox")
+async def test_upstox() -> dict:
+    """Validate the stored Upstox access token against /v2/user/profile.
+
+    Reads the (sealed) ``upstox_access_token`` from settings, unseals it, and
+    hits Upstox to confirm it's live. Returns ``{ok, message}`` for the
+    Settings UI button. Never returns the token itself.
+    """
+    from app.services.orchestrator import _get_settings
+    from app.services import upstox_fetcher
+
+    settings = await _get_settings()
+    token = settings.get("upstox_access_token") or ""
+    if not token:
+        return {"ok": False, "message": "No Upstox access token saved. Paste one and Save first."}
+    return await upstox_fetcher.test_connection(token)

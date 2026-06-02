@@ -158,3 +158,58 @@ def test_high_correlation_emits_warning_not_reject():
     # Approved but with a warning.
     assert res.verdict is GateVerdict.APPROVED
     assert any("correlation" in w for w in res.warnings)
+
+
+# ── Quality gates (4a / 4b / 4c) ─────────────────────────────────────────
+
+def test_bad_data_quality_rejects():
+    res = evaluate_trade(_basic_candidate(data_quality="stale"), _portfolio())
+    assert res.verdict is GateVerdict.REJECTED
+    assert any("data quality" in r for r in res.reasons)
+
+
+def test_good_data_quality_passes():
+    res = evaluate_trade(_basic_candidate(data_quality="ok"), _portfolio())
+    assert res.verdict is GateVerdict.APPROVED
+
+
+def test_data_quality_none_is_inert():
+    # No data_quality supplied ⇒ gate must not fire.
+    res = evaluate_trade(_basic_candidate(data_quality=None), _portfolio())
+    assert res.verdict is GateVerdict.APPROVED
+
+
+def test_wide_spread_rejects():
+    # bid 100 / ask 102 → 2% spread > 1% cap.
+    res = evaluate_trade(_basic_candidate(bid=100.0, ask=102.0), _portfolio())
+    assert res.verdict is GateVerdict.REJECTED
+    assert any("spread" in r for r in res.reasons)
+
+
+def test_tight_spread_passes():
+    # bid 100 / ask 100.2 → 0.2% spread, under cap.
+    res = evaluate_trade(_basic_candidate(bid=100.0, ask=100.2), _portfolio())
+    assert res.verdict is GateVerdict.APPROVED
+
+
+def test_spread_inert_without_quotes():
+    res = evaluate_trade(_basic_candidate(bid=None, ask=None), _portfolio())
+    assert res.verdict is GateVerdict.APPROVED
+
+
+def test_atr_chop_rejects():
+    # High ATR (6%) + low ADX (15) → choppy, no trend.
+    res = evaluate_trade(_basic_candidate(atr_pct=6.0, adx=15.0), _portfolio())
+    assert res.verdict is GateVerdict.REJECTED
+    assert any("choppy" in r for r in res.reasons)
+
+
+def test_high_atr_with_strong_trend_passes():
+    # High ATR but strong ADX (35) is a trending move, not chop.
+    res = evaluate_trade(_basic_candidate(atr_pct=6.0, adx=35.0), _portfolio())
+    assert res.verdict is GateVerdict.APPROVED
+
+
+def test_atr_chop_inert_without_inputs():
+    res = evaluate_trade(_basic_candidate(atr_pct=None, adx=None), _portfolio())
+    assert res.verdict is GateVerdict.APPROVED

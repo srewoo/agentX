@@ -184,6 +184,20 @@ export interface AppSettings {
   kite_api_key?: string;
   kite_api_secret?: string;
   kite_access_token?: string;
+  // Upstox data source — daily OAuth access token (write-only; the backend
+  // never echoes it back, only an `upstox_access_token_configured` flag).
+  upstox_access_token?: string;
+  upstox_access_token_configured?: boolean;
+  upstox_api_key?: string;
+  upstox_api_secret?: string;
+  // Twelve Data keyed fallback.
+  twelvedata_api_key?: string;
+  // Financial Modeling Prep (fundamentals + earnings calendar) + Finnhub (macro / USD-INR).
+  // Write-only: the backend returns only a `<key>_configured` boolean, never the value.
+  fmp_api_key?: string;
+  fmp_api_key_configured?: boolean;
+  finnhub_api_key?: string;
+  finnhub_api_key_configured?: boolean;
   // ── added by Tier 1/2/3 buildout ─────────────────────────────────
   onboarding_complete?: boolean;
   theme?: "dark" | "light";
@@ -399,6 +413,23 @@ export interface ScanStatus {
   progress_pct: number;        // 0–100
   signals_so_far: number;
   error: string | null;
+}
+
+export interface AutomationStatusHeartbeat {
+  last_run_at: string;
+  summary?: Record<string, unknown> | null;
+}
+
+export interface AutomationStatus {
+  orchestrator_running: boolean;
+  market_open: boolean;
+  auto_paper_enabled: boolean;
+  daily_backtest_enabled: boolean;
+  open_positions: number;
+  heartbeats: Record<string, AutomationStatusHeartbeat>;
+  last_backtest_at: string | null;
+  next_daily_backtest_utc: string;
+  next_weekly_backtest_utc: string;
 }
 
 export interface BacktestRun {

@@ -22,7 +22,7 @@ Guardrails:
 """
 import logging
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Optional
 
 import aiosqlite
 
@@ -36,6 +36,51 @@ logger = logging.getLogger(__name__)
 DEFAULT_MIN_CONVICTION = 65
 DEFAULT_MAX_PER_DAY = 5
 DEFAULT_MAX_OPEN_POSITIONS = 12
+
+# Conviction → win-probability mapping for Kelly sizing.
+# Deliberately conservative: the walk-forward evidence shows even strong
+# signals realise only ~53% WR, so conviction 100 maps to just ~0.57 and
+# conviction 50 to a coin-flip. This keeps Kelly fractions honest — we never
+# let the engine's self-reported confidence inflate the bet beyond what the
+# measured edge supports. Combined with ¼-Kelly + caps, sizing stays sane.
+_WIN_PROB_BASE = 0.50          # win prob at conviction 50
+_WIN_PROB_SLOPE = 0.0014       # per conviction point above/below 50
+_WIN_PROB_CAP = 0.58           # never imply more edge than the data shows
+
+
+def _win_probability(conviction: float) -> float:
+    """Map a 0-100 conviction to a conservative win probability for Kelly.
+
+    Heavily shrunk toward 0.5 — see module-level rationale. A separately
+    measured/calibrated probability (e.g. meta-label output) should be
+    preferred by callers when available; this is the conviction-only floor.
+    """
+    p = _WIN_PROB_BASE + (float(conviction) - 50.0) * _WIN_PROB_SLOPE
+    return max(0.35, min(_WIN_PROB_CAP, p))
+
+
+async def _fetch_volatility(symbol: str) -> tuple[Optional[float], Optional[float]]:
+    """Best-effort ``(atr_pct, adx)`` for the risk gate's ATR-chop rule.
+
+    Returns ``(None, None)`` on any failure (offline, thin history, source
+    cooldown) so the chop gate stays *inert* rather than blocking a trade on
+    missing data. Real numbers when the data layer can serve history.
+    """
+    try:
+        from app.services.data_fetcher import async_fetch_history
+        from app.services.technicals import compute_technicals
+        df = await async_fetch_history(symbol, period="6mo")
+        if df is None or len(df) < 30:
+            return None, None
+        tech = compute_technicals(df)
+        atr_pct = tech.get("atr_pct")
+        adx = tech.get("adx")
+        return (
+            float(atr_pct) if atr_pct is not None else None,
+            float(adx) if adx is not None else None,
+        )
+    except Exception:
+        return None, None
 
 
 async def _today_iso() -> str:
@@ -157,6 +202,12 @@ async def auto_open_from_recommendations(
     except Exception:
         _corr_available = False
 
+    try:
+        from app.services.kelly_sizing import kelly_position_size
+        _kelly_available = True
+    except Exception:
+        _kelly_available = False
+
     skip_counts: dict[str, int] = {}
     for conv, rr, r in candidates:
         if len(opened) >= budget:
@@ -176,6 +227,32 @@ async def auto_open_from_recommendations(
             continue
         # Strength = floor of conviction/10, clamped 1..10.
         strength = max(1, min(10, int(conv // 10)))
+
+        # ── edge-aware Kelly sizing (the filter) ──
+        # Size the position to its measured edge. A non-positive Kelly
+        # fraction means the trade has no positive expectancy at this
+        # win-probability + reward:risk — we skip it entirely. This is the
+        # deterministic stand-in for the oracle that only bets positive-edge
+        # trades (see kelly_sizing.py / backtest_results/CEILING_ANALYSIS.md).
+        kelly_shares: int | None = None
+        position_size: float | None = None
+        if _kelly_available:
+            try:
+                sizing = kelly_position_size(
+                    capital=capital, entry=entry, stop=sl, target=tgt,
+                    win_prob=_win_probability(conv), direction=direction,
+                )
+                if sizing["skip"]:
+                    skip_counts["negative_kelly_edge"] = skip_counts.get("negative_kelly_edge", 0) + 1
+                    logger.info(
+                        "SKIP auto-open %s: %s (b=%.2f)",
+                        sym, sizing["reason"], sizing["payoff_ratio"],
+                    )
+                    continue
+                kelly_shares = int(sizing["shares"])
+                position_size = float(sizing["position_value"])
+            except Exception as e:
+                logger.debug("kelly sizing skipped for %s: %s", sym, e)
 
         # ── pre-trade correlation check (≥ 0.7 to most-correlated open) ──
         max_corr = 0.0
@@ -198,14 +275,41 @@ async def auto_open_from_recommendations(
         # ── hard 10-rule risk gate ──
         if _risk_gate_available:
             try:
+                # Use the Kelly-sized share count as the gate's qty so the
+                # position-size / sector caps evaluate the size we actually
+                # intend to take (falls back to 1 when Kelly is unavailable).
+                gate_qty = kelly_shares if kelly_shares and kelly_shares > 0 else max(
+                    1, int(getattr(r, "shares", 0) or r.get("shares") or 1)
+                )
+                # Quality-gate inputs: data_quality off the recommendation
+                # (real), ATR%/ADX from a best-effort technicals fetch. Both
+                # gates stay inert when their inputs aren't available.
+                data_quality = (
+                    getattr(r, "data_quality", None)
+                    or (r.get("data_quality") if isinstance(r, dict) else None)
+                )
+                atr_pct, adx = await _fetch_volatility(sym)
+                # Earnings blackout via FMP calendar — None (no key/failed)
+                # leaves the gate inert; True triggers rejection in the gate.
+                earnings_blackout = False
+                try:
+                    from app.services.fmp_fetcher import is_in_earnings_blackout
+                    bl = await is_in_earnings_blackout(sym)
+                    earnings_blackout = bool(bl) if bl is not None else False
+                except Exception as e:
+                    logger.debug("earnings-blackout check skipped for %s: %s", sym, e)
                 candidate = TradeCandidate(
                     symbol=sym,
                     direction=direction,
                     entry=entry,
                     stop=sl,
                     target=tgt,
-                    qty=max(1, int(getattr(r, "shares", 0) or r.get("shares") or 1)),
+                    qty=gate_qty,
                     sector=str(getattr(r, "sector", "") or r.get("sector") or "Unknown"),
+                    data_quality=data_quality,
+                    atr_pct=atr_pct,
+                    adx=adx,
+                    is_in_earnings_blackout=earnings_blackout,
                 )
                 portfolio = PortfolioState(
                     capital=capital,
@@ -218,7 +322,14 @@ async def auto_open_from_recommendations(
                     logger.info("REJECTED auto-open %s by risk_gate: %s", sym, "; ".join(gate.reasons))
                     continue
                 if gate.verdict == GateVerdict.MODIFIED and gate.modified_qty is not None:
-                    # The gate trimmed our size — propagate downstream.
+                    # The gate trimmed our size — clamp Kelly shares to it.
+                    if kelly_shares is not None:
+                        kelly_shares = max(0, min(kelly_shares, gate.modified_qty))
+                        if kelly_shares <= 0:
+                            skip_counts["risk_gate_rejected"] = skip_counts.get("risk_gate_rejected", 0) + 1
+                            logger.info("REJECTED auto-open %s: risk gate trimmed size to 0", sym)
+                            continue
+                        position_size = round(kelly_shares * entry, 2)
                     strength = max(1, min(strength, gate.modified_qty))
             except Exception as e:
                 logger.debug("risk_gate evaluation skipped for %s: %s", sym, e)
@@ -232,10 +343,13 @@ async def auto_open_from_recommendations(
                 entry_price=entry,
                 stop_loss=sl,
                 target=tgt,
+                position_size=position_size,
+                shares=kelly_shares,
                 source="auto",
             )
             opened.append({"symbol": sym, "direction": direction, "conviction": conv,
-                            "trade_id": trade["trade_id"]})
+                            "trade_id": trade["trade_id"], "shares": kelly_shares,
+                            "position_size": position_size})
         except Exception as e:
             logger.warning("auto-open failed for %s: %s", sym, e)
             skip_counts["create_error"] = skip_counts.get("create_error", 0) + 1
