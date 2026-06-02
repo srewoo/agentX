@@ -54,6 +54,8 @@ export default function AutomationStatusPanel() {
   const autoPaper = hb["auto_paper"];
   const scan = hb["scan"];
   const dailyBt = hb["backtest_daily"];
+  const calib = hb["calibration"];
+  const calibSummary = (calib?.summary ?? {}) as Record<string, unknown>;
 
   return (
     <div className="space-y-2 text-xs">
@@ -110,6 +112,20 @@ export default function AutomationStatusPanel() {
               {when(status.next_daily_backtest_utc)} · {when(status.next_weekly_backtest_utc)}
             </span>
           </Row>
+          <div className="border-t border-border my-1" />
+          <Row label="Weekly self-calibration">
+            <span className="text-zinc-500">ran {ago(calib?.last_run_at)}</span>
+          </Row>
+          {calib?.summary && (
+            <p className="text-[10px] text-zinc-600 pl-1">
+              weights: {String(calibSummary.factor_weights ?? "—")} · meta-label: {String(calibSummary.meta_label ?? "—")} · meta-judge: {calibSummary.meta_judge_trained ? `AUC ${String(calibSummary.meta_judge_auc ?? "?")}` : "not trained"}
+            </p>
+          )}
+          {calib?.summary && (calibSummary.factor_weights === "insufficient_data" || calibSummary.meta_label === "insufficient_data") && (
+            <p className="text-[10px] text-amber-500/80 pl-1">
+              Still gathering data (need ≥200 resolved trades) — engine using priors until then.
+            </p>
+          )}
         </div>
       )}
 

@@ -15,8 +15,53 @@ from typing import Any
 
 import aiosqlite
 
-from app.database import DB_PATH
+from app.database import DB_PATH, CREATE_SIGNAL_OUTCOMES_TABLE
 from app.services.signal_edge import get_edge
+
+
+async def _record_paper_outcome(
+    db: aiosqlite.Connection, trade: dict[str, Any], *,
+    exit_price: float, exit_date: str, pnl_pct: float, now_iso: str,
+) -> None:
+    """Persist a closed paper trade into ``signal_outcomes`` so the weekly
+    learners (meta-judge, signal_tracker) train on REAL paper-trade P&L, not
+    just re-simulated price. Best-effort — a failure here never blocks the
+    close. Idempotent via the ``paper_<trade_id>`` signal_id key.
+    """
+    try:
+        hold_days = None
+        try:
+            ed = datetime.fromisoformat(str(trade.get("entry_date"))[:10])
+            xd = datetime.fromisoformat(str(exit_date)[:10])
+            hold_days = max(0, (xd - ed).days)
+        except Exception:
+            hold_days = None
+        outcome = "win" if pnl_pct > 0 else "loss"
+        await db.execute(CREATE_SIGNAL_OUTCOMES_TABLE)
+        await db.execute(
+            """INSERT OR REPLACE INTO signal_outcomes
+               (signal_id, symbol, signal_type, direction, entry_price, exit_price,
+                entry_time, exit_time, pnl_pct, outcome, hold_days, evaluated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                f"paper_{trade.get('trade_id')}",
+                trade.get("symbol"),
+                trade.get("signal_type") or "paper_trade",
+                trade.get("direction"),
+                float(trade.get("entry_price") or 0),
+                float(exit_price),
+                str(trade.get("entry_date")),
+                exit_date,
+                round(float(pnl_pct), 4),
+                outcome,
+                hold_days,
+                now_iso,
+            ),
+        )
+        await db.commit()
+    except Exception:
+        # Learning signal is best-effort; never let it break a trade close.
+        pass
 
 PAPER_TRADE_FIELDS = [
     "trade_id",
@@ -237,6 +282,12 @@ async def close_paper_trade(
             ),
         )
         await db.commit()
+
+        # Feed the realised outcome into the learning loop (signal_outcomes).
+        await _record_paper_outcome(
+            db, trade, exit_price=float(exit_price),
+            exit_date=exit_date or now[:10], pnl_pct=pnl_pct, now_iso=now,
+        )
 
         async with db.execute("SELECT * FROM paper_trades WHERE trade_id = ?", (trade_id,)) as cur:
             updated = await cur.fetchone()

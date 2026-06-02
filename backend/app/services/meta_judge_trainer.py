@@ -102,6 +102,13 @@ async def train_and_save(
     model = MetaJudge.train(train, n_stumps=n_stumps, target_tpr=target_tpr)
     ev = evaluate(model, test)
 
+    # Persist the holdout metrics INTO the model's train_meta as well, not
+    # just the sidecar .meta.json. The orchestrator's deploy gate reads
+    # `train_meta["holdout_metrics"]["auc"]` at load time — without this the
+    # gate always sees 0.0 and the model never deploys, however good it is.
+    if isinstance(model.train_meta, dict):
+        model.train_meta["holdout_metrics"] = ev
+
     _model_dir()
     model.save(_MODEL_PATH)
     meta_path = _MODEL_PATH.with_suffix(".meta.json")

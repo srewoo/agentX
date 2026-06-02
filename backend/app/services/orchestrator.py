@@ -1276,6 +1276,8 @@ class SignalOrchestrator:
         # resolved trades; once over the threshold they self-activate
         # and the engine picks them up on its next request without a
         # restart (in-memory caches updated as a side effect).
+        tune_res: dict[str, Any] = {}
+        meta_res: dict[str, Any] = {}
         try:
             from app.services.recommendation_tuner import logistic_fit_weights
             tune_res = await logistic_fit_weights()
@@ -1292,6 +1294,36 @@ class SignalOrchestrator:
             )
         except Exception as e:
             logger.warning("Weekly meta-label refit failed: %s", e)
+
+        # Auto-retrain the deterministic AdaBoost meta-judge from resolved
+        # outcomes. It only *deploys* when holdout AUC ≥ 0.55 (gate lives in
+        # the scan path), so a noisy retrain can't degrade live filtering —
+        # but without this weekly call the model was never refreshed at all.
+        mj_res: dict[str, Any] = {}
+        try:
+            from app.services.meta_judge_trainer import train_and_save
+            mj_res = await train_and_save()
+            auc = (mj_res.get("holdout_metrics") or {}).get("auc") if mj_res.get("trained") else None
+            logger.info(
+                "Weekly meta-judge retrain: trained=%s holdout_auc=%s",
+                mj_res.get("trained"), auc,
+            )
+        except Exception as e:
+            logger.warning("Weekly meta-judge retrain failed: %s", e)
+
+        # Record the calibration verdict so the automation-status panel can
+        # show whether the loop actually adjusted anything or is still waiting
+        # for the ≥200-sample threshold.
+        try:
+            from app.services.runtime_status import record_run
+            await record_run("calibration", summary={
+                "factor_weights": tune_res.get("status"),
+                "meta_label": meta_res.get("status"),
+                "meta_judge_trained": mj_res.get("trained", False),
+                "meta_judge_auc": (mj_res.get("holdout_metrics") or {}).get("auc") if mj_res.get("trained") else None,
+            })
+        except Exception as e:
+            logger.debug("runtime_status record (calibration) failed: %s", e)
 
     async def _auto_paper_loop(self) -> None:
         """Independent loop for the multi-factor auto-paper-trader.

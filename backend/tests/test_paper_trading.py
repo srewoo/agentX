@@ -95,3 +95,50 @@ async def test_create_close_list_and_summary_paper_trade(paper_db):
     assert summary["closed"] == 1
     assert summary["wins"] == 1
     assert summary["win_rate"] == 100.0
+
+
+@pytest.mark.asyncio
+async def test_close_paper_trade_records_signal_outcome(paper_db):
+    """Closing a paper trade must persist a signal_outcomes row so the weekly
+    learners train on real paper-trade P&L (the self-correction wiring)."""
+    trade = await paper_trading.create_paper_trade(
+        symbol="TCS", direction="bullish", signal_type="macd_divergence",
+        strength=7, entry_price=100.0, stop_loss=95.0, target=115.0,
+        entry_date="2026-05-20", shares=10, position_size=1000.0, source="auto",
+    )
+    tid = trade["trade_id"]
+    # Close above entry → a win, +10%.
+    await paper_trading.close_paper_trade(tid, exit_price=110.0, exit_date="2026-05-25")
+
+    con = sqlite3.connect(paper_db)
+    row = con.execute(
+        "SELECT signal_type, direction, pnl_pct, outcome, hold_days "
+        "FROM signal_outcomes WHERE signal_id=?", (f"paper_{tid}",),
+    ).fetchone()
+    con.close()
+    assert row is not None
+    assert row[0] == "macd_divergence"
+    assert row[1] == "bullish"
+    assert row[2] == pytest.approx(10.0, abs=0.01)
+    assert row[3] == "win"
+    assert row[4] == 5  # 2026-05-20 → 2026-05-25
+
+
+@pytest.mark.asyncio
+async def test_close_records_loss_outcome(paper_db):
+    trade = await paper_trading.create_paper_trade(
+        symbol="INFY", direction="bullish", signal_type="double_top",
+        strength=5, entry_price=100.0, stop_loss=95.0, target=115.0,
+        entry_date="2026-05-20", shares=10, source="auto",
+    )
+    tid = trade["trade_id"]
+    await paper_trading.close_paper_trade(tid, exit_price=92.0, exit_date="2026-05-22")
+    con = sqlite3.connect(paper_db)
+    row = con.execute(
+        "SELECT pnl_pct, outcome FROM signal_outcomes WHERE signal_id=?",
+        (f"paper_{tid}",),
+    ).fetchone()
+    con.close()
+    assert row is not None
+    assert row[0] < 0
+    assert row[1] == "loss"
