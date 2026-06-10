@@ -20,7 +20,9 @@ def trainer_env(monkeypatch):
         "CREATE TABLE signal_outcomes (signal_id TEXT PRIMARY KEY, symbol TEXT, "
         "signal_type TEXT, direction TEXT, entry_price REAL, exit_price REAL, "
         "entry_time TEXT, exit_time TEXT, pnl_pct REAL, outcome TEXT, hold_days INTEGER, "
-        "evaluated_at TEXT)"
+        "evaluated_at TEXT, strength INTEGER, regime TEXT, sector TEXT, rsi REAL, "
+        "adx REAL, atr_pct REAL, dist_sma20_pct REAL, dist_sma50_pct REAL, "
+        "dist_sma200_pct REAL, delivery_pct REAL, vix REAL)"
     )
     # 240 separable rows: 'good' setups win, 'bad' setups lose → high AUC.
     rows = []

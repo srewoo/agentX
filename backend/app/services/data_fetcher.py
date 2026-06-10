@@ -20,6 +20,7 @@ executors. The orchestrator and routers call these functions.
 import asyncio
 import logging
 import random
+import threading
 import time
 import warnings
 from typing import Any
@@ -519,6 +520,18 @@ async def get_stock_quote(symbol: str) -> dict[str, Any]:
             logger.debug("yfinance quote failed for %s: %s", symbol, e)
             source_health.mark_down("yfinance")
 
+    # Last resort: the bulk EOD bhavcopy (one whole-market download, cached).
+    # Serves last close when every live source is parked — better than a null
+    # quote that flatlines the auto-paper loop and stop-loss checks.
+    try:
+        from app.services import bhavcopy
+        eod = await bhavcopy.get_eod_quote(clean_symbol)
+        if eod and eod.get("lastPrice") is not None:
+            eod["symbol"] = symbol
+            return eod
+    except Exception as e:
+        logger.debug("bhavcopy EOD quote failed for %s: %s", clean_symbol, e)
+
     return {"symbol": symbol, "lastPrice": None, "error": "All data sources failed"}
 
 
@@ -549,6 +562,16 @@ async def get_delivery_volume(symbol: str) -> dict[str, Any]:
     except Exception as e:
         logger.debug("NSE delivery fetch failed for %s: %s", clean, e)
 
+    # Fallback: the bulk bhavcopy carries DELIV_PER for the whole market in
+    # one cached download — no per-symbol anti-bot 403 wall.
+    try:
+        from app.services import bhavcopy
+        bc = await bhavcopy.get_delivery_pct(clean)
+        if bc and bc.get("delivery_pct") is not None:
+            return bc
+    except Exception as e:
+        logger.debug("bhavcopy delivery fetch failed for %s: %s", clean, e)
+
     return {"symbol": symbol, "delivery_pct": None, "traded_qty": None,
             "delivered_qty": None, "source": "unavailable"}
 
@@ -564,7 +587,22 @@ _NSE_DELIVERY_HEADERS = {
     "Referer": "https://www.nseindia.com/get-quotes/equity",
 }
 _NSE_HOMEPAGE = "https://www.nseindia.com"
+_NSE_QUOTES_PAGE = "https://www.nseindia.com/get-quotes/equity?symbol={symbol}"
 _NSE_DELIVERY_TIMEOUT = 12.0
+
+# Anti-bot throttle. NSE rate-limits per IP at roughly 3 req/s; staying under
+# that (with jitter) is what stops the 403 feedback loop the scan loop triggers
+# when it fans out across ~50 symbols. The lock serialises concurrent threads
+# so the spacing holds even though fetches run in the asyncio executor pool.
+_NSE_MIN_INTERVAL = 0.4  # seconds between NSE requests (~2.5 req/s ceiling)
+_nse_rate_lock = threading.Lock()
+_nse_last_request_at: float = 0.0
+
+# Cookies expire well before NSE forces a 403; re-warm proactively under this
+# TTL instead of waiting for the request to fail.
+_NSE_WARM_TTL = 240.0
+_nse_session_warmed_at: float = 0.0
+
 # Module-level session reused across calls so cookies persist between fetches.
 _nse_delivery_session: Any = None
 
@@ -584,12 +622,48 @@ def _get_nse_delivery_session() -> Any:
     return _nse_delivery_session
 
 
-def _warm_nse_session(session: Any) -> None:
-    """Hit the NSE homepage so the session picks up the anti-bot cookies."""
+def _throttle_nse() -> None:
+    """Block until at least ``_NSE_MIN_INTERVAL`` (plus jitter) has elapsed
+    since the last NSE request. Serialised across threads via a lock so the
+    spacing holds under the executor pool the async fetchers run in."""
+    global _nse_last_request_at
+    with _nse_rate_lock:
+        now = time.monotonic()
+        wait = _NSE_MIN_INTERVAL - (now - _nse_last_request_at)
+        if wait > 0:
+            time.sleep(wait + random.uniform(0, 0.15))
+        _nse_last_request_at = time.monotonic()
+
+
+def _warm_nse_session(session: Any, symbol: str | None = None) -> None:
+    """Warm the session so it picks up NSE's anti-bot cookies.
+
+    A single homepage GET is often not enough — NSE sets the full cookie chain
+    only after a navigation that looks like a real user landing on a quote
+    page. We hit the homepage, then (if a symbol is known) the get-quotes page,
+    with a short pause so the cookies settle before the API call.
+    """
+    global _nse_session_warmed_at
     try:
         session.get(_NSE_HOMEPAGE, timeout=_NSE_DELIVERY_TIMEOUT)
+        if symbol:
+            time.sleep(0.3)
+            session.get(
+                _NSE_QUOTES_PAGE.format(symbol=symbol),
+                timeout=_NSE_DELIVERY_TIMEOUT,
+            )
+        time.sleep(0.3)
+        _nse_session_warmed_at = time.monotonic()
     except Exception as e:  # pragma: no cover - logged for diagnostics
         logger.debug("NSE session warm-up failed: %s", e)
+
+
+def _ensure_nse_warm(session: Any, symbol: str | None = None) -> None:
+    """Proactively warm the session if it has never been warmed or its cookies
+    are older than ``_NSE_WARM_TTL`` — before issuing the request, not after a
+    403."""
+    if (time.monotonic() - _nse_session_warmed_at) >= _NSE_WARM_TTL:
+        _warm_nse_session(session, symbol)
 
 
 async def _fetch_nse_delivery(symbol: str) -> dict[str, Any] | None:
@@ -608,12 +682,15 @@ async def _fetch_nse_delivery(symbol: str) -> dict[str, Any] | None:
 
     def _sync_fetch() -> dict[str, Any] | None:
         session = _get_nse_delivery_session()
+        # Warm proactively (before a 403) if cookies are stale or absent.
+        _ensure_nse_warm(session, symbol)
         url = (
             f"https://www.nseindia.com/api/quote-equity"
             f"?symbol={symbol}&section=trade_info"
         )
 
         def _do_request() -> requests.Response:
+            _throttle_nse()
             return session.get(url, timeout=_NSE_DELIVERY_TIMEOUT)
 
         # First attempt — may 403 if cookies are stale.
@@ -628,7 +705,7 @@ async def _fetch_nse_delivery(symbol: str) -> dict[str, Any] | None:
                 "NSE delivery 403 for %s; re-warming session and retrying once",
                 symbol,
             )
-            _warm_nse_session(session)
+            _warm_nse_session(session, symbol)
             try:
                 resp = _do_request()
             except requests.RequestException as e:

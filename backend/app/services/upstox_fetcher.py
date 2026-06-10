@@ -36,6 +36,10 @@ logger = logging.getLogger(__name__)
 _BASE = "https://api.upstox.com/v2"
 _INSTRUMENT_URL = "https://assets.upstox.com/market-quote/instruments/exchange/{exch}.json.gz"
 _HTTP_TIMEOUT = 12.0
+
+# OAuth2 authorization-code endpoints (Upstox API v2).
+_LOGIN_DIALOG = "https://api.upstox.com/v2/login/authorization/dialog"
+_TOKEN_URL = "https://api.upstox.com/v2/login/authorization/token"
 _CACHE_DIR = Path("/tmp/agentx_upstox")
 
 # Instrument master is large (~1-2 MB gz). Cache the symbol→instrument_key map
@@ -157,7 +161,7 @@ def _sync_fetch_history(
     try:
         resp = requests.get(url, headers=_auth_headers(token), timeout=_HTTP_TIMEOUT)
         if resp.status_code == 401:
-            logger.warning("upstox: 401 — access token expired/invalid; re-auth in Settings")
+            logger.warning("upstox: 401 on history — token lacks market-data access (use an Analytics Token; see Settings)")
             return None
         resp.raise_for_status()
         candles = (resp.json().get("data") or {}).get("candles") or []
@@ -216,7 +220,7 @@ def _sync_fetch_quote(symbol: str, token: str, exchange: str) -> Optional[dict]:
             timeout=_HTTP_TIMEOUT,
         )
         if resp.status_code == 401:
-            logger.warning("upstox: 401 on quote — access token expired/invalid")
+            logger.warning("upstox: 401 on quote — token lacks market-data access (use an Analytics Token; see Settings)")
             return None
         resp.raise_for_status()
         data = resp.json().get("data") or {}
@@ -273,7 +277,7 @@ def _sync_fetch_intraday(symbol: str, interval: str, token: str, exchange: str) 
     try:
         resp = requests.get(url, headers=_auth_headers(token), timeout=_HTTP_TIMEOUT)
         if resp.status_code == 401:
-            logger.warning("upstox: 401 on intraday — token expired/invalid")
+            logger.warning("upstox: 401 on intraday — token lacks market-data access (use an Analytics Token; see Settings)")
             return None
         resp.raise_for_status()
         candles = (resp.json().get("data") or {}).get("candles") or []
@@ -352,7 +356,7 @@ def _sync_fetch_option_chain(symbol: str, token: str, exchange: str) -> Optional
             params={"instrument_key": key}, timeout=_HTTP_TIMEOUT,
         )
         if cresp.status_code == 401:
-            logger.warning("upstox: 401 on option/contract — token expired/invalid")
+            logger.warning("upstox: 401 on option/contract — token lacks market-data access (use an Analytics Token; see Settings)")
             return None
         cresp.raise_for_status()
         contracts = cresp.json().get("data") or []
@@ -404,24 +408,131 @@ async def upstox_fetch_option_chain(
     )
 
 
+# ── OAuth2 token generation (for the Settings UI flow) ───────
+# Upstox issues short-lived access tokens via the authorization-code grant:
+#   1. Open build_login_url(...) in a browser, log in, approve.
+#   2. Upstox redirects to redirect_uri?code=<CODE>.
+#   3. exchange_code(<CODE>, ...) trades the code for an access_token.
+# The token expires daily (~03:30 IST), so this is re-run each trading day.
+
+def build_login_url(api_key: str, redirect_uri: str, state: str = "agentx") -> str:
+    """Return the Upstox login dialog URL to open in a browser.
+
+    ``api_key`` is the Upstox app's API key (client_id). ``redirect_uri`` must
+    exactly match the one registered on the Upstox app, or Upstox rejects it.
+    """
+    from urllib.parse import urlencode
+
+    query = urlencode({
+        "response_type": "code",
+        "client_id": api_key,
+        "redirect_uri": redirect_uri,
+        "state": state,
+    })
+    return f"{_LOGIN_DIALOG}?{query}"
+
+
+def _sync_exchange_code(
+    code: str, api_key: str, api_secret: str, redirect_uri: str,
+) -> dict[str, Any]:
+    """Trade an authorization code for an access token. Never raises."""
+    import requests
+
+    if not (code and api_key and api_secret and redirect_uri):
+        return {
+            "ok": False,
+            "message": "Need code, upstox_api_key, upstox_api_secret and redirect_uri.",
+        }
+    try:
+        resp = requests.post(
+            _TOKEN_URL,
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+            data={
+                "code": code,
+                "client_id": api_key,
+                "client_secret": api_secret,
+                "redirect_uri": redirect_uri,
+                "grant_type": "authorization_code",
+            },
+            timeout=_HTTP_TIMEOUT,
+        )
+        body = resp.json() if resp.content else {}
+    except Exception as e:
+        return {"ok": False, "message": f"Token exchange failed: {e}"}
+
+    token = (body or {}).get("access_token")
+    if not token:
+        # Upstox returns {"errors":[{"message": "..."}]} on failure.
+        errs = (body or {}).get("errors") or []
+        detail = errs[0].get("message") if errs and isinstance(errs[0], dict) else None
+        return {
+            "ok": False,
+            "message": detail or f"No access_token in response (HTTP {resp.status_code}).",
+        }
+    return {"ok": True, "access_token": token, "message": "Access token generated."}
+
+
+async def exchange_code(
+    code: str, *, api_key: str, api_secret: str, redirect_uri: str,
+) -> dict[str, Any]:
+    """Async wrapper for the OAuth code→token exchange."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        None, _sync_exchange_code, code, api_key, api_secret, redirect_uri,
+    )
+
+
 # ── Connection test (for the Settings UI button) ─────────────
 
+_TEST_SYMBOL = "RELIANCE"  # liquid NSE equity always in the instrument master
+
+
 def _sync_test_connection(token: str) -> dict[str, Any]:
-    """Validate a token against /v2/user/profile. Returns {ok, message, ...}."""
+    """Validate a token against the *market-data* path (LTP quote).
+
+    We deliberately do NOT hit ``/v2/user/profile``: this app uses Upstox only
+    as a market-data source, and the supported credential for that is the
+    long-lived **Analytics Token**, which is market-data-only and returns 401
+    on ``/user/profile`` (account endpoint, static-IP restricted). Validating
+    against profile therefore gave false negatives for a working data token —
+    and false positives for a daily OAuth token that 401s on quotes. Hitting
+    LTP confirms the only thing that matters here: is live data flowing.
+    """
     import requests
 
     if not token:
         return {"ok": False, "message": "No Upstox access token configured."}
+
+    key = _resolve_instrument_key(_TEST_SYMBOL, "NSE")
+    if not key:
+        return {"ok": False, "message": "Could not load Upstox instrument master — check network."}
     try:
         resp = requests.get(
-            f"{_BASE}/user/profile", headers=_auth_headers(token), timeout=_HTTP_TIMEOUT,
+            f"{_BASE}/market-quote/ltp", headers=_auth_headers(token),
+            params={"instrument_key": key}, timeout=_HTTP_TIMEOUT,
         )
         if resp.status_code == 401:
-            return {"ok": False, "message": "Token rejected (401). Re-authenticate in Upstox and paste a fresh access token."}
+            return {
+                "ok": False,
+                "message": (
+                    "Token rejected for market data (401). Use an Upstox "
+                    "Analytics Token (Developer Apps → Analytics tab → Generate "
+                    "Token) — the daily OAuth access token does not grant "
+                    "market-data access."
+                ),
+            }
         resp.raise_for_status()
-        data = resp.json().get("data") or {}
-        name = data.get("user_name") or data.get("email") or "Upstox user"
-        return {"ok": True, "message": f"Connected as {name}.", "user": name}
+        payload = next(iter((resp.json().get("data") or {}).values()), None)
+        ltp = (payload or {}).get("last_price")
+        if ltp is None:
+            return {"ok": False, "message": "Connected, but no price returned (market may be closed)."}
+        return {
+            "ok": True,
+            "message": f"Connected — live market data flowing ({_TEST_SYMBOL} LTP ₹{ltp}).",
+        }
     except Exception as e:
         return {"ok": False, "message": f"Connection failed: {e}"}
 

@@ -6,7 +6,7 @@ import aiosqlite
 from fastapi import APIRouter
 
 from app.database import DB_PATH
-from app.models import UpdateSettingsRequest
+from app.models import UpdateSettingsRequest, UpstoxExchangeRequest
 from app.services.orchestrator import orchestrator
 from app.services.secrets import SECRET_KEYS, get_manager
 
@@ -159,3 +159,56 @@ async def test_upstox() -> dict:
     if not token:
         return {"ok": False, "message": "No Upstox access token saved. Paste one and Save first."}
     return await upstox_fetcher.test_connection(token)
+
+
+@router.get("/upstox-login-url")
+async def upstox_login_url(redirect_uri: str) -> dict:
+    """Build the Upstox OAuth login URL from the stored ``upstox_api_key``.
+
+    The caller opens the returned URL in a browser, approves access, and Upstox
+    redirects to ``redirect_uri?code=<CODE>``. ``redirect_uri`` must match the
+    one registered on the Upstox app. The api_key is *not* a secret in the URL —
+    it is the public client_id — so returning it here is safe.
+    """
+    from app.services.orchestrator import _get_settings
+    from app.services import upstox_fetcher
+
+    settings = await _get_settings()
+    api_key = settings.get("upstox_api_key") or ""
+    if not api_key:
+        return {"ok": False, "message": "Save your Upstox API key (upstox_api_key) first."}
+    return {"ok": True, "url": upstox_fetcher.build_login_url(api_key, redirect_uri)}
+
+
+@router.post("/upstox-exchange-code")
+async def upstox_exchange_code(body: UpstoxExchangeRequest) -> dict:
+    """Trade an OAuth authorization code for an access token and store it.
+
+    Reads the stored (sealed) ``upstox_api_key`` / ``upstox_api_secret``,
+    exchanges ``code`` for an access token, seals it, and persists it as
+    ``upstox_access_token``. Returns ``{ok, message}`` only — never the token.
+    """
+    from app.services.orchestrator import _get_settings
+    from app.services import upstox_fetcher
+
+    settings = await _get_settings()
+    api_key = settings.get("upstox_api_key") or ""
+    api_secret = settings.get("upstox_api_secret") or ""
+    if not (api_key and api_secret):
+        return {"ok": False, "message": "Save upstox_api_key and upstox_api_secret first."}
+
+    result = await upstox_fetcher.exchange_code(
+        body.code, api_key=api_key, api_secret=api_secret, redirect_uri=body.redirect_uri,
+    )
+    if not result.get("ok"):
+        return {"ok": False, "message": result.get("message", "Token exchange failed.")}
+
+    secrets_manager = get_manager()
+    sealed = secrets_manager.seal_key(result["access_token"])
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+            ("upstox_access_token", sealed),
+        )
+        await db.commit()
+    return {"ok": True, "message": "Upstox access token generated and saved."}

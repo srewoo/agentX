@@ -1,0 +1,10 @@
+# <type>(<scope>): <subject>   — max ~72 chars, imperative mood
+#
+# <blank line>
+# Body: explain WHY this change is needed, not WHAT (the diff shows what).
+#       Wrap at 72 chars.
+#
+# Footer: BREAKING CHANGE: ... / Refs: #123
+#
+# Types: feat fix refactor test docs chore perf ci build style revert
+# Co-Authored-By trailers go here.

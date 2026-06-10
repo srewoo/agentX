@@ -107,6 +107,15 @@ export const api = {
     request<{ ok: boolean }>("/api/settings", { method: "POST", body: JSON.stringify(settings) }),
   testUpstox: () =>
     request<{ ok: boolean; message: string; user?: string }>("/api/settings/test-upstox", { method: "POST" }),
+  upstoxLoginUrl: (redirectUri: string) =>
+    request<{ ok: boolean; url?: string; message?: string }>(
+      `/api/settings/upstox-login-url?redirect_uri=${encodeURIComponent(redirectUri)}`,
+    ),
+  upstoxExchangeCode: (code: string, redirectUri: string) =>
+    request<{ ok: boolean; message: string }>("/api/settings/upstox-exchange-code", {
+      method: "POST",
+      body: JSON.stringify({ code, redirect_uri: redirectUri }),
+    }),
 
   // Alerts
   getAlerts: () =>

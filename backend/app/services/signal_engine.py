@@ -69,6 +69,80 @@ def _make_signal(
     }
 
 
+# Top-level numeric/categorical keys the meta-judge's `featurise` reads. Kept
+# in sync with meta_judge._NUMERIC_FEATURES / _CATEGORICAL_FEATURES — these are
+# the fields the model splits on. Per-signal-type metadata (e.g. metadata.rsi
+# on an RSI signal) is NOT enough: featurise reads TOP-LEVEL keys and each
+# signal type carries different metadata, so without a uniform block the judge
+# is effectively blind. We stamp the same block here that the trainer later
+# reads back from signal_outcomes — guaranteeing train/serve feature symmetry.
+META_FEATURE_KEYS = (
+    "rsi", "adx", "atr_pct",
+    "dist_sma20_pct", "dist_sma50_pct", "dist_sma200_pct",
+    "delivery_pct", "vix",
+)
+
+
+def attach_meta_features(
+    signal: dict[str, Any],
+    *,
+    technicals: Optional[dict] = None,
+    regime: Optional[str] = None,
+    delivery_pct: Optional[float] = None,
+    vix: Optional[float] = None,
+    sector: Optional[str] = None,
+) -> dict[str, Any]:
+    """Stamp a uniform feature block onto a signal so the meta-judge sees the
+    same inputs at train time (persisted to signal_outcomes) and predict time
+    (live signal dict). Mutates and returns ``signal``.
+
+    Defensive by construction: every field is optional and any extraction
+    failure is swallowed — feature enrichment must never break the scan loop.
+    Absent features are simply omitted (the model treats missing as neutral).
+    """
+    try:
+        t = technicals or {}
+        cp = safe_float(t.get("current_price"))
+        ma = t.get("moving_averages") or {}
+
+        def _dist(key: str) -> Optional[float]:
+            v = safe_float(ma.get(key))
+            if cp and v:
+                return round((cp - v) / v * 100.0, 3)
+            return None
+
+        feats: dict[str, Any] = {
+            "rsi": safe_float(t.get("rsi")),
+            "adx": safe_float(t.get("adx")),
+            "atr_pct": safe_float(t.get("atr_pct")),
+            "dist_sma20_pct": _dist("sma20"),
+            "dist_sma50_pct": _dist("sma50"),
+            "dist_sma200_pct": _dist("sma200"),
+            "delivery_pct": safe_float(delivery_pct),
+            "vix": safe_float(vix),
+        }
+        for k, v in feats.items():
+            if v is not None:
+                signal[k] = v
+        if regime:
+            signal["regime"] = regime
+        if sector:
+            signal["sector"] = sector
+
+        # Persist a compact copy under metadata so it survives the round-trip
+        # through the signals table → signal_outcomes (read back by the trainer).
+        md = signal.get("metadata") or {}
+        md["meta_features"] = {
+            k: signal.get(k)
+            for k in (*feats.keys(), "regime", "sector")
+            if signal.get(k) is not None
+        }
+        signal["metadata"] = md
+    except Exception as e:  # pragma: no cover - enrichment is best-effort
+        logger.debug("attach_meta_features failed for %s: %s", signal.get("symbol"), e)
+    return signal
+
+
 def detect_price_spike(
     symbol: str,
     current_price: Optional[float],

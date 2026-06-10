@@ -56,12 +56,73 @@ if [ ! -f "$DAILY_LOG" ]; then
   echo "date,open_trades,closed_today,total_closed,win_rate,total_pnl,capital" > "$DAILY_LOG"
 fi
 
+# ── Loud alerting ────────────────────────────────────────────
+# Cron output is buried in cron.log where nobody looks. A failed run must
+# leave a signal a human will actually see: a dedicated, append-only alert
+# log (timestamped, never rotated by the routine) plus a best-effort OS
+# notification. Set PAPER_ALERT_CMD to pipe alerts to any external channel
+# (e.g. a curl to a Telegram/Slack webhook) — we can't use the in-app
+# notification service here because that very backend may be the thing
+# that's down.
+ALERTS_FILE="${DATA_DIR}/ALERTS.log"
+raise_alert() {
+  local msg="$1"
+  local ts; ts="$(date '+%Y-%m-%d %H:%M:%S %Z')"
+  mkdir -p "$DATA_DIR"
+  printf '[%s] PAPER-TRADE ALERT: %s\n' "$ts" "$msg" >> "$ALERTS_FILE"
+  err ""
+  err "╔══════════════════════════════════════════════════════════╗"
+  err "║  PAPER-TRADE ALERT — action required                     ║"
+  err "╚══════════════════════════════════════════════════════════╝"
+  err "$msg"
+  err "Logged to: ${ALERTS_FILE}"
+  # Best-effort macOS desktop notification (no-op elsewhere).
+  if command -v osascript > /dev/null 2>&1; then
+    osascript -e "display notification \"${msg}\" with title \"agentX paper-trade FAILED\"" > /dev/null 2>&1 || true
+  fi
+  # Optional external channel.
+  if [ -n "${PAPER_ALERT_CMD:-}" ]; then
+    printf '%s' "$msg" | eval "${PAPER_ALERT_CMD}" > /dev/null 2>&1 || true
+  fi
+}
+
 # ── Check backend ────────────────────────────────────────────
+# Backend down used to exit(1) into cron.log silently — the routine then
+# accumulated NO forward track record for weeks unnoticed. Now: try to
+# auto-start (the #1 cause is simply that the server wasn't running), wait
+# for it to come up, and only if that fails do we raise a loud alert.
+# Disable auto-start with BACKEND_AUTOSTART=0.
+backend_up() { curl -s --max-time 5 "${BACKEND_URL}/api/health" > /dev/null 2>&1; }
+
 check_backend() {
-  if ! curl -s --max-time 5 "${BACKEND_URL}/api/health" > /dev/null 2>&1; then
-    err "Backend not reachable at ${BACKEND_URL}. Start it with: ./start.sh"
+  if backend_up; then return 0; fi
+
+  warn "Backend not reachable at ${BACKEND_URL}."
+
+  if [ "${BACKEND_AUTOSTART:-1}" != "0" ]; then
+    local start_script; start_script="$(cd "$(dirname "$0")" && pwd)/start.sh"
+    if [ -x "$start_script" ]; then
+      log "Attempting auto-start: ${start_script}"
+      # Detached so cron doesn't block; its own logs go to start.sh's sinks.
+      (nohup "$start_script" > /dev/null 2>&1 &) || true
+      # Poll up to ~45s for health to come up.
+      local i
+      for i in $(seq 1 15); do
+        sleep 3
+        if backend_up; then
+          ok "Backend came up after auto-start (waited ~$((i * 3))s)."
+          return 0
+        fi
+      done
+      raise_alert "Backend at ${BACKEND_URL} did not come up after auto-start. No paper trades placed this run. Check start.sh / server logs."
+      exit 1
+    fi
+    raise_alert "Backend at ${BACKEND_URL} is down and start.sh is missing/not executable at ${start_script}. No paper trades placed this run."
     exit 1
   fi
+
+  raise_alert "Backend at ${BACKEND_URL} is down (auto-start disabled). No paper trades placed this run. Start it with: ./start.sh"
+  exit 1
 }
 
 # ── Drawdown Circuit Breaker Check ──────────────────────────
@@ -613,7 +674,13 @@ if open_trades:
 print()
 
 # ── Sharpe & Sortino ratios ──────────────────────────────────────────────
-if len(closed_trades) >= 3:
+# Annualized risk-adjusted ratios are meaningless on a handful of trades:
+# a few wins with no losing day produced a fake Sharpe ~8 / Sortino ~12,
+# which reads as 'world-class fund' rather than 'tiny sample'. We require a
+# minimum closed-trade count before reporting them, and never print an
+# infinite/sentinel Sortino. Below the floor we say so plainly.
+MIN_TRADES_FOR_RATIOS = 30  # matches signal_edge._OVERRIDE_MIN_TRADES
+if len(closed_trades) >= MIN_TRADES_FOR_RATIOS:
     import math
     risk_free_daily = 0.07 / 252  # India 10Y bond yield ~7%
 
@@ -627,7 +694,7 @@ if len(closed_trades) >= 3:
         except (ValueError, TypeError):
             pass
 
-    if len(daily_returns) >= 3:
+    if len(daily_returns) >= MIN_TRADES_FOR_RATIOS:
         mean_ret = sum(daily_returns) / len(daily_returns)
         variance = sum((r - mean_ret) ** 2 for r in daily_returns) / len(daily_returns)
         std_dev = math.sqrt(variance) if variance > 0 else 0.0001
@@ -641,11 +708,16 @@ if len(closed_trades) >= 3:
             downside_var = sum((r - risk_free_daily) ** 2 for r in neg_returns) / len(neg_returns)
             downside_std = math.sqrt(downside_var)
             sortino = (mean_ret - risk_free_daily) / downside_std * math.sqrt(252) if downside_std > 0 else 0.0
+            sortino_str = f'{sortino:>+.2f}'
         else:
-            sortino = 999.0  # No losing days
+            sortino_str = 'n/a (no losing days yet)'
 
         print(f'  Sharpe Ratio:         {sharpe:>+.2f}  (>1.0 = viable, >1.5 = good, >2.0 = excellent)')
-        print(f'  Sortino Ratio:        {sortino:>+.2f}  (penalizes only downside volatility)')
+        print(f'  Sortino Ratio:        {sortino_str}  (penalizes only downside volatility)')
+        print(f'  (ratios on n={len(daily_returns)} trades — still a small sample; treat as indicative)')
+else:
+    print(f'  Sharpe / Sortino:     not reported — only {len(closed_trades)} closed trades')
+    print(f'                        (need >= {MIN_TRADES_FOR_RATIOS} for a non-misleading ratio)')
 
 print()
 print('=' * 55)

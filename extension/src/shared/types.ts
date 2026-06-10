@@ -189,7 +189,9 @@ export interface AppSettings {
   upstox_access_token?: string;
   upstox_access_token_configured?: boolean;
   upstox_api_key?: string;
+  upstox_api_key_configured?: boolean;
   upstox_api_secret?: string;
+  upstox_api_secret_configured?: boolean;
   // Twelve Data keyed fallback.
   twelvedata_api_key?: string;
   // Financial Modeling Prep (fundamentals + earnings calendar) + Finnhub (macro / USD-INR).

@@ -125,6 +125,24 @@ CREATE TABLE IF NOT EXISTS signal_outcomes (
 );
 """
 
+# Feature columns captured at signal-creation time (via signals.metadata →
+# meta_features) and carried into the outcome row so the meta-judge trains on
+# the SAME features it sees live at predict time. Added via PRAGMA inspection
+# for existing installs. `strength` mirrors the signals column for convenience.
+_SIGNAL_OUTCOMES_LATE_COLUMNS = {
+    "strength": "INTEGER",
+    "regime": "TEXT",
+    "sector": "TEXT",
+    "rsi": "REAL",
+    "adx": "REAL",
+    "atr_pct": "REAL",
+    "dist_sma20_pct": "REAL",
+    "dist_sma50_pct": "REAL",
+    "dist_sma200_pct": "REAL",
+    "delivery_pct": "REAL",
+    "vix": "REAL",
+}
+
 CREATE_PRICE_ALERTS_TABLE = """
 CREATE TABLE IF NOT EXISTS price_alerts (
     id TEXT PRIMARY KEY,
@@ -416,6 +434,13 @@ async def _init_db_sqlite() -> None:
         for col_name, col_ddl in _SIGNALS_LATE_COLUMNS.items():
             if col_name not in existing_cols:
                 await db.execute(f"ALTER TABLE signals ADD COLUMN {col_name} {col_ddl}")
+
+        # Late-added feature columns on `signal_outcomes` (meta-judge inputs).
+        async with db.execute("PRAGMA table_info(signal_outcomes)") as cur:
+            existing_so_cols = {row[1] for row in await cur.fetchall()}
+        for col_name, col_ddl in _SIGNAL_OUTCOMES_LATE_COLUMNS.items():
+            if col_name not in existing_so_cols:
+                await db.execute(f"ALTER TABLE signal_outcomes ADD COLUMN {col_name} {col_ddl}")
 
         for idx_sql in CREATE_SIGNALS_INDEXES:
             await db.execute(idx_sql)

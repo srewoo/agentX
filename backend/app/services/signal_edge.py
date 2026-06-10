@@ -231,15 +231,62 @@ REGIME_KILL_SET: set[tuple[str, str, str]] = {
 # Regime-stratified promotion list — (regime, signal_type, direction)
 # with Wilson 95% LB ≥ 47 AND positive avg_pnl. These get an extra
 # boost on top of the unconditional PROMOTED_SIGNALS set.
+#
+# REMOVED 2026-06-08: ("trend_up", "rsi_extreme", "bearish") and
+# ("trend_up", "evening_star", "bearish"). These were *boosting* bearish
+# counter-trend signals inside uptrends — the precise failure mode
+# ANALYSIS_REPORT.md documents (trend_up + bearish lost ~75% of the time;
+# the engine fired 219 bearish vs 25 bullish in trend_up). Their apparent
+# in-sample edge was a small-sample artefact swamped by the structural
+# bias. Boosting a counter-trend short in a rising market is exactly what
+# the regime guard below now forbids.
 REGIME_PROMOTE_SET: set[tuple[str, str, str]] = {
     ("sideways", "rsi_extreme", "bearish"),
     ("sideways", "macd_divergence", "bullish"),
     ("trend_down", "price_spike", "bullish"),
-    ("trend_up", "rsi_extreme", "bearish"),
     ("sideways", "rsi_divergence", "bullish"),
-    ("trend_up", "evening_star", "bearish"),
     ("trend_down", "macd_divergence", "bullish"),
 }
+
+# ── Structural anti-counter-trend guard ──────────────────────────────────
+# 2026-06-08. Root-cause fix for the "structurally bearish in a rising
+# market" defect. Muting individual (regime, signal, direction) combos was
+# whack-a-mole: new bearish detectors kept leaking shorts into uptrends.
+#
+# The structural rule: in a confirmed `trend_up` regime, COUNTER-TREND
+# signals (bearish) are suppressed by default. Only setups with proven
+# out-of-sample bearish edge that survives the realistic-cost evaluator are
+# allowed to fire as shorts against the trend. Symmetric guard for
+# trend_down protects against catching falling knives with counter-trend
+# longs. This converts an opt-OUT blocklist (mute the losers we've found)
+# into an opt-IN allowlist (only trade counter-trend setups we've proven),
+# which is the correct default for a mean-reversion-biased engine.
+COUNTERTREND_ALLOWLIST: set[tuple[str, str, str]] = {
+    # The single bearish combo with durable positive net edge across the
+    # 2y AND 5y walk-forwards (n=153, +0.80% avg, +14.2% Kelly).
+    ("trend_up", "double_top", "bearish"),
+}
+
+
+def is_countertrend_suppressed(
+    regime: Optional[str], signal_type: str, direction: str
+) -> bool:
+    """True when a signal fights a confirmed trend without proven edge.
+
+    trend_up + bearish, or trend_down + bullish, are counter-trend. They are
+    suppressed unless the exact (regime, signal_type, direction) is on the
+    COUNTERTREND_ALLOWLIST. Regimes other than the two trending states
+    (e.g. ``sideways``, ``None``/unknown) are never suppressed here.
+    """
+    if not regime:
+        return False
+    is_counter = (
+        (regime == "trend_up" and direction == "bearish")
+        or (regime == "trend_down" and direction == "bullish")
+    )
+    if not is_counter:
+        return False
+    return (regime, signal_type, direction) not in COUNTERTREND_ALLOWLIST
 
 # Backtest-driven execution policy. HARD = needs independent confirming
 # evidence (different family) before becoming a trade. SOFT = the signal
@@ -332,12 +379,16 @@ def signal_weight_multiplier(signal_type: str, direction: str, regime: Optional[
     Optional `regime` activates regime-stratified gating from the
     walk-forward. Ordering:
       1. `is_muted` — universal kill (still 0.0)
-      2. `REGIME_KILL_SET` — kill only in this regime (0.0)
-      3. `REGIME_PROMOTE_SET` — extra boost in this regime (2.0×)
-      4. `is_promoted` — universal 1.6× boost
-      5. 1.0 otherwise
+      2. `is_countertrend_suppressed` — kill counter-trend signals with no
+         proven edge (structural anti-bearish-bias guard) (0.0)
+      3. `REGIME_KILL_SET` — kill only in this regime (0.0)
+      4. `REGIME_PROMOTE_SET` — extra boost in this regime (2.0×)
+      5. `is_promoted` — universal 1.6× boost
+      6. 1.0 otherwise
     """
     if is_muted(signal_type, direction):
+        return 0.0
+    if is_countertrend_suppressed(regime, signal_type, direction):
         return 0.0
     if regime and (regime, signal_type, direction) in REGIME_KILL_SET:
         return 0.0

@@ -4,6 +4,7 @@ Signal outcome tracker — evaluates whether BUY/SELL signals made money.
 Fetches current prices for past signals, calculates PnL, and stores outcomes.
 """
 import asyncio
+import json
 import logging
 from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
@@ -77,7 +78,7 @@ async def evaluate_signals() -> dict[str, Any]:
         db.row_factory = aiosqlite.Row
         query = """
             SELECT s.id, s.symbol, s.signal_type, s.direction,
-                   s.current_price, s.created_at
+                   s.current_price, s.created_at, s.strength, s.metadata
             FROM signals s
             WHERE s.created_at >= ?
               AND s.created_at <= ?
@@ -163,6 +164,37 @@ async def evaluate_signals() -> dict[str, Any]:
     return summary
 
 
+# Feature columns carried from the signal into the outcome row so the
+# meta-judge trains on the same inputs it sees live. Sourced from
+# signals.metadata["meta_features"] (stamped by signal_engine.attach_meta_features)
+# plus the signal's own strength.
+_FEATURE_COLS = (
+    "strength", "regime", "sector", "rsi", "adx", "atr_pct",
+    "dist_sma20_pct", "dist_sma50_pct", "dist_sma200_pct", "delivery_pct", "vix",
+)
+
+
+def _extract_features(sig: dict) -> dict[str, Any]:
+    """Pull the persisted meta-feature block out of a signals row.
+
+    Returns a dict keyed by ``_FEATURE_COLS`` with None for anything absent —
+    safe on legacy rows that predate feature capture.
+    """
+    feats: dict[str, Any] = {k: None for k in _FEATURE_COLS}
+    feats["strength"] = sig.get("strength")
+    raw = sig.get("metadata")
+    if raw:
+        try:
+            md = raw if isinstance(raw, dict) else json.loads(raw)
+            mf = (md or {}).get("meta_features") or {}
+            for k in _FEATURE_COLS:
+                if k in mf and mf[k] is not None:
+                    feats[k] = mf[k]
+        except Exception:
+            pass
+    return feats
+
+
 def _compute_outcome(
     sig: dict, current_price: float, now: datetime
 ) -> dict | None:
@@ -188,6 +220,7 @@ def _compute_outcome(
             "outcome": "expired",
             "hold_days": _days_since(sig["created_at"], now),
             "evaluated_at": now.isoformat(),
+            **_extract_features(sig),
         }
 
     # Calculate PnL based on direction
@@ -224,6 +257,7 @@ def _compute_outcome(
         "outcome": outcome,
         "hold_days": hold_days,
         "evaluated_at": now.isoformat(),
+        **_extract_features(sig),
     }
 
 
@@ -247,13 +281,21 @@ async def _store_outcomes(outcomes: list[dict]) -> None:
                 """INSERT OR REPLACE INTO signal_outcomes
                    (signal_id, symbol, signal_type, direction, entry_price,
                     exit_price, entry_time, exit_time, pnl_pct, outcome,
-                    hold_days, evaluated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    hold_days, evaluated_at,
+                    strength, regime, sector, rsi, adx, atr_pct,
+                    dist_sma20_pct, dist_sma50_pct, dist_sma200_pct,
+                    delivery_pct, vix)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                           ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     o["signal_id"], o["symbol"], o["signal_type"], o["direction"],
                     o["entry_price"], o["exit_price"], o["entry_time"],
                     o["exit_time"], o["pnl_pct"], o["outcome"],
                     o["hold_days"], o["evaluated_at"],
+                    o.get("strength"), o.get("regime"), o.get("sector"),
+                    o.get("rsi"), o.get("adx"), o.get("atr_pct"),
+                    o.get("dist_sma20_pct"), o.get("dist_sma50_pct"),
+                    o.get("dist_sma200_pct"), o.get("delivery_pct"), o.get("vix"),
                 ),
             )
         await db.commit()

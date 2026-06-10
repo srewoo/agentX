@@ -23,7 +23,7 @@ from app.database import DB_PATH
 from app.services.data_fetcher import MAJOR_STOCKS, async_fetch_history, get_delivery_volume
 from app.services.screener import pre_screen_stocks
 from app.services.technicals import compute_technicals, compute_support_resistance
-from app.services.signal_engine import scan_symbol, filter_by_risk_mode, detect_options_signal
+from app.services.signal_engine import scan_symbol, filter_by_risk_mode, detect_options_signal, attach_meta_features
 from app.services.llm_analyst import enrich_signal
 from app.services.llm_signal_judge import judge_signals, is_enabled as judge_enabled
 from app.services.sentiment import get_stock_news, get_sentiment_summary, calculate_sentiment
@@ -635,7 +635,7 @@ async def run_scan_cycle() -> list[dict]:
                     except Exception:
                         pass
 
-                return scan_symbol(
+                sigs = scan_symbol(
                     symbol=sym,
                     df=df,
                     technicals=technicals,
@@ -648,6 +648,21 @@ async def run_scan_cycle() -> list[dict]:
                     fundamentals=sym_fundamentals,
                     earnings_recent_days=earnings_recent_days_sym,
                 )
+                # Stamp the uniform meta-judge feature block so the model sees
+                # identical features at train (persisted) and predict (live)
+                # time. regime/vix come from always-defined scope; the helper
+                # is fully defensive and cannot break the scan.
+                _regime_label = scan_thresholds.get("_regime_v2")
+                for _s in sigs:
+                    attach_meta_features(
+                        _s,
+                        technicals=technicals,
+                        regime=_regime_label,
+                        delivery_pct=sym_delivery_pct,
+                        vix=india_vix,
+                        sector=_sector_lookup.get(sym),
+                    )
+                return sigs
             except Exception as e:
                 _bad_symbol_strikes[sym] = _bad_symbol_strikes.get(sym, 0) + 1
                 logger.debug("Error scanning %s (strike %d): %s", sym, _bad_symbol_strikes[sym], e)

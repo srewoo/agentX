@@ -35,21 +35,35 @@ def _model_dir() -> Path:
     return _MODEL_PATH.parent
 
 
+# Numeric feature columns persisted on signal_outcomes (stamped at signal
+# creation via attach_meta_features). Passed straight through to the model —
+# MetaJudge.featurise reads these top-level keys, and the orchestrator puts the
+# identical keys on the live signal dict at predict time (train/serve symmetry).
+_OUTCOME_FEATURE_COLS = (
+    "strength", "rsi", "adx", "atr_pct",
+    "dist_sma20_pct", "dist_sma50_pct", "dist_sma200_pct", "delivery_pct", "vix",
+)
+
+
 async def _load_resolved_trades() -> list[dict[str, Any]]:
-    """Pull every resolved trade from signal_outcomes with enough features
-    to train a meaningful model. Joins with `signals` for signal_type and
-    direction; everything else (regime, factor scores) is in
-    signal_outcomes itself or computed downstream.
+    """Pull every resolved (win/loss) trade from signal_outcomes along with the
+    feature block captured at creation time.
+
+    Expired/neutral rows are dropped — the meta-judge is a binary win/loss
+    classifier. Feature columns are read back verbatim so the model trains on
+    exactly what it sees live. Legacy rows with NULL features pass through as
+    neutral (the model treats missing as 0.0).
     """
     out: list[dict[str, Any]] = []
+    cols = ", ".join(f"so.{c}" for c in _OUTCOME_FEATURE_COLS)
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         try:
             async with db.execute(
-                """
+                f"""
                 SELECT so.signal_id, so.symbol, so.signal_type, so.direction,
-                       so.entry_price, so.exit_price, so.pnl_pct, so.outcome,
-                       so.hold_days, so.entry_time
+                       so.pnl_pct, so.outcome, so.hold_days, so.entry_time,
+                       so.regime, so.sector, {cols}
                 FROM signal_outcomes so
                 WHERE so.outcome IN ('win','loss','expired')
                 ORDER BY so.entry_time ASC
@@ -60,15 +74,22 @@ async def _load_resolved_trades() -> list[dict[str, Any]]:
                     # Drop expired / neutral — meta-judge is binary.
                     if rd["outcome"] == "expired":
                         continue
-                    out.append({
+                    trade = {
                         "symbol": rd["symbol"],
                         "signal_type": rd["signal_type"],
                         "direction": rd["direction"],
-                        "regime": "unknown",      # signal_outcomes doesn't carry regime today
-                        "sector": "Unknown",
+                        "regime": rd.get("regime") or "unknown",
+                        "sector": rd.get("sector") or "Unknown",
                         "pnl": float(rd["pnl_pct"] or 0.0),
                         "win": rd["outcome"] == "win",
-                    })
+                    }
+                    # Carry through any captured numeric features (skip NULLs so
+                    # featurise's missing→0.0 default applies on legacy rows).
+                    for c in _OUTCOME_FEATURE_COLS:
+                        v = rd.get(c)
+                        if v is not None:
+                            trade[c] = float(v)
+                    out.append(trade)
         except Exception as e:
             logger.warning("meta_judge_trainer: signal_outcomes query failed: %s", e)
     return out

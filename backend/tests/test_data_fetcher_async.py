@@ -127,15 +127,26 @@ class _FakeSession:
 
     def get(self, url: str, timeout: float = 0) -> _FakeResponse:  # noqa: ARG002
         self.calls.append(url)
-        # Homepage warm-up requests do not consume the queued API responses.
-        if url.endswith(".com") or url.endswith(".com/"):
+        # Warm-up requests (homepage + get-quotes page) do not consume the
+        # queued API responses — only the quote-equity API calls do.
+        if "api/quote-equity" not in url:
             return _FakeResponse(200)
         return self._responses.pop(0)
 
 
+def _prewarm(monkeypatch) -> None:
+    """Mark the session freshly warmed (skip the proactive pre-request warm-up)
+    and no-op the warm-up/throttle sleeps so these tests isolate the reactive
+    403→re-warm→retry path and stay fast."""
+    monkeypatch.setattr(data_fetcher.time, "sleep", lambda *_a, **_k: None)
+    data_fetcher._nse_session_warmed_at = data_fetcher.time.monotonic()
+    data_fetcher._nse_last_request_at = 0.0
+
+
 @pytest.mark.asyncio
-async def test_fetch_nse_delivery_retries_on_403_after_warm_up() -> None:
-    """First 403 should trigger a homepage warm-up and a single retry."""
+async def test_fetch_nse_delivery_retries_on_403_after_warm_up(monkeypatch) -> None:
+    """First 403 should trigger a re-warm (homepage + get-quotes) and one retry."""
+    _prewarm(monkeypatch)
     payload = {
         "marketDeptOrderBook": {
             "tradeInfo": {
@@ -156,28 +167,32 @@ async def test_fetch_nse_delivery_retries_on_403_after_warm_up() -> None:
     assert result["delivery_pct"] == 60.0
     assert result["traded_qty"] == 1000
     assert result["delivered_qty"] == 600
-    # Sequence: API (403) -> homepage warm-up -> API (200)
-    assert len(fake.calls) == 3
+    # Sequence: API (403) -> re-warm (homepage + get-quotes) -> API (200)
+    assert len(fake.calls) == 4
     assert "api/quote-equity" in fake.calls[0]
     assert fake.calls[1] == data_fetcher._NSE_HOMEPAGE
-    assert "api/quote-equity" in fake.calls[2]
+    assert "get-quotes/equity" in fake.calls[2]
+    assert "api/quote-equity" in fake.calls[3]
 
 
 @pytest.mark.asyncio
-async def test_fetch_nse_delivery_returns_none_on_persistent_403() -> None:
+async def test_fetch_nse_delivery_returns_none_on_persistent_403(monkeypatch) -> None:
     """If both attempts return 403 the caller must see None (logged warning)."""
+    _prewarm(monkeypatch)
     fake = _FakeSession([_FakeResponse(403), _FakeResponse(403)])
     data_fetcher._nse_delivery_session = fake
 
     result = await _fetch_nse_delivery("RELIANCE")
 
     assert result is None
-    assert len(fake.calls) == 3  # API, warm-up, API
+    # API (403) -> re-warm (homepage + get-quotes) -> API (403)
+    assert len(fake.calls) == 4
 
 
 @pytest.mark.asyncio
-async def test_fetch_nse_delivery_no_retry_when_first_attempt_succeeds() -> None:
+async def test_fetch_nse_delivery_no_retry_when_first_attempt_succeeds(monkeypatch) -> None:
     """Happy path must not re-warm the session or retry."""
+    _prewarm(monkeypatch)
     payload = {
         "securityWiseDP": {
             "deliveryToTradedQuantity": "72.5",

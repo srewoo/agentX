@@ -423,9 +423,13 @@ class MetaJudge:
         labels01 = [1 if y == 1 else 0 for y in y_full]
         platt_a, platt_b = _fit_platt(raw_scores, labels01, random_state)
 
-        # Calibrate operating-point threshold.
+        # Calibrate operating-point threshold to maximise EXPECTANCY, not win
+        # rate. The per-trade P&L is the objective the system actually cares
+        # about — a high-WR/low-payoff cutoff loses money (observed empirically:
+        # 71% kept-WR at −0.32%/trade while the dropped trades averaged +1.96%).
         probs = [_sigmoid(platt_a * z + platt_b) for z in raw_scores]
-        threshold = _calibrate_threshold(probs, labels01, target_tpr)
+        pnls = [float(t.get("pnl", 0.0)) for t in trades]
+        threshold = _calibrate_threshold(probs, labels01, target_tpr, pnls=pnls)
 
         meta = MetaJudge(
             stumps=stumps,
@@ -594,28 +598,60 @@ def _fit_platt(raw_scores: list[float], labels01: list[int], seed: int = 42) -> 
     return a, b
 
 
-def _calibrate_threshold(probs: list[float], labels01: list[int], target_tpr: float) -> float:
+def _calibrate_threshold(
+    probs: list[float],
+    labels01: list[int],
+    target_tpr: float,
+    *,
+    pnls: Optional[list[float]] = None,
+    min_keep_frac: float = 0.15,
+    min_keep_floor: int = 20,
+) -> float:
     """Find the operating-point threshold.
 
-    Strategy: pick the threshold maximising **expected P&L lift**, computed as
-    a weighted Youden-style J statistic where each kept trade is rewarded by
-    its expected outcome instead of just its binary label.
+    PRIMARY objective (when ``pnls`` is supplied): maximise the **mean P&L of
+    kept trades**. A trading filter's job is to raise *expectancy*, not win
+    rate — optimising classification accuracy (Youden's J) demonstrably keeps
+    cheap, frequent winners while discarding the few large winners that carry
+    the strategy (observed: 71% kept-WR, −0.32%/trade vs +1.96% on dropped).
 
-    Concretely we sweep candidate thresholds, compute (TPR - FPR), and pick
-    the highest J. This is well-known to maximise the AUC operating point
-    and transfers better OOS than a TPR-quantile cutoff (which overfits to
-    train-fold positive scores). The `target_tpr` argument becomes a soft
-    *minimum* recall — if J-max threshold falls below it, we relax to the
-    target. Otherwise the data-driven J point wins.
+    We sort candidates by descending P(win), walk the keep-set from most- to
+    least-confident, and pick the cutoff that maximises mean kept P&L subject
+    to keeping at least ``max(min_keep_floor, min_keep_frac·N)`` trades — the
+    floor stops the optimiser from degenerating to "keep the single best
+    trade". The threshold returned is the P(win) of the lowest-ranked trade
+    still kept.
+
+    FALLBACK (no ``pnls``): Youden's J (TPR−FPR) with a soft recall floor —
+    the legacy behaviour, retained for callers/tests that pass only labels.
     """
     if not probs:
         return 0.5
+
+    # ── Expectancy-maximising path ──────────────────────────────────────
+    if pnls is not None and len(pnls) == len(probs):
+        paired = sorted(zip(probs, pnls), key=lambda x: -x[0])
+        n = len(paired)
+        min_keep = min(n, max(min_keep_floor, int(min_keep_frac * n)))
+        best_t = paired[0][0]
+        best_mean = float("-inf")
+        running = 0.0
+        for i, (p, pnl) in enumerate(paired, start=1):
+            running += pnl
+            if i < min_keep:
+                continue
+            mean_kept = running / i
+            if mean_kept > best_mean:
+                best_mean = mean_kept
+                best_t = p
+        return float(best_t)
+
+    # ── Legacy Youden-J path ────────────────────────────────────────────
     paired = sorted(zip(probs, labels01), key=lambda x: -x[0])
     pos = sum(labels01)
     neg = len(labels01) - pos
     if pos == 0 or neg == 0:
         return 0.5
-    # Step through every score as a candidate threshold; track best J.
     tp = fp = 0
     best_j = -1.0
     best_t = paired[0][0]

@@ -168,14 +168,61 @@ async def test_option_chain_normalizes_to_nse_shape(monkeypatch):
 @pytest.mark.asyncio
 async def test_test_connection_ok_and_401(monkeypatch):
     import requests
-    monkeypatch.setattr(requests, "get", lambda *a, **k: _FakeResp(
-        json_data={"data": {"user_name": "Rohan"}}))
-    res = await upstox_fetcher.test_connection("good-tok")
-    assert res["ok"] is True and "Rohan" in res["message"]
+    # test_connection now validates against the market-data LTP endpoint, not
+    # /user/profile — so stub instrument resolution and an LTP payload.
+    monkeypatch.setattr(
+        upstox_fetcher, "_resolve_instrument_key",
+        lambda sym, exch: "NSE_EQ|INE002A01018",
+    )
 
+    monkeypatch.setattr(requests, "get", lambda *a, **k: _FakeResp(
+        json_data={"data": {"NSE_EQ:RELIANCE": {"last_price": 1269.2}}}))
+    res = await upstox_fetcher.test_connection("good-tok")
+    assert res["ok"] is True and "1269.2" in res["message"]
+
+    # 401 on the market-data path → guidance toward the Analytics Token.
     monkeypatch.setattr(requests, "get", lambda *a, **k: _FakeResp(status=401))
     res = await upstox_fetcher.test_connection("bad-tok")
-    assert res["ok"] is False
+    assert res["ok"] is False and "Analytics Token" in res["message"]
 
     res = await upstox_fetcher.test_connection("")
     assert res["ok"] is False
+
+
+# ── OAuth2 token generation ──────────────────────────────────
+
+def test_build_login_url():
+    url = upstox_fetcher.build_login_url("APIKEY", "https://x.test/cb")
+    assert url.startswith("https://api.upstox.com/v2/login/authorization/dialog?")
+    assert "response_type=code" in url
+    assert "client_id=APIKEY" in url
+    assert "redirect_uri=https%3A%2F%2Fx.test%2Fcb" in url
+
+
+@pytest.mark.asyncio
+async def test_exchange_code_success(monkeypatch):
+    import requests
+    monkeypatch.setattr(requests, "post", lambda *a, **k: _FakeResp(
+        json_data={"access_token": "ATK"}, content=b"x"))
+    res = await upstox_fetcher.exchange_code(
+        "code", api_key="k", api_secret="s", redirect_uri="https://x.test/cb")
+    assert res["ok"] is True
+    assert res["access_token"] == "ATK"
+
+
+@pytest.mark.asyncio
+async def test_exchange_code_missing_params():
+    res = await upstox_fetcher.exchange_code(
+        "", api_key="", api_secret="", redirect_uri="")
+    assert res["ok"] is False
+
+
+@pytest.mark.asyncio
+async def test_exchange_code_upstream_error(monkeypatch):
+    import requests
+    monkeypatch.setattr(requests, "post", lambda *a, **k: _FakeResp(
+        status=400, json_data={"errors": [{"message": "invalid code"}]}, content=b"x"))
+    res = await upstox_fetcher.exchange_code(
+        "bad", api_key="k", api_secret="s", redirect_uri="https://x.test/cb")
+    assert res["ok"] is False
+    assert "invalid code" in res["message"]

@@ -1,0 +1,5 @@
+trade_id,symbol,direction,signal_type,strength,entry_price,entry_date,stop_loss,target,position_size,shares,status,exit_price,exit_date,pnl_pct,pnl_amount,exit_reason,trailing_stop
+039bf7cf,MUTHOOTFIN,bearish,double_top,10,2964.7,2026-06-09,3053.64,2816.46,29647.0,10,open,,,,,,3053.64
+7de5ce21,BRITANNIA,bearish,double_top,10,5078.5,2026-06-09,5230.86,4824.57,25392.5,5,open,,,,,,5230.86
+3e23124d,GLAXO,bearish,double_top,10,2183.8,2026-06-09,2249.31,2074.61,28389.4,13,open,,,,,,2249.31
+5bc05a29,WIPRO,bearish,gap_down,9,198.37,2026-06-09,204.32,188.45,29953.87,151,open,,,,,,204.32

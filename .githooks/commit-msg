@@ -1,0 +1,54 @@
+#!/bin/bash
+# Conventional-commit enforcement.
+# Installed via: git config core.hooksPath .githooks
+#
+# Rejects low-signal messages ("better", "fixed all", "improved version")
+# that violate the repo standard. Format:
+#   <type>(<optional scope>): <description>
+# Types: feat fix refactor test docs chore perf ci build style revert
+#
+# Bypass for a genuine emergency with: git commit --no-verify
+set -euo pipefail
+
+msg_file="$1"
+# First non-comment, non-empty line is the subject.
+subject="$(grep -vE '^\s*#' "$msg_file" | grep -vE '^\s*$' | head -n1 || true)"
+
+# Allow merge/revert/fixup commits git generates itself.
+case "$subject" in
+  "Merge "*|"Revert "*|"fixup! "*|"squash! "*) exit 0 ;;
+esac
+
+pattern='^(feat|fix|refactor|test|docs|chore|perf|ci|build|style|revert)(\([a-z0-9._/-]+\))?(!)?: .{3,}'
+
+if [[ ! "$subject" =~ $pattern ]]; then
+  cat >&2 <<EOF
+
+✗ Commit message rejected — does not follow Conventional Commits.
+
+  Got:      "$subject"
+  Expected: <type>(<scope>): <description>
+  Types:    feat fix refactor test docs chore perf ci build style revert
+
+  Good examples:
+    fix(paper-trade): fail loudly when backend is unreachable
+    refactor(signal-edge): add structural counter-trend guard
+    test(backtester): cover walk-forward fold boundaries
+
+  Bad (rejected): "better", "fixed all", "improved version"
+
+  Bypass only in a real emergency:  git commit --no-verify
+
+EOF
+  exit 1
+fi
+
+# Block lazy subjects even if they technically parse.
+body="${subject#*: }"
+case "$(echo "$body" | tr '[:upper:]' '[:lower:]')" in
+  "wip"|"stuff"|"things"|"fixes"|"updates"|"changes"|"misc")
+    echo "✗ Commit subject too vague: '$body'. Describe WHAT changed and why." >&2
+    exit 1 ;;
+esac
+
+exit 0

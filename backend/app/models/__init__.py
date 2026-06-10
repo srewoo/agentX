@@ -101,6 +101,12 @@ class UpdateSettingsRequest(BaseModel):
     finnhub_api_key: Optional[str] = Field(None, max_length=200)
 
 
+class UpstoxExchangeRequest(BaseModel):
+    """Body for the Upstox OAuth code→token exchange."""
+    code: str = Field(min_length=1, max_length=4000)
+    redirect_uri: str = Field(min_length=1, max_length=2000)
+
+
 class CreateAlertRequest(BaseModel):
     symbol: str = Field(min_length=1, max_length=20)
     target_price: float = Field(gt=0)
