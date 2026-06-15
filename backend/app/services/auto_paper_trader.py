@@ -116,6 +116,46 @@ async def _count_auto_trades_today() -> int:
             return int(row[0]) if row else 0
 
 
+async def _portfolio_risk_state(capital: float) -> tuple:
+    """(vix, recent_loss_streak, peak_equity, current_equity) for B4/B5.
+
+    All best-effort: VIX from market context (None on failure), the recent
+    losing streak and the realized equity curve from closed paper trades.
+    Equity = capital + cumulative realized PnL; peak is its running max.
+    """
+    vix = None
+    try:
+        from app.services.market_data import get_india_vix
+        vix = await get_india_vix()
+    except Exception:
+        vix = None
+
+    recent_losses = 0
+    peak = capital
+    current = capital
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                "SELECT pnl_amount FROM paper_trades WHERE status='closed' "
+                "AND pnl_amount IS NOT NULL ORDER BY exit_date ASC, trade_id ASC"
+            ) as cur:
+                rows = [r[0] for r in await cur.fetchall()]
+        running = capital
+        for pnl in rows:
+            running += float(pnl or 0.0)
+            peak = max(peak, running)
+        current = running
+        # Trailing losing streak (most recent closed trades).
+        for pnl in reversed(rows):
+            if float(pnl or 0.0) < 0:
+                recent_losses += 1
+            else:
+                break
+    except Exception:
+        pass
+    return vix, recent_losses, peak, current
+
+
 async def _count_open_positions() -> int:
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT COUNT(*) FROM paper_trades WHERE status='open'") as cur:
@@ -266,6 +306,48 @@ async def auto_open_from_recommendations(
     except Exception:
         _kelly_available = False
 
+    # ── B3/B4/B5 portfolio-aware sizing inputs (computed once per cycle) ──
+    try:
+        from app.services.portfolio_sizing import (
+            apply_exposure_caps, correlation_size_multiplier,
+            dynamic_kelly_fraction, drawdown_breaker_tripped,
+        )
+        _psizing_available = True
+    except Exception:
+        _psizing_available = False
+
+    # B4: shrink the Kelly fraction in high-VIX regimes / after a losing streak.
+    from app.services.kelly_sizing import DEFAULT_KELLY_FRACTION
+    dyn_fraction = DEFAULT_KELLY_FRACTION
+    # B3: aggregate the open book for sector + gross/net exposure caps.
+    sector_open: dict[str, float] = {}
+    gross_open = 0.0
+    net_open = 0.0
+    for p in open_positions_rows:
+        val = float(p.get("position_size") or 0.0)
+        gross_open += val
+        net_open += val if (p.get("direction") == "bullish") else -val
+    if _psizing_available:
+        try:
+            vix, recent_losses, peak_eq, cur_eq = await _portfolio_risk_state(capital)
+            dyn_fraction = dynamic_kelly_fraction(
+                DEFAULT_KELLY_FRACTION, vix=vix, recent_losses=recent_losses)
+            # B5: halt all new entries while in a deep drawdown.
+            breaker = drawdown_breaker_tripped(peak_eq, cur_eq)
+            if breaker["tripped"]:
+                logger.warning("Drawdown breaker tripped (%.1f%%) — no new auto entries",
+                               breaker["drawdown_pct"])
+                return {
+                    "opened": [],
+                    "skipped_reason_counts": {"drawdown_breaker": len(candidates)},
+                    "today_auto_trades": already_today,
+                    "open_positions": open_pos,
+                    "drawdown_pct": breaker["drawdown_pct"],
+                    "decisions_logged": 0,
+                }
+        except Exception as e:
+            logger.debug("portfolio risk state skipped: %s", e)
+
     skip_counts: dict[str, int] = {}
     for conv, rr, r in candidates:
         if len(opened) >= budget:
@@ -306,6 +388,7 @@ async def auto_open_from_recommendations(
                 sizing = kelly_position_size(
                     capital=capital, entry=entry, stop=sl, target=tgt,
                     win_prob=_effective_win_prob(conv, meta_p), direction=direction,
+                    kelly_fraction_mult=dyn_fraction,  # B4: regime/streak-adjusted
                 )
                 if sizing["skip"]:
                     skip_counts["negative_kelly_edge"] = skip_counts.get("negative_kelly_edge", 0) + 1
@@ -340,6 +423,30 @@ async def auto_open_from_recommendations(
             _record(r, conv, rr, taken=False, skip_reason="correlated_to_open",
                     direction=direction, sizing=sizing, max_corr=max_corr)
             continue
+
+        # ── B2: graduated correlation trim (0.5 ≤ corr < 0.7 shrinks the bet) ──
+        # ── B3: sector + gross/net exposure caps ──
+        if _psizing_available and kelly_shares and position_size:
+            corr_mult = correlation_size_multiplier(max_corr)
+            capped = apply_exposure_caps(
+                position_size * corr_mult, direction, capital=capital,
+                sector=str(getattr(r, "sector", "") or (r.get("sector") if isinstance(r, dict) else "") or "Unknown"),
+                sector_value_open=sector_open.get(
+                    str(getattr(r, "sector", "") or (r.get("sector") if isinstance(r, dict) else "") or "Unknown"), 0.0),
+                gross_open=gross_open, net_open=net_open,
+            )
+            allowed_value = capped["allowed_value"]
+            new_shares = int(allowed_value / entry) if entry > 0 else 0
+            if new_shares <= 0:
+                skip_counts["exposure_capped"] = skip_counts.get("exposure_capped", 0) + 1
+                logger.info("SKIP auto-open %s: exposure cap (%s) left no room", sym, capped["binding"])
+                _record(r, conv, rr, taken=False,
+                        skip_reason=f"exposure_capped:{capped['binding']}",
+                        direction=direction, sizing=sizing, max_corr=max_corr)
+                continue
+            if new_shares < kelly_shares:
+                kelly_shares = new_shares
+                position_size = round(kelly_shares * entry, 2)
 
         # ── hard 10-rule risk gate ──
         if _risk_gate_available:
@@ -427,6 +534,13 @@ async def auto_open_from_recommendations(
                             "position_size": position_size})
             _record(r, conv, rr, taken=True, direction=direction,
                     sizing=sizing, max_corr=max_corr)
+            # Keep the open-book aggregates current so B3 caps are cumulative
+            # across multiple opens in the same cycle.
+            if position_size:
+                gross_open += position_size
+                net_open += position_size if direction == "bullish" else -position_size
+                _sec = str(getattr(r, "sector", "") or (r.get("sector") if isinstance(r, dict) else "") or "Unknown")
+                sector_open[_sec] = sector_open.get(_sec, 0.0) + position_size
         except Exception as e:
             logger.warning("auto-open failed for %s: %s", sym, e)
             skip_counts["create_error"] = skip_counts.get("create_error", 0) + 1
