@@ -180,6 +180,32 @@ async def recommendation_calibration():
     }
 
 
+@router.get("/calibration-curve")
+async def get_conviction_calibration_curve():
+    """Conviction→p(win) reliability curve + Brier score (C1).
+
+    Returns the persisted isotonic calibration of conviction against realized
+    win rate: the reliability-diagram points, the fitted curve, and Brier for
+    raw vs calibrated probabilities (so "did calibration help?" is a number).
+    Build/refresh it via POST /calibration-curve.
+    """
+    from app.services.calibration_curve import get_calibration_curve
+    report = await get_calibration_curve()
+    return {"data": report or {"status": "not_built"}}
+
+
+@router.post("/calibration-curve")
+async def build_conviction_calibration_curve():
+    """Fit + persist the conviction calibration curve from resolved outcomes.
+
+    Requires ≥100 resolved BUY/SELL outcomes; below that returns
+    `insufficient_data` and persists nothing (a curve from a tiny sample is
+    noise).
+    """
+    from app.services.calibration_curve import build_calibration_curve
+    return {"data": await build_calibration_curve()}
+
+
 @router.post("/fit-weights")
 async def fit_factor_weights(regime: Optional[str] = None):
     """Refit factor weights from resolved win/loss outcomes (logistic regression).
