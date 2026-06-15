@@ -823,6 +823,29 @@ async def generate_recommendation(
     except Exception as e:
         logger.debug("meta-label gating skipped for %s: %s", symbol, e)
 
+    # ── Explainability enrichment (C2/C3/C4) — best-effort, never fatal ──
+    try:
+        from app.services.recommendation_explain import (
+            enrich_factors, conviction_interval, counterfactual_swing_factor,
+        )
+        from app.services.recommendation_tracker import get_factor_edge_snapshot
+        contribs = [
+            {"name": c.name, "weight": c.weight, "score": c.score}
+            for c in (rec.signals or [])
+        ]
+        snap = get_factor_edge_snapshot() or {}
+        evidence = enrich_factors(contribs, snap)
+        eff_n = min(2000, sum(
+            (e["evidence"]["n"] for e in evidence if e.get("evidence")), 0))
+        rec = rec.model_copy(update={
+            "factor_evidence": evidence,                                  # C2
+            "conviction_ci": conviction_interval(rec.conviction, eff_n),  # C3
+            "swing_factor": counterfactual_swing_factor(                  # C4
+                contribs, rec.weighted_score or 0.0),
+        })
+    except Exception as e:
+        logger.debug("explainability enrichment skipped for %s: %s", symbol, e)
+
     await cache_manager.set(cache_key, rec.model_dump(mode="json"), ttl=_HORIZON_TTL[horizon])
     # Persist to the outcome tracker (no-op for HOLD/AVOID). Fire-and-forget
     # — tracker failures must not break the recommendation surface.

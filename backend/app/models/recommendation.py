@@ -64,6 +64,13 @@ class Recommendation(BaseModel):
     # position sizing (kelly) can bet off the measured probability rather than
     # the conviction heuristic. See auto_paper_trader._effective_win_prob.
     meta_label_prob: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    # Explainability (C2–C4): conviction confidence band, the factor whose
+    # removal would flip the call, and top meta-judge drivers. All optional —
+    # populated when the supporting data is available.
+    conviction_ci: Optional[dict] = None
+    swing_factor: Optional[dict] = None
+    meta_judge_drivers: Optional[list] = None
+    factor_evidence: Optional[list] = None
     calibration_note: Optional[str] = None
     data_quality: Optional[str] = None
     portfolio_context: Optional[dict] = None
