@@ -116,3 +116,40 @@ def test_overlay_returns_none_when_empty():
     gs.set_overlay({"promoted": set(), "muted": set(), "blocked": set()})
     assert gs.overlay_is_promoted("x", "bullish") is None
     assert gs.overlay_is_blocked("x") is None
+
+
+# ── A5 — human veto on transitions ──
+@pytest.mark.asyncio
+async def test_veto_mode_holds_promotion_as_pending(db_path):
+    strong = [Candidate("macd_divergence|bullish", wins=144, n=200)]
+    for _ in range(gs.PROMOTE_AFTER):
+        await gs.update_gating_state(strong, veto_mode=True, db_path=db_path)
+    # Live state must NOT have promoted; a pending proposal exists instead.
+    active = await gs.get_active_gating(db_path=db_path)
+    assert "macd_divergence|bullish" not in active["promoted"]
+    pending = await gs.list_pending(db_path=db_path)
+    assert any(p["key"] == "macd_divergence|bullish" and p["to_state"] == "promoted"
+               for p in pending)
+
+
+@pytest.mark.asyncio
+async def test_resolve_pending_approve_applies(db_path):
+    strong = [Candidate("macd_divergence|bullish", wins=144, n=200)]
+    for _ in range(gs.PROMOTE_AFTER):
+        await gs.update_gating_state(strong, veto_mode=True, db_path=db_path)
+    res = await gs.resolve_pending("macd_divergence|bullish", approve=True, db_path=db_path)
+    assert res["status"] == "approved"
+    active = await gs.get_active_gating(db_path=db_path)
+    assert "macd_divergence|bullish" in active["promoted"]
+    assert await gs.list_pending(db_path=db_path) == []
+
+
+@pytest.mark.asyncio
+async def test_resolve_pending_reject_discards(db_path):
+    strong = [Candidate("macd_divergence|bullish", wins=144, n=200)]
+    for _ in range(gs.PROMOTE_AFTER):
+        await gs.update_gating_state(strong, veto_mode=True, db_path=db_path)
+    res = await gs.resolve_pending("macd_divergence|bullish", approve=False, db_path=db_path)
+    assert res["status"] == "rejected"
+    active = await gs.get_active_gating(db_path=db_path)
+    assert "macd_divergence|bullish" not in active["promoted"]

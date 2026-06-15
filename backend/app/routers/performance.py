@@ -228,6 +228,20 @@ async def durability_report(backtest_win_rate: float = 0.50):
     return {"data": await durability_check(backtest_win_rate=backtest_win_rate)}
 
 
+@router.get("/gating/pending")
+async def gating_pending():
+    """A5: derived gating transitions awaiting human approval (veto mode)."""
+    from app.services.gating_state import list_pending
+    return {"data": await list_pending()}
+
+
+@router.post("/gating/resolve")
+async def gating_resolve(key: str, approve: bool):
+    """A5: approve (apply) or reject (discard) a pending gating transition."""
+    from app.services.gating_state import resolve_pending
+    return {"data": await resolve_pending(key, approve)}
+
+
 @router.post("/fit-weights")
 async def fit_factor_weights(regime: Optional[str] = None):
     """Refit factor weights from resolved win/loss outcomes (logistic regression).

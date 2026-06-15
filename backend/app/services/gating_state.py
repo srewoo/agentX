@@ -56,9 +56,24 @@ CREATE TABLE IF NOT EXISTS gating_state (
 );
 """
 
+# A5: proposed transitions awaiting human approval (veto mode). A pending row
+# means the state machine WANTED to change state but is holding for a human.
+CREATE_GATING_PENDING_TABLE = """
+CREATE TABLE IF NOT EXISTS gating_pending (
+    key TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    from_state TEXT NOT NULL,
+    to_state TEXT NOT NULL,
+    win_rate REAL,
+    n INTEGER,
+    proposed_at TEXT
+);
+"""
+
 
 async def _ensure(db: aiosqlite.Connection) -> None:
     await db.execute(CREATE_GATING_STATE_TABLE)
+    await db.execute(CREATE_GATING_PENDING_TABLE)
 
 
 def _next_state(
@@ -95,6 +110,7 @@ async def update_gating_state(
     p0: float = 0.5,
     alpha: float = 0.05,
     min_trades: int = 30,
+    veto_mode: bool = False,
     db_path: Optional[str] = None,
 ) -> dict[str, Any]:
     """Run one round of the state machine over derived win records.
@@ -132,6 +148,21 @@ async def update_gating_state(
             new_state, cp, cf = _next_state(
                 current, passed=passed, win_rate=wr, n=cand.n,
                 consecutive_pass=cp, consecutive_fail=cf)
+
+            # A5: in veto mode, a state CHANGE is held as a pending proposal —
+            # the live state does not move until a human approves. Counters
+            # still advance (so approval reflects accumulated evidence).
+            if new_state != current and veto_mode:
+                await db.execute(
+                    "INSERT INTO gating_pending (key, kind, from_state, to_state, "
+                    "win_rate, n, proposed_at) VALUES (?,?,?,?,?,?,?) "
+                    "ON CONFLICT(key) DO UPDATE SET to_state=excluded.to_state, "
+                    "win_rate=excluded.win_rate, n=excluded.n, proposed_at=excluded.proposed_at",
+                    (cand.key, kind, current, new_state, round(wr, 4), cand.n, now),
+                )
+                transitions.append({"key": cand.key, "from": current,
+                                    "to": new_state, "pending": True})
+                new_state = current  # hold the live state
 
             if new_state != current:
                 history.append({"at": now, "from": current, "to": new_state,
@@ -176,6 +207,49 @@ async def get_active_gating(*, db_path: Optional[str] = None) -> dict[str, Any]:
     except Exception as e:
         logger.debug("get_active_gating failed: %s", e)
     return out
+
+
+async def list_pending(*, db_path: Optional[str] = None) -> list[dict[str, Any]]:
+    """A5: proposed transitions awaiting human approval."""
+    path = db_path or DB_PATH
+    try:
+        async with aiosqlite.connect(path) as db:
+            await _ensure(db)
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT key, kind, from_state, to_state, win_rate, n, proposed_at "
+                "FROM gating_pending ORDER BY proposed_at DESC"
+            ) as cur:
+                return [dict(r) for r in await cur.fetchall()]
+    except Exception as e:
+        logger.debug("list_pending failed: %s", e)
+        return []
+
+
+async def resolve_pending(
+    key: str, approve: bool, *, db_path: Optional[str] = None
+) -> dict[str, Any]:
+    """A5: approve (apply the proposed transition) or reject (discard) a proposal."""
+    path = db_path or DB_PATH
+    now = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(path) as db:
+        await _ensure(db)
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM gating_pending WHERE key = ?", (key,)
+        ) as cur:
+            row = await cur.fetchone()
+        if not row:
+            return {"status": "not_found", "key": key}
+        if approve:
+            await db.execute(
+                "UPDATE gating_state SET state = ?, updated_at = ? WHERE key = ?",
+                (row["to_state"], now, key),
+            )
+        await db.execute("DELETE FROM gating_pending WHERE key = ?", (key,))
+        await db.commit()
+    return {"status": "approved" if approve else "rejected", "key": key,
+            "to_state": row["to_state"] if approve else None}
 
 
 # ── sync overlay cache (mirrors signal_edge._edge_overrides) ──
