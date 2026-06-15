@@ -206,6 +206,28 @@ async def build_conviction_calibration_curve():
     return {"data": await build_calibration_curve()}
 
 
+@router.get("/forward-performance")
+async def forward_performance_report(benchmark_return_pct: Optional[float] = None):
+    """Benchmark-relative forward performance + readiness (D2/D3).
+
+    Forward expectancy, win rate (with Wilson CI), per-trade Sharpe, max
+    drawdown, and alpha vs an optional benchmark return — from closed paper
+    trades. `readiness` flags whether the sample is large enough to trust.
+    """
+    from app.services.forward_report import forward_performance
+    return {"data": await forward_performance(benchmark_return_pct=benchmark_return_pct)}
+
+
+@router.get("/durability")
+async def durability_report(backtest_win_rate: float = 0.50):
+    """Durability check (D4): is the forward win rate inside the backtest CI?
+
+    A divergence (no CI overlap) is the train→test collapse signature.
+    """
+    from app.services.forward_report import durability_check
+    return {"data": await durability_check(backtest_win_rate=backtest_win_rate)}
+
+
 @router.post("/fit-weights")
 async def fit_factor_weights(regime: Optional[str] = None):
     """Refit factor weights from resolved win/loss outcomes (logistic regression).
