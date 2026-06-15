@@ -310,6 +310,51 @@ CREATE TABLE IF NOT EXISTS paper_trades (
 );
 """
 
+# Forward decision log (D1). One row per recommendation *considered* by the
+# auto-trader each cycle — taken AND skipped — with the full decision-time
+# snapshot. This is the honest forward record: it captures selection bias (why
+# a rec was NOT acted on) that `recommendation_outcomes` cannot, and is the
+# raw material for benchmark-relative reporting (D2) and the durability check
+# (D4). Append-only; never updated. Portable DDL (TEXT/REAL/INTEGER) so it
+# works on both SQLite and Postgres.
+CREATE_DECISION_LOG_TABLE = """
+CREATE TABLE IF NOT EXISTS decision_log (
+    id TEXT PRIMARY KEY,
+    decided_at TEXT NOT NULL,
+    trade_date TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    horizon TEXT,
+    action TEXT,
+    direction TEXT,
+    conviction INTEGER,
+    meta_label_prob REAL,
+    entry REAL,
+    stoploss REAL,
+    target1 REAL,
+    risk_reward REAL,
+    regime TEXT,
+    sector TEXT,
+    weighted_score REAL,
+    factor_agreement REAL,
+    taken INTEGER NOT NULL,
+    skip_reason TEXT,
+    win_prob_used REAL,
+    kelly_f_used REAL,
+    payoff_ratio REAL,
+    shares INTEGER,
+    position_value REAL,
+    binding_constraint TEXT,
+    max_correlation REAL,
+    source TEXT DEFAULT 'auto',
+    factors_json TEXT
+);
+"""
+CREATE_DECISION_LOG_INDEXES = [
+    "CREATE INDEX IF NOT EXISTS idx_decision_log_trade_date ON decision_log(trade_date);",
+    "CREATE INDEX IF NOT EXISTS idx_decision_log_symbol ON decision_log(symbol);",
+    "CREATE INDEX IF NOT EXISTS idx_decision_log_taken ON decision_log(taken);",
+]
+
 CREATE_BACKTEST_RUNS_TABLE = _create_backtest_runs_sql("sqlite")
 CREATE_BACKTEST_RUNS_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_backtest_runs_run_at ON backtest_runs(run_at DESC);",
@@ -424,6 +469,7 @@ async def _init_db_sqlite() -> None:
         await db.execute(CREATE_RECOMMENDATION_OUTCOMES_TABLE)
         await db.execute(CREATE_FACTOR_PERFORMANCE_TABLE)
         await db.execute(CREATE_PAPER_TRADES_TABLE)
+        await db.execute(CREATE_DECISION_LOG_TABLE)
         await db.execute(_create_backtest_runs_sql("sqlite"))
         await db.execute(_create_llm_usage_sql("sqlite"))
         await db.execute(CREATE_SIGNAL_EDGE_OVERRIDES_TABLE)
@@ -449,6 +495,8 @@ async def _init_db_sqlite() -> None:
         for idx_sql in CREATE_BACKTEST_RUNS_INDEXES:
             await db.execute(idx_sql)
         for idx_sql in CREATE_PAPER_TRADES_INDEXES:
+            await db.execute(idx_sql)
+        for idx_sql in CREATE_DECISION_LOG_INDEXES:
             await db.execute(idx_sql)
         for idx_sql in CREATE_LLM_USAGE_INDEXES:
             await db.execute(idx_sql)
@@ -477,6 +525,7 @@ def _init_db_sqlalchemy() -> None:
         CREATE_RECOMMENDATION_OUTCOMES_TABLE,
         CREATE_FACTOR_PERFORMANCE_TABLE,
         CREATE_PAPER_TRADES_TABLE,
+        CREATE_DECISION_LOG_TABLE,
         _create_backtest_runs_sql(dialect),
         _create_llm_usage_sql(dialect),
         CREATE_SIGNAL_EDGE_OVERRIDES_TABLE,
@@ -484,6 +533,7 @@ def _init_db_sqlalchemy() -> None:
         *CREATE_PRICE_ALERTS_INDEXES,
         *CREATE_BACKTEST_RUNS_INDEXES,
         *CREATE_PAPER_TRADES_INDEXES,
+        *CREATE_DECISION_LOG_INDEXES,
         *CREATE_LLM_USAGE_INDEXES,
     ]
     with eng.begin() as conn:

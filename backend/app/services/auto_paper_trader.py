@@ -164,15 +164,56 @@ async def auto_open_from_recommendations(
             "open_positions": open_pos,
         }
 
+    # ── forward decision log (D1) ──
+    # One snapshot per actionable (BUY/SELL) recommendation we evaluate —
+    # taken AND skipped, with the reason — so selection bias is auditable.
+    # HOLD/AVOID recs are never trade candidates and are intentionally not
+    # row-logged (they'd bloat the table by the size of the universe).
+    decisions: list[dict[str, Any]] = []
+
+    def _record(r, conv, rr, *, taken, skip_reason=None, direction=None,
+                sizing=None, max_corr=None) -> None:
+        def g(k):
+            v = getattr(r, k, None)
+            if v is None and isinstance(r, dict):
+                v = r.get(k)
+            return v
+        snap: dict[str, Any] = {
+            "symbol": g("symbol"), "horizon": g("horizon"), "action": g("action"),
+            "direction": direction, "conviction": int(conv),
+            "meta_label_prob": g("meta_label_prob"),
+            "entry": g("entry"), "stoploss": g("stoploss"), "target1": g("target1"),
+            "risk_reward": rr, "regime": g("regime"), "sector": g("sector"),
+            "weighted_score": g("weighted_score"), "factor_agreement": g("factor_agreement"),
+            "taken": taken, "skip_reason": skip_reason, "max_correlation": max_corr,
+            "trade_date": today, "source": "auto",
+            "factors": [
+                {"name": getattr(c, "name", None), "score": getattr(c, "score", None)}
+                for c in (g("signals") or []) if not isinstance(c, dict)
+            ] or g("signals"),
+        }
+        if sizing:
+            snap.update({
+                "win_prob_used": sizing.get("win_prob_used"),
+                "kelly_f_used": sizing.get("kelly_f_used"),
+                "payoff_ratio": sizing.get("payoff_ratio"),
+                "shares": sizing.get("shares"),
+                "position_value": sizing.get("position_value"),
+                "binding_constraint": sizing.get("binding_constraint"),
+            })
+        decisions.append(snap)
+
     candidates = []
     for r in recs:
         action = getattr(r, "action", None) or (r.get("action") if isinstance(r, dict) else None)
         if action not in ("BUY", "SELL"):
             continue
         conv = float(getattr(r, "conviction", 0) or (r.get("conviction") if isinstance(r, dict) else 0) or 0)
-        if conv < min_conviction:
-            continue
         rr = float(getattr(r, "risk_reward", 0) or (r.get("risk_reward") if isinstance(r, dict) else 0) or 0)
+        if conv < min_conviction:
+            _record(r, conv, rr, taken=False, skip_reason="below_min_conviction",
+                    direction=("bullish" if action == "BUY" else "bearish"))
+            continue
         candidates.append((conv, rr, r))
     candidates.sort(key=lambda t: (-t[0], -t[1]))
 
@@ -229,18 +270,21 @@ async def auto_open_from_recommendations(
     for conv, rr, r in candidates:
         if len(opened) >= budget:
             skip_counts["budget_exhausted"] = skip_counts.get("budget_exhausted", 0) + 1
+            _record(r, conv, rr, taken=False, skip_reason="budget_exhausted")
             continue
         sym = getattr(r, "symbol", None) or r.get("symbol")
         action = getattr(r, "action", None) or r.get("action")
         direction = "bullish" if action == "BUY" else "bearish"
         if await _already_open(sym, direction, today):
             skip_counts["already_open"] = skip_counts.get("already_open", 0) + 1
+            _record(r, conv, rr, taken=False, skip_reason="already_open", direction=direction)
             continue
         entry = float(getattr(r, "entry", None) or r.get("entry") or 0)
         sl = float(getattr(r, "stoploss", None) or r.get("stoploss") or 0)
         tgt = float(getattr(r, "target1", None) or r.get("target1") or 0)
         if entry <= 0 or sl <= 0 or tgt <= 0:
             skip_counts["invalid_prices"] = skip_counts.get("invalid_prices", 0) + 1
+            _record(r, conv, rr, taken=False, skip_reason="invalid_prices", direction=direction)
             continue
         # Strength = floor of conviction/10, clamped 1..10.
         strength = max(1, min(10, int(conv // 10)))
@@ -253,6 +297,7 @@ async def auto_open_from_recommendations(
         # trades (see kelly_sizing.py / backtest_results/CEILING_ANALYSIS.md).
         kelly_shares: int | None = None
         position_size: float | None = None
+        sizing: dict[str, Any] | None = None
         if _kelly_available:
             try:
                 meta_p = getattr(r, "meta_label_prob", None)
@@ -268,6 +313,8 @@ async def auto_open_from_recommendations(
                         "SKIP auto-open %s: %s (b=%.2f)",
                         sym, sizing["reason"], sizing["payoff_ratio"],
                     )
+                    _record(r, conv, rr, taken=False, skip_reason="negative_kelly_edge",
+                            direction=direction, sizing=sizing)
                     continue
                 kelly_shares = int(sizing["shares"])
                 position_size = float(sizing["position_value"])
@@ -290,6 +337,8 @@ async def auto_open_from_recommendations(
         if max_corr >= 0.7:
             skip_counts["correlated_to_open"] = skip_counts.get("correlated_to_open", 0) + 1
             logger.info("REJECTED auto-open %s: corr %.2f >= 0.70 against open book", sym, max_corr)
+            _record(r, conv, rr, taken=False, skip_reason="correlated_to_open",
+                    direction=direction, sizing=sizing, max_corr=max_corr)
             continue
 
         # ── hard 10-rule risk gate ──
@@ -340,6 +389,9 @@ async def auto_open_from_recommendations(
                 if gate.verdict == GateVerdict.REJECTED:
                     skip_counts["risk_gate_rejected"] = skip_counts.get("risk_gate_rejected", 0) + 1
                     logger.info("REJECTED auto-open %s by risk_gate: %s", sym, "; ".join(gate.reasons))
+                    _record(r, conv, rr, taken=False,
+                            skip_reason="risk_gate_rejected: " + "; ".join(gate.reasons),
+                            direction=direction, sizing=sizing, max_corr=max_corr)
                     continue
                 if gate.verdict == GateVerdict.MODIFIED and gate.modified_qty is not None:
                     # The gate trimmed our size — clamp Kelly shares to it.
@@ -348,6 +400,9 @@ async def auto_open_from_recommendations(
                         if kelly_shares <= 0:
                             skip_counts["risk_gate_rejected"] = skip_counts.get("risk_gate_rejected", 0) + 1
                             logger.info("REJECTED auto-open %s: risk gate trimmed size to 0", sym)
+                            _record(r, conv, rr, taken=False,
+                                    skip_reason="risk_gate_trimmed_to_zero",
+                                    direction=direction, sizing=sizing, max_corr=max_corr)
                             continue
                         position_size = round(kelly_shares * entry, 2)
                     strength = max(1, min(strength, gate.modified_qty))
@@ -370,18 +425,32 @@ async def auto_open_from_recommendations(
             opened.append({"symbol": sym, "direction": direction, "conviction": conv,
                             "trade_id": trade["trade_id"], "shares": kelly_shares,
                             "position_size": position_size})
+            _record(r, conv, rr, taken=True, direction=direction,
+                    sizing=sizing, max_corr=max_corr)
         except Exception as e:
             logger.warning("auto-open failed for %s: %s", sym, e)
             skip_counts["create_error"] = skip_counts.get("create_error", 0) + 1
+            _record(r, conv, rr, taken=False, skip_reason="create_error",
+                    direction=direction, sizing=sizing, max_corr=max_corr)
 
     if opened:
         logger.info("Auto paper-trades opened: %d (today=%d, open=%d)",
                     len(opened), already_today + len(opened), open_pos + len(opened))
+
+    # Persist the forward decision log (D1) — fire-and-forget, never blocks or
+    # breaks the trade path. One row per actionable candidate, taken or not.
+    try:
+        from app.services.decision_log import log_decisions
+        await log_decisions(decisions, db_path=DB_PATH)
+    except Exception as e:
+        logger.debug("decision_log persistence skipped: %s", e)
+
     return {
         "opened": opened,
         "skipped_reason_counts": skip_counts,
         "today_auto_trades": already_today + len(opened),
         "open_positions": open_pos + len(opened),
+        "decisions_logged": len(decisions),
     }
 
 
