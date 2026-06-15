@@ -811,6 +811,10 @@ async def generate_recommendation(
             rec = rec.model_copy(update={
                 "conviction": max(0, min(100, scaled)),
                 "action": new_action,
+                # Surface the OOS p(win) as a machine-readable field so Kelly
+                # sizing can bet off the measured probability (B1), not just
+                # the conviction heuristic.
+                "meta_label_prob": round(float(p_meta), 4),
                 "calibration_note": (
                     f"{rec.calibration_note} Meta-label p(win)={p_meta:.2f} → "
                     f"conviction {rec.conviction} → {scaled}."

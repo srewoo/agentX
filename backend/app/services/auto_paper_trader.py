@@ -59,6 +59,23 @@ def _win_probability(conviction: float) -> float:
     return max(0.35, min(_WIN_PROB_CAP, p))
 
 
+def _effective_win_prob(conviction: float, meta_label_prob: Optional[float]) -> float:
+    """Win probability to size Kelly on (B1).
+
+    The conviction map (`_win_probability`) is a hand-tuned heuristic. When the
+    recommendation carries an out-of-sample meta-label probability — a measured
+    p(win) from the trained secondary classifier — we bet off the **more
+    conservative** of the two. Taking the min means a weak measured edge always
+    shrinks the bet (and can drop it to zero via Kelly), while a strong
+    measured edge never *inflates* it beyond the conviction-only ceiling. With
+    no meta-label deployed yet, this is exactly the old behaviour.
+    """
+    conv_p = _win_probability(conviction)
+    if meta_label_prob is None:
+        return conv_p
+    return min(conv_p, max(0.0, min(1.0, float(meta_label_prob))))
+
+
 async def _fetch_volatility(symbol: str) -> tuple[Optional[float], Optional[float]]:
     """Best-effort ``(atr_pct, adx)`` for the risk gate's ATR-chop rule.
 
@@ -238,9 +255,12 @@ async def auto_open_from_recommendations(
         position_size: float | None = None
         if _kelly_available:
             try:
+                meta_p = getattr(r, "meta_label_prob", None)
+                if meta_p is None and isinstance(r, dict):
+                    meta_p = r.get("meta_label_prob")
                 sizing = kelly_position_size(
                     capital=capital, entry=entry, stop=sl, target=tgt,
-                    win_prob=_win_probability(conv), direction=direction,
+                    win_prob=_effective_win_prob(conv, meta_p), direction=direction,
                 )
                 if sizing["skip"]:
                     skip_counts["negative_kelly_edge"] = skip_counts.get("negative_kelly_edge", 0) + 1

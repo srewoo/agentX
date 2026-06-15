@@ -99,3 +99,41 @@ async def test_earnings_blackout_rec_is_rejected_by_gate(wired_db, monkeypatch):
     result = await auto_paper_trader.auto_open_from_recommendations([rec], min_conviction=65)
     assert result["opened"] == []
     assert result["skipped_reason_counts"].get("risk_gate_rejected", 0) == 1
+
+
+# ── B1: meta-label probability threaded into Kelly sizing ──
+# _effective_win_prob is the pure decision point — bet off the more
+# conservative of the conviction heuristic and the measured OOS p(win).
+
+def test_effective_win_prob_no_meta_label_is_conviction_only():
+    # No deployed meta-label model → identical to the old conviction map.
+    conv = 80.0
+    assert auto_paper_trader._effective_win_prob(conv, None) == \
+        auto_paper_trader._win_probability(conv)
+
+
+def test_effective_win_prob_weak_meta_label_shrinks_the_bet():
+    # A pessimistic measured p(win) must drag the sizing probability DOWN
+    # below the conviction-only value — never let conviction override a weak
+    # measured edge.
+    conv = 90.0
+    conv_only = auto_paper_trader._win_probability(conv)
+    eff = auto_paper_trader._effective_win_prob(conv, meta_label_prob=0.40)
+    assert eff == 0.40
+    assert eff < conv_only
+
+
+def test_effective_win_prob_strong_meta_label_cannot_inflate_beyond_ceiling():
+    # A bullish measured p(win) must NOT push sizing above the conservative
+    # conviction ceiling — we take the min, so the cap still binds.
+    conv = 70.0
+    conv_only = auto_paper_trader._win_probability(conv)
+    eff = auto_paper_trader._effective_win_prob(conv, meta_label_prob=0.95)
+    assert eff == conv_only
+    assert eff <= auto_paper_trader._WIN_PROB_CAP
+
+
+def test_effective_win_prob_clamps_out_of_range_meta_label():
+    # Defensive: a malformed p(win) outside [0,1] is clamped, never trusted raw.
+    assert 0.0 <= auto_paper_trader._effective_win_prob(60.0, 1.7) <= 1.0
+    assert auto_paper_trader._effective_win_prob(60.0, -0.2) == 0.0

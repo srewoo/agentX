@@ -58,6 +58,12 @@ class Recommendation(BaseModel):
     regime: Optional[str] = None
     weighted_score: Optional[float] = None
     factor_agreement: Optional[float] = None
+    # Out-of-sample meta-label classifier's p(win), when a model is deployed
+    # (None before it has enough resolved trades to train). Exposed as a
+    # machine-readable field — not just in calibration_note — so downstream
+    # position sizing (kelly) can bet off the measured probability rather than
+    # the conviction heuristic. See auto_paper_trader._effective_win_prob.
+    meta_label_prob: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     calibration_note: Optional[str] = None
     data_quality: Optional[str] = None
     portfolio_context: Optional[dict] = None
