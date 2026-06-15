@@ -1,0 +1,255 @@
+from __future__ import annotations
+"""A1 + A2 — autonomous gating: derive promote/mute/block sets with a state machine.
+
+Replaces the hand-typed constants in `signal_edge.py` (SYMBOL_BLOCKLIST,
+DIRECTIONAL_MUTES, PROMOTED_SIGNALS) with sets *derived from data* — but only
+behind two protections so the autonomous loop can't overfit:
+
+  * **A3 guardrails** (`multiple_testing.select_significant`): a combo's win
+    record must be FDR-significant above break-even on an adequate sample
+    before it is even eligible for promotion.
+  * **Hysteresis state machine** (this module): eligibility on a *single*
+    round is not enough. A combo must pass on ``PROMOTE_AFTER`` consecutive
+    weekly rounds to become PROMOTED, and a PROMOTED combo is demoted after
+    ``DEMOTE_AFTER`` consecutive failures. This is what stops the gate from
+    flip-flopping on noise and is the mechanism that replaces a human reading
+    the backtest each week.
+
+States: CANDIDATE → (consecutive passes) → PROMOTED, and back to CANDIDATE on
+sustained failure; a combo whose win rate sits materially *below* break-even on
+a large sample is MUTED. Per-symbol records use the same machine with a BLOCKED
+terminal state.
+
+The derived sets are persisted to `gating_state`; `get_active_gating()` returns
+them for the engine to consume. Seeding from the existing hand-curated
+constants is supported so the first run starts where the human left off.
+"""
+import json
+import logging
+from datetime import datetime, timezone
+from typing import Any, Optional
+
+import aiosqlite
+
+from app.database import DB_PATH
+from app.services.multiple_testing import Candidate, select_significant
+
+logger = logging.getLogger(__name__)
+
+PROMOTE_AFTER = 3   # consecutive significant rounds to reach PROMOTED
+DEMOTE_AFTER = 2    # consecutive failures to leave PROMOTED
+MUTE_WINRATE = 0.45     # win rate below this on a large sample → MUTED
+MUTE_MIN_TRADES = 100   # sample needed before a MUTE is trusted
+
+CREATE_GATING_STATE_TABLE = """
+CREATE TABLE IF NOT EXISTS gating_state (
+    key TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    state TEXT NOT NULL,
+    consecutive_pass INTEGER DEFAULT 0,
+    consecutive_fail INTEGER DEFAULT 0,
+    last_win_rate REAL,
+    last_n INTEGER,
+    last_p_value REAL,
+    updated_at TEXT,
+    history_json TEXT
+);
+"""
+
+
+async def _ensure(db: aiosqlite.Connection) -> None:
+    await db.execute(CREATE_GATING_STATE_TABLE)
+
+
+def _next_state(
+    current: str, *, passed: bool, win_rate: float, n: int,
+    consecutive_pass: int, consecutive_fail: int,
+) -> tuple[str, int, int]:
+    """Pure transition function. Returns (state, consecutive_pass, consecutive_fail)."""
+    if passed:
+        consecutive_pass += 1
+        consecutive_fail = 0
+        if consecutive_pass >= PROMOTE_AFTER:
+            return "promoted", consecutive_pass, consecutive_fail
+        # A passing combo that isn't yet promoted is a candidate (clears MUTE).
+        return ("promoted" if current == "promoted" else "candidate",
+                consecutive_pass, consecutive_fail)
+    # Did not pass this round.
+    consecutive_fail += 1
+    consecutive_pass = 0
+    if current == "promoted":
+        if consecutive_fail >= DEMOTE_AFTER:
+            return "candidate", consecutive_pass, consecutive_fail
+        return "promoted", consecutive_pass, consecutive_fail  # grace period
+    # Mute only on a clear, well-sampled negative — not mere non-significance.
+    if n >= MUTE_MIN_TRADES and win_rate < MUTE_WINRATE:
+        return "muted", consecutive_pass, consecutive_fail
+    return ("muted" if current == "muted" else "candidate",
+            consecutive_pass, consecutive_fail)
+
+
+async def update_gating_state(
+    round_results: list[Candidate],
+    *,
+    kind: str = "combo",
+    p0: float = 0.5,
+    alpha: float = 0.05,
+    min_trades: int = 30,
+    db_path: Optional[str] = None,
+) -> dict[str, Any]:
+    """Run one round of the state machine over derived win records.
+
+    `round_results` is this round's (key, wins, n) per combo/symbol — typically
+    mapped from the weekly walk-forward. Applies A3 significance, advances each
+    key's state with hysteresis, persists, and returns a transition summary.
+    """
+    path = db_path or DB_PATH
+    verdicts = {v.key: v for v in select_significant(
+        round_results, p0=p0, alpha=alpha, min_trades=min_trades)}
+    now = datetime.now(timezone.utc).isoformat()
+    transitions: list[dict[str, Any]] = []
+
+    async with aiosqlite.connect(path) as db:
+        await _ensure(db)
+        db.row_factory = aiosqlite.Row
+        for cand in round_results:
+            v = verdicts.get(cand.key)
+            passed = bool(v and v.passed)
+            wr = (cand.wins / cand.n) if cand.n > 0 else 0.0
+            async with db.execute(
+                "SELECT state, consecutive_pass, consecutive_fail, history_json "
+                "FROM gating_state WHERE key = ?", (cand.key,)
+            ) as cur:
+                row = await cur.fetchone()
+            current = row["state"] if row else "candidate"
+            cp = row["consecutive_pass"] if row else 0
+            cf = row["consecutive_fail"] if row else 0
+            try:
+                history = json.loads(row["history_json"]) if row and row["history_json"] else []
+            except Exception:
+                history = []
+
+            new_state, cp, cf = _next_state(
+                current, passed=passed, win_rate=wr, n=cand.n,
+                consecutive_pass=cp, consecutive_fail=cf)
+
+            if new_state != current:
+                history.append({"at": now, "from": current, "to": new_state,
+                                "wr": round(wr, 4), "n": cand.n})
+                transitions.append({"key": cand.key, "from": current, "to": new_state})
+
+            await db.execute(
+                "INSERT INTO gating_state (key, kind, state, consecutive_pass, "
+                "consecutive_fail, last_win_rate, last_n, last_p_value, updated_at, "
+                "history_json) VALUES (?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(key) DO UPDATE SET state=excluded.state, "
+                "consecutive_pass=excluded.consecutive_pass, "
+                "consecutive_fail=excluded.consecutive_fail, "
+                "last_win_rate=excluded.last_win_rate, last_n=excluded.last_n, "
+                "last_p_value=excluded.last_p_value, updated_at=excluded.updated_at, "
+                "history_json=excluded.history_json",
+                (cand.key, kind, new_state, cp, cf, round(wr, 4), cand.n,
+                 round(v.p_value, 6) if v else None, now,
+                 json.dumps(history[-50:])),
+            )
+        await db.commit()
+
+    return {"evaluated": len(round_results), "transitions": transitions}
+
+
+async def get_active_gating(*, db_path: Optional[str] = None) -> dict[str, Any]:
+    """Derived gating sets for the engine: promoted / muted / blocked keys.
+
+    Returns sets of keys (``"signal_type|direction"`` or ``"SYMBOL"``). Empty
+    sets when nothing has been derived yet — the engine then falls back to its
+    hand-curated constants, so this is safe to consult unconditionally.
+    """
+    path = db_path or DB_PATH
+    out = {"promoted": set(), "muted": set(), "blocked": set(), "candidate": set()}
+    try:
+        async with aiosqlite.connect(path) as db:
+            await _ensure(db)
+            db.row_factory = aiosqlite.Row
+            async with db.execute("SELECT key, state FROM gating_state") as cur:
+                for row in await cur.fetchall():
+                    out.setdefault(row["state"], set()).add(row["key"])
+    except Exception as e:
+        logger.debug("get_active_gating failed: %s", e)
+    return out
+
+
+# ── sync overlay cache (mirrors signal_edge._edge_overrides) ──
+# signal_edge's predicates are sync and hot-path; this in-memory overlay lets
+# them consult the derived sets without an await. Seed at startup via
+# seed_overlay(); the overlay predicates return None when a key is in no
+# derived set, so the caller falls back to its hand-curated constant.
+_overlay: dict[str, set] = {"promoted": set(), "muted": set(), "blocked": set()}
+
+
+def set_overlay(sets: dict[str, set]) -> None:
+    global _overlay
+    _overlay = {
+        "promoted": set(sets.get("promoted") or ()),
+        "muted": set(sets.get("muted") or ()),
+        "blocked": set(sets.get("blocked") or ()),
+    }
+
+
+async def seed_overlay(*, db_path: Optional[str] = None) -> int:
+    """Load derived sets into the sync overlay cache. Call at startup."""
+    active = await get_active_gating(db_path=db_path)
+    set_overlay(active)
+    return sum(len(active.get(k, ())) for k in ("promoted", "muted", "blocked"))
+
+
+def overlay_is_promoted(signal_type: str, direction: str) -> Optional[bool]:
+    """True if derived-promoted, None if no derived opinion (→ use constant)."""
+    if not _overlay["promoted"] and not _overlay["muted"]:
+        return None
+    return f"{signal_type}|{direction}" in _overlay["promoted"]
+
+
+def overlay_is_muted(signal_type: str, direction: str) -> Optional[bool]:
+    if not _overlay["muted"] and not _overlay["promoted"]:
+        return None
+    return f"{signal_type}|{direction}" in _overlay["muted"]
+
+
+def overlay_is_blocked(symbol: str) -> Optional[bool]:
+    if not _overlay["blocked"]:
+        return None
+    return (symbol or "").upper() in _overlay["blocked"]
+
+
+async def seed_from_constants(
+    promoted: list[tuple[str, str]],
+    muted: list[tuple[str, str]],
+    blocked: list[str],
+    *,
+    db_path: Optional[str] = None,
+) -> int:
+    """One-time seed of the state table from the existing hand-curated sets.
+
+    Starts the autonomous machine where the human left off, so we don't lose
+    accumulated judgment on the first derived run. Idempotent — only inserts
+    keys that don't already exist.
+    """
+    path = db_path or DB_PATH
+    now = datetime.now(timezone.utc).isoformat()
+    rows = (
+        [(f"{s}|{d}", "combo", "promoted") for s, d in promoted]
+        + [(f"{s}|{d}", "combo", "muted") for s, d in muted]
+        + [(s, "symbol", "blocked") for s in blocked]
+    )
+    n = 0
+    async with aiosqlite.connect(path) as db:
+        await _ensure(db)
+        for key, kind, state in rows:
+            cur = await db.execute(
+                "INSERT OR IGNORE INTO gating_state (key, kind, state, updated_at, "
+                "history_json) VALUES (?,?,?,?,?)",
+                (key, kind, state, now, json.dumps([{"at": now, "seed": state}])),
+            )
+            n += cur.rowcount or 0
+        await db.commit()
+    return n
