@@ -25,6 +25,22 @@ import aiosqlite
 
 logger = logging.getLogger(__name__)
 
+# Date the static SIGNAL_EDGE baseline below was generated from (the
+# 2026-05-21 walk-forward OOS run). This is the cold-start prior; live
+# overrides from the weekly backtest shadow it per key. Surfaced via
+# `edge_freshness()` so the API/UI can warn when the priors are stale and
+# the engine is flying on numbers that may no longer hold.
+EDGE_BASELINE_DATE = "2026-05-21"
+
+# Beyond this many days without a live override refresh, the edge table is
+# considered stale — the signal engine may have drifted from these priors.
+EDGE_STALE_AFTER_DAYS = 45
+
+# Timestamp (ISO-8601) of the most recent live override refresh, learned from
+# the `signal_edge_overrides.updated_at` column at seed/write time. None when
+# no override has ever been written (running purely on the static baseline).
+_edge_last_refreshed_at: Optional[str] = None
+
 # Family taxonomy — used by confluence diversity check.
 #  - momentum:   trend / momentum (MACD, EMA cross, price spike)
 #  - divergence: classical divergences (RSI, MACD divergence)
@@ -348,7 +364,12 @@ def is_symbol_blocked(symbol: str) -> bool:
     Use at the top of every per-symbol entry point (orchestrator scan,
     recommendation engine, auto-paper-trader) so blocked names never reach
     any of the costly downstream layers.
+
+    Consults the autonomous-gating overlay first (derived sets can only ADD
+    blocks, never un-block a hand-curated name), then the constant blocklist.
     """
+    if _overlay_blocked(symbol):
+        return True
     return (symbol or "").upper() in SYMBOL_BLOCKLIST
 
 
@@ -363,14 +384,51 @@ def is_muted(signal_type: str, direction: Optional[str] = None) -> bool:
     """
     if signal_type in RECOMMENDED_MUTES:
         return True
+    if direction is not None and _overlay_muted(signal_type, direction):
+        return True
     if direction is not None and (signal_type, direction) in DIRECTIONAL_MUTES:
         return True
     return False
 
 
 def is_promoted(signal_type: str, direction: str) -> bool:
-    """True for the four walk-forward-confirmed positive-edge setups."""
+    """True for walk-forward-confirmed positive-edge setups.
+
+    Consults the autonomous-gating overlay first (derived promotions add to,
+    never remove, the hand-curated set), then the PROMOTED_SIGNALS constant.
+    """
+    if _overlay_promoted(signal_type, direction):
+        return True
     return (signal_type, direction) in PROMOTED_SIGNALS
+
+
+# ── autonomous-gating overlay bridge ──
+# Lazy + fail-safe: the derived sets live in gating_state's sync cache (seeded
+# at startup). We consult them here so the hot-path predicates stay sync. Any
+# import/lookup failure falls through to the hand-curated constants — the
+# derived layer can only ever ADD gating, never weaken it.
+def _overlay_promoted(signal_type: str, direction: str) -> bool:
+    try:
+        from app.services.gating_state import overlay_is_promoted
+        return overlay_is_promoted(signal_type, direction) is True
+    except Exception:
+        return False
+
+
+def _overlay_muted(signal_type: str, direction: str) -> bool:
+    try:
+        from app.services.gating_state import overlay_is_muted
+        return overlay_is_muted(signal_type, direction) is True
+    except Exception:
+        return False
+
+
+def _overlay_blocked(symbol: str) -> bool:
+    try:
+        from app.services.gating_state import overlay_is_blocked
+        return overlay_is_blocked(symbol) is True
+    except Exception:
+        return False
 
 
 def signal_weight_multiplier(signal_type: str, direction: str, regime: Optional[str] = None) -> float:
@@ -423,12 +481,14 @@ def set_edge_overrides(rows: dict[tuple[str, str], dict]) -> None:
 async def seed_edge_overrides() -> int:
     """Load overrides from SQLite at startup. Returns number loaded."""
     from app.database import DB_PATH
+    global _edge_last_refreshed_at
     loaded: dict[tuple[str, str], dict] = {}
+    latest_updated_at: Optional[str] = None
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
-                "SELECT signal_type, direction, win_rate, avg_pnl, trades "
+                "SELECT signal_type, direction, win_rate, avg_pnl, trades, updated_at "
                 "FROM signal_edge_overrides"
             ) as cur:
                 async for row in cur:
@@ -437,9 +497,13 @@ async def seed_edge_overrides() -> int:
                         "avg_pnl": float(row["avg_pnl"]),
                         "trades": int(row["trades"]),
                     }
+                    upd = row["updated_at"]
+                    if upd and (latest_updated_at is None or upd > latest_updated_at):
+                        latest_updated_at = upd
     except Exception as e:
         logger.debug("seed_edge_overrides: %s", e)
     set_edge_overrides(loaded)
+    _edge_last_refreshed_at = latest_updated_at
     return len(loaded)
 
 
@@ -447,25 +511,41 @@ async def write_edge_overrides(
     rows: dict[tuple[str, str], dict],
     min_trades: int = _OVERRIDE_MIN_TRADES,
 ) -> int:
-    """Persist + activate per-key overrides. Returns number written.
+    """Persist + activate per-key overrides via UPSERT (merge, not replace).
 
-    Skips rows below `min_trades` so a thin weekly run can never erase
-    a known-good baseline edge. Replaces all rows in one transaction so
-    keys that no longer meet the threshold are removed cleanly.
+    Skips rows below ``min_trades`` so a thin batch can never write a noisy
+    edge. **Merges** the surviving keys into the existing table rather than
+    replacing it: keys present in this batch are refreshed (freshest wins),
+    keys absent from this batch are preserved. This is what makes it safe for
+    both the daily *and* weekly backtests to refresh edges — a narrower daily
+    run no longer wipes the broader weekly coverage (and vice-versa). The
+    cold-start ``SIGNAL_EDGE`` baseline still backs any key neither run has
+    measured yet, and ``edge_freshness()`` reports overall staleness.
+
+    Returns the number of keys written/updated this call.
     """
     from app.database import DB_PATH
+    global _edge_last_refreshed_at
     keep: dict[tuple[str, str], dict] = {
         k: v for k, v in rows.items() if (v.get("trades") or 0) >= min_trades
     }
+    if not keep:
+        logger.info(
+            "signal_edge overrides: 0/%d keys cleared min_trades=%d — table unchanged",
+            len(rows), min_trades,
+        )
+        return 0
     now = datetime.now(timezone.utc).isoformat()
     try:
         async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("DELETE FROM signal_edge_overrides")
             for (stype, direction), d in keep.items():
                 await db.execute(
                     "INSERT INTO signal_edge_overrides "
                     "(signal_type, direction, win_rate, avg_pnl, trades, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    "VALUES (?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(signal_type, direction) DO UPDATE SET "
+                    "win_rate=excluded.win_rate, avg_pnl=excluded.avg_pnl, "
+                    "trades=excluded.trades, updated_at=excluded.updated_at",
                     (stype, direction, float(d["win_rate"]), float(d["avg_pnl"]),
                      int(d["trades"]), now),
                 )
@@ -473,10 +553,13 @@ async def write_edge_overrides(
     except Exception as e:
         logger.warning("write_edge_overrides failed (non-critical): %s", e)
         return 0
-    set_edge_overrides(keep)
+    # Re-seed the in-memory map from the merged table so this process reflects
+    # the full set (this batch + previously-written keys), not just this batch.
+    await seed_edge_overrides()
+    _edge_last_refreshed_at = now
     logger.info(
-        "signal_edge overrides refreshed: %d/%d keys persisted (min_trades=%d)",
-        len(keep), len(rows), min_trades,
+        "signal_edge overrides merged: %d/%d keys upserted (min_trades=%d), %d total live",
+        len(keep), len(rows), min_trades, len(_edge_overrides),
     )
     return len(keep)
 
@@ -544,3 +627,52 @@ def all_edge_rows() -> list[dict]:
         })
     rows.sort(key=lambda r: r["avg_pnl"], reverse=True)
     return rows
+
+
+def edge_freshness() -> dict:
+    """Report how current the edge priors are, so callers can warn on staleness.
+
+    The static ``SIGNAL_EDGE`` table is a snapshot from ``EDGE_BASELINE_DATE``;
+    live overrides from the weekly backtest shadow it per key. If no override
+    has refreshed in ``EDGE_STALE_AFTER_DAYS`` (or none ever has), the engine
+    is filtering live signals on priors that may no longer hold — ``is_stale``
+    flags that. Returns::
+
+        {
+            "baseline_date": "2026-05-21",
+            "last_refreshed_at": "2026-06-09T..." | None,
+            "live_override_count": int,
+            "age_days": float | None,   # since last live refresh
+            "is_stale": bool,
+            "reason": str,
+        }
+    """
+    last = _edge_last_refreshed_at
+    age_days: Optional[float] = None
+    if last:
+        try:
+            ts = datetime.fromisoformat(last)
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            age_days = (datetime.now(timezone.utc) - ts).total_seconds() / 86400.0
+        except Exception:
+            age_days = None
+
+    if age_days is None:
+        is_stale = True
+        reason = "no live override refresh on record — running on static baseline only"
+    elif age_days > EDGE_STALE_AFTER_DAYS:
+        is_stale = True
+        reason = f"last live refresh {age_days:.0f}d ago (> {EDGE_STALE_AFTER_DAYS}d threshold)"
+    else:
+        is_stale = False
+        reason = f"last live refresh {age_days:.0f}d ago"
+
+    return {
+        "baseline_date": EDGE_BASELINE_DATE,
+        "last_refreshed_at": last,
+        "live_override_count": len(_edge_overrides),
+        "age_days": round(age_days, 1) if age_days is not None else None,
+        "is_stale": is_stale,
+        "reason": reason,
+    }

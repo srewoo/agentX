@@ -32,6 +32,7 @@ import pandas as pd
 
 from app.services.data_fetcher import MAJOR_STOCKS, async_fetch_history
 from app.services.fundamentals_deep import get_deep_fundamentals
+from app.services.fundamentals_pit import get_pit_history, select_asof, _normalise as _normalise_pit
 from app.services.quality_value_strategy import QV_FILTERS, passes_qv_filters
 
 logger = logging.getLogger(__name__)
@@ -95,6 +96,7 @@ async def _evaluate_one_symbol(
     filters: dict[str, Any],
     sector_pe_lookup: dict[str, float],
     fundamentals_mode: str = "deep",
+    point_in_time: bool = False,
 ) -> dict[str, Any]:
     """Walk through history sampling at `rebalance_days` cadence.
 
@@ -106,6 +108,26 @@ async def _evaluate_one_symbol(
     df = await async_fetch_history(symbol, period=period, interval="1d")
     if df is None or df.empty or len(df) < 260 + hold_days:
         return {"symbol": symbol, "error": "insufficient_history", "trades": 0}
+
+    # ── Point-in-time fundamentals (opt-in) ──────────────────────────────
+    # When enabled, pull the filing-date-tagged statement history once and
+    # resolve fundamentals *as of each entry bar* inside the loop, removing
+    # the restated-snapshot look-ahead. `pit_applied` records whether PIT data
+    # was actually available (FMP key/plan/coverage) so the aggregate output
+    # can report honestly rather than claiming a fix that didn't run.
+    pit_history = None
+    pit_applied = False
+    bar_dates: list = []
+    if point_in_time and fundamentals_mode == "deep":
+        pit_history = await get_pit_history(symbol)
+        pit_applied = bool(pit_history)
+        if pit_history:
+            try:
+                bar_dates = [getattr(d, "date", lambda: None)() for d in df.index]
+            except Exception:
+                bar_dates = []
+                pit_history = None
+                pit_applied = False
 
     composite = 0
     roe = pe = fcf = net_debt_to_ebitda = None
@@ -170,14 +192,33 @@ async def _evaluate_one_symbol(
         fl_low = float(fiftytwo_low_series[i]) if fiftytwo_low_series[i] == fiftytwo_low_series[i] else 0.0
         adv = float(pd.Series(closes[i - 20:i + 1]).mean() * pd.Series(volumes[i - 20:i + 1]).mean())
 
+        # Per-bar fundamentals. Default to the pre-loop values; override with
+        # point-in-time figures when PIT mode resolved a statement public on
+        # this bar's date.
+        pe_i, roe_i, ndte_i, fcf_i = pe, roe, net_debt_to_ebitda, fcf
+
         # PIT-correct quality: compute the proxy using ONLY bars [0..i].
         # Was previously a single snapshot on the full series, which
         # leaked future information backward. Now an honest backtest.
         if fundamentals_mode == "price_only":
             composite_pit = int(_price_only_quality_proxy(close_series.iloc[: i + 1]))
+        elif pit_history is not None and i < len(bar_dates) and bar_dates[i] is not None:
+            # Resolve fundamentals as they were public on this bar's date.
+            asof_row = select_asof(pit_history, bar_dates[i])
+            if asof_row is None:
+                # Nothing was filed yet on this date — we cannot QV-filter
+                # honestly, so skip the entry rather than borrow future data.
+                continue
+            m = _normalise_pit(asof_row)
+            pe_i = m["pe"] if m["pe"] is not None else pe
+            roe_i = m["roe"] if m["roe"] is not None else roe
+            ndte_i = m["net_debt_to_ebitda"] if m["net_debt_to_ebitda"] is not None else net_debt_to_ebitda
+            fcf_i = m["fcf_per_share"] if m["fcf_per_share"] is not None else fcf
+            # Use the price-only proxy for composite — PIT-honest, no snapshot.
+            composite_pit = int(_price_only_quality_proxy(close_series.iloc[: i + 1]))
         else:
-            # Deep-fundamentals mode still has the snapshot bias unless
-            # snapshot_fundamentals has captured PIT rows — caller's job.
+            # Deep-fundamentals mode without PIT data still carries the
+            # snapshot bias — surfaced via pit_applied in the aggregate output.
             composite_pit = composite
 
         # SMA200 PIT: use rolling value up to bar i.
@@ -185,8 +226,8 @@ async def _evaluate_one_symbol(
 
         passes, _audit = passes_qv_filters(
             price=price, fiftytwo_week_low=fl_low, avg_daily_value_inr=adv,
-            pe=pe, sector_pe_median=sector_pe, roe=roe,
-            net_debt_to_ebitda=net_debt_to_ebitda, fcf=fcf,
+            pe=pe_i, sector_pe_median=sector_pe, roe=roe_i,
+            net_debt_to_ebitda=ndte_i, fcf=fcf_i,
             composite_score=composite_pit, sector=sector,
             sma200=sma200_val,
             # Earnings blackout not applied in backtester — no historical
@@ -218,7 +259,8 @@ async def _evaluate_one_symbol(
         })
         last_entry_idx = i
 
-    return {"symbol": symbol, "trades_count": len(trades), "trades": trades}
+    return {"symbol": symbol, "trades_count": len(trades), "trades": trades,
+            "pit_applied": pit_applied}
 
 
 def _summarise(all_trades: list[dict[str, Any]], hold_days: int) -> dict[str, Any]:
@@ -270,6 +312,7 @@ async def run_qv_walk_forward(
     filters: Optional[dict[str, Any]] = None,
     parallelism: int = 5,
     fundamentals_mode: str = "deep",
+    point_in_time: bool = False,
 ) -> dict[str, Any]:
     """Run the QV strategy walk-forward across `symbols` over `period`.
 
@@ -277,14 +320,32 @@ async def run_qv_walk_forward(
     of history, hold period from QV_FILTERS (default 365 days), scan every
     60 days for new candidates.
 
+    ``point_in_time``: when True, fundamentals are resolved as-of each entry
+    bar via filing-date-tagged statements (removing restated-snapshot
+    look-ahead), and — if a historical-constituents CSV is present — the
+    universe is reconstructed survivorship-free. The ``methodology`` output
+    reports which biases were *actually* corrected this run, not which the
+    flag requested.
+
     Returns per-symbol trade lists + universe summary + Wilson LBs on
     multiple win-rate thresholds (positive, >5%, >10%, >25%).
     """
     filters = filters or QV_FILTERS
     if hold_days is None:
         hold_days = int(filters.get("hold_days", 365))
+
+    survivorship_free = False
     if symbols is None:
-        symbols = [s["symbol"] for s in MAJOR_STOCKS if not s["symbol"].startswith("^")][:100]
+        if point_in_time:
+            # Survivorship-aware universe (point-in-time members incl. delisted
+            # names) when a constituents-history CSV is available; else today's
+            # static list with the bias flagged. As-of date = start of period.
+            from datetime import timedelta
+            from app.services.universe_pit import get_universe_at_date
+            start_dt = (datetime.now(timezone.utc) - timedelta(days=365 * 5)).date()
+            symbols, survivorship_free = get_universe_at_date(start_dt, limit=100)
+        else:
+            symbols = [s["symbol"] for s in MAJOR_STOCKS if not s["symbol"].startswith("^")][:100]
 
     # Sector median PE — only fetched in "deep" mode to avoid burning
     # yfinance budget when we're going price-only anyway.
@@ -300,6 +361,7 @@ async def run_qv_walk_forward(
                     rebalance_days=rebalance_days, filters=filters,
                     sector_pe_lookup=sector_pe_lookup,
                     fundamentals_mode=fundamentals_mode,
+                    point_in_time=point_in_time,
                 )
             except Exception as e:
                 logger.warning("QV walk-forward failed for %s: %s", sym, e)
@@ -312,6 +374,28 @@ async def run_qv_walk_forward(
             pooled_trades.append({**t, "symbol": ps["symbol"]})
 
     universe_summary = _summarise(pooled_trades, hold_days)
+
+    # How many symbols actually got point-in-time fundamentals (FMP coverage)?
+    pit_symbols = sum(1 for p in per_symbol if p.get("pit_applied"))
+    pit_fundamentals_applied = point_in_time and pit_symbols > 0
+
+    # Report the biases that REMAIN, honestly, based on what ran — not what the
+    # flag asked for. A flag set but data unavailable must not claim a fix.
+    remaining_biases: list[str] = []
+    if not pit_fundamentals_applied:
+        remaining_biases.append(
+            "fundamentals are current-snapshot, not point-in-time "
+            "(yfinance restates); biases win-rate upward 2-4pp"
+            + (" — PIT requested but FMP data unavailable for this universe"
+               if point_in_time else "")
+        )
+    if not survivorship_free:
+        remaining_biases.append(
+            "universe is current NIFTY membership; survivorship biases "
+            "win-rate upward 1-3pp"
+            + (" — survivorship-free requested but no constituents-history CSV present"
+               if point_in_time else "")
+        )
 
     return {
         "universe_evaluated": len(symbols),
@@ -330,11 +414,16 @@ async def run_qv_walk_forward(
             "type": "qv_quality_value_52w_low",
             "hold": f"{hold_days} trading days",
             "exit_rules": "time barrier OR catastrophe stop at -20%",
-            "known_biases": [
-                "fundamentals are current-snapshot, not point-in-time "
-                "(yfinance restates); biases win-rate upward 2-4pp",
-                "universe is current NIFTY membership; survivorship "
-                "biases win-rate upward 1-3pp",
+            "point_in_time_requested": point_in_time,
+            "pit_fundamentals_applied": pit_fundamentals_applied,
+            "pit_symbol_coverage": f"{pit_symbols}/{len(symbols)}",
+            "survivorship_free": survivorship_free,
+            "known_biases": remaining_biases,
+            "biases_corrected": [
+                b for b, on in (
+                    ("point_in_time_fundamentals", pit_fundamentals_applied),
+                    ("survivorship_free_universe", survivorship_free),
+                ) if on
             ],
             "win_rate_definitions": {
                 "win_rate_pos": "P&L > 0% net of nothing — base rate",

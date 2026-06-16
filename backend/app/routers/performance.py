@@ -14,6 +14,7 @@ from app.services.signal_edge import (
     EDGE_META,
     RECOMMENDED_MUTES,
     all_edge_rows,
+    edge_freshness,
 )
 from app.services.signal_tracker import (
     evaluate_signals,
@@ -161,6 +162,7 @@ async def signal_edge():
     """
     return {
         "meta": EDGE_META,
+        "freshness": edge_freshness(),
         "recommended_mutes": RECOMMENDED_MUTES,
         "rows": all_edge_rows(),
     }

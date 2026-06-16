@@ -70,6 +70,20 @@ _ANT_TIMEOUT = getattr(anthropic, "APITimeoutError", _Unraisable) if anthropic e
 _LLM_MAX_RETRIES = 2
 _LLM_BASE_DELAY = 1.0  # seconds
 
+# Pin temperature for analyst calls so output is reproducible across providers.
+ANALYST_TEMPERATURE = 0.2
+
+# Anthropic removed sampling params (temperature/top_p/top_k) on Opus 4.7+ and
+# Fable 5 — passing `temperature` to those models returns a 400. Sonnet 4.6 and
+# earlier (Sonnet 4.5, Haiku 4.5) still accept it. Match on the families that
+# reject it so the pin can never break a Claude call.
+_CLAUDE_NO_SAMPLING_PREFIXES = ("claude-opus-4-7", "claude-opus-4-8", "claude-fable-5", "claude-mythos-5")
+
+
+def _claude_accepts_temperature(model: str) -> bool:
+    """False for Claude models that 400 on a `temperature` parameter."""
+    return not any(model.startswith(p) for p in _CLAUDE_NO_SAMPLING_PREFIXES)
+
 # Default USD→INR conversion. Override via env. Must be > 0.
 _DEFAULT_USD_INR = 83.0
 
@@ -499,6 +513,7 @@ async def _call_openai(
     }
     if not reasoning:
         kwargs["response_format"] = {"type": "json_object"}
+        kwargs["temperature"] = ANALYST_TEMPERATURE
 
     last_exc: Exception = RuntimeError("OpenAI call not attempted")
     for attempt in range(_LLM_MAX_RETRIES + 1):
@@ -580,7 +595,7 @@ async def _call_gemini(
         from google.genai import types as genai_types  # type: ignore
         config = genai_types.GenerateContentConfig(
             system_instruction=system_message,
-            temperature=0.2,
+            temperature=ANALYST_TEMPERATURE,
             max_output_tokens=max_tokens,
         )
     else:
@@ -605,7 +620,7 @@ async def _call_gemini(
                 response = await gmodel.generate_content_async(
                     prompt,
                     generation_config={
-                        "temperature": 0.2,
+                        "temperature": ANALYST_TEMPERATURE,
                         "max_output_tokens": max_tokens,
                     },
                 )
@@ -654,15 +669,19 @@ async def _call_claude(
         raise RuntimeError("anthropic SDK not installed")
     client = anthropic.AsyncAnthropic(api_key=api_key)
 
+    create_kwargs: dict = {
+        "model": model,
+        "system": system_message,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": max_tokens,
+    }
+    if _claude_accepts_temperature(model):
+        create_kwargs["temperature"] = ANALYST_TEMPERATURE
+
     last_exc: Exception = RuntimeError("Claude call not attempted")
     for attempt in range(_LLM_MAX_RETRIES + 1):
         try:
-            response = await client.messages.create(
-                model=model,
-                system=system_message,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=max_tokens,
-            )
+            response = await client.messages.create(**create_kwargs)
             text = response.content[0].text.strip()
             usage_obj = getattr(response, "usage", None)
             usage = {

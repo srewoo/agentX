@@ -479,14 +479,14 @@ async def _init_db_sqlite() -> None:
             existing_cols = {row[1] for row in await cur.fetchall()}
         for col_name, col_ddl in _SIGNALS_LATE_COLUMNS.items():
             if col_name not in existing_cols:
-                await db.execute(f"ALTER TABLE signals ADD COLUMN {col_name} {col_ddl}")
+                await db.execute(f'ALTER TABLE signals ADD COLUMN "{col_name}" {col_ddl}')
 
         # Late-added feature columns on `signal_outcomes` (meta-judge inputs).
         async with db.execute("PRAGMA table_info(signal_outcomes)") as cur:
             existing_so_cols = {row[1] for row in await cur.fetchall()}
         for col_name, col_ddl in _SIGNAL_OUTCOMES_LATE_COLUMNS.items():
             if col_name not in existing_so_cols:
-                await db.execute(f"ALTER TABLE signal_outcomes ADD COLUMN {col_name} {col_ddl}")
+                await db.execute(f'ALTER TABLE signal_outcomes ADD COLUMN "{col_name}" {col_ddl}')
 
         for idx_sql in CREATE_SIGNALS_INDEXES:
             await db.execute(idx_sql)

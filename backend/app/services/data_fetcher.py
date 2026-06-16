@@ -61,14 +61,58 @@ async def _get_data_settings() -> dict[str, Any]:
         return _settings_cache or {}
     return _settings_cache
 
+# ── Rate-limit (HTTP 429) handling ────────────────────────────
+# When an upstream returns 429 we honour its Retry-After header instead of the
+# default exponential backoff — retrying sooner just earns another 429.
+_RATELIMIT_DEFAULT = 2.0   # seconds — Retry-After missing/unparseable
+_RATELIMIT_CAP = 30.0      # seconds — never wait longer than this
+
+
+class _RateLimited(Exception):
+    """Raised when an upstream responds 429; carries the parsed back-off (s)."""
+
+    def __init__(self, backoff: float) -> None:
+        super().__init__(f"rate-limited; backing off {backoff:.0f}s")
+        self.backoff = backoff
+
+
+def _parse_retry_after(value: Any) -> float:
+    """Parse a ``Retry-After`` header (integer seconds) into a capped back-off.
+
+    Only the integer-seconds form is handled; an HTTP-date or unparseable
+    value falls back to :data:`_RATELIMIT_DEFAULT`. Clamped to
+    ``[_RATELIMIT_DEFAULT, _RATELIMIT_CAP]``.
+    """
+    try:
+        secs = float(int(str(value or "").strip()))
+    except (ValueError, TypeError):
+        return _RATELIMIT_DEFAULT
+    if secs <= 0:
+        return _RATELIMIT_DEFAULT
+    return min(secs, _RATELIMIT_CAP)
+
+
 # ── Retry helper ──────────────────────────────────────────────
 
 async def _retry_async(fn, *args, max_retries: int = 2, base_delay: float = 1.0, **kwargs):
-    """Retry an async function with exponential backoff + jitter."""
+    """Retry an async function with exponential backoff + jitter.
+
+    On a :class:`_RateLimited` error we wait the server-advertised
+    ``Retry-After`` window instead of the exponential delay — backing off
+    politely rather than hammering an endpoint that just told us to slow down.
+    """
     last_exc = None
     for attempt in range(max_retries + 1):
         try:
             return await fn(*args, **kwargs)
+        except _RateLimited as e:
+            last_exc = e
+            if attempt < max_retries:
+                logger.warning(
+                    "Rate-limited (429) on %s; honouring Retry-After, waiting %.0fs",
+                    fn.__name__, e.backoff,
+                )
+                await asyncio.sleep(e.backoff)
         except Exception as e:
             last_exc = e
             if attempt < max_retries:
@@ -184,18 +228,34 @@ async def _jugaad_fetch(symbol: str, days: int) -> pd.DataFrame:
 # ── Twelve Data (keyed REST fallback) ────────────────────────
 
 def _twelvedata_fetch_sync(symbol: str, days: int, api_key: str, exchange: str) -> pd.DataFrame:
-    """Fetch daily history from Twelve Data. Empty DataFrame on failure."""
+    """Fetch daily history from Twelve Data. Empty DataFrame on failure.
+
+    On HTTP 429 we wait the server-advertised ``Retry-After`` window (capped)
+    and retry once, rather than retrying immediately into another 429.
+    """
     import requests
+    import time as _time
     try:
-        resp = requests.get(
-            "https://api.twelvedata.com/time_series",
-            params={
-                "symbol": symbol, "interval": "1day",
-                "outputsize": min(max(days, 30), 5000),
-                "exchange": exchange.upper(), "apikey": api_key,
-            },
-            timeout=12.0,
-        )
+        def _do_request() -> requests.Response:
+            return requests.get(
+                "https://api.twelvedata.com/time_series",
+                params={
+                    "symbol": symbol, "interval": "1day",
+                    "outputsize": min(max(days, 30), 5000),
+                    "exchange": exchange.upper(), "apikey": api_key,
+                },
+                timeout=12.0,
+            )
+
+        resp = _do_request()
+        if resp.status_code == 429:
+            backoff = _parse_retry_after(resp.headers.get("Retry-After"))
+            logger.warning(
+                "twelvedata rate-limited (429) for %s; honouring Retry-After, waiting %.0fs",
+                symbol, backoff,
+            )
+            _time.sleep(backoff)
+            resp = _do_request()
         resp.raise_for_status()
         data = resp.json()
         values = data.get("values") if isinstance(data, dict) else None

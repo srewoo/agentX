@@ -84,4 +84,5 @@ backend/models/
 *.orig
 backend/backtest_results/
 backend/.agentx.pid
+*.md
 

@@ -27,11 +27,21 @@ skips the trade. Negative-edge setups get no capital. That is the filter.
 
 The payoff ratio `b` is taken from the *real* trade geometry
 (reward = target−entry, risk = entry−stop) — not an assumed distribution —
-so the only estimated input is the win probability `p`, which callers should
-source conservatively (measured per-signal win-rate Wilson lower bound, or a
-calibrated probability shrunk toward 0.5).
+so the only estimated input is the win probability `p`.
+
+Conservatism on `p` is now **enforced, not merely requested**:
+  * a hard ``MAX_WIN_PROB`` ceiling (0.85) caps the edge any single input may
+    imply, so an over-optimistic caller cannot size for ruin; and
+  * when the caller supplies ``win_prob_n`` (the sample size `p` was measured
+    on), the size is computed from the **Wilson 95% lower bound** of that
+    sample, not the raw point estimate — small lucky samples are sized down
+    automatically.
+Callers that already pass a calibrated probability shrunk toward 0.5 (e.g. the
+conviction→prob map in auto_paper_trader, or a meta-label output) keep working
+unchanged; the guards only ever make sizing *more* conservative.
 """
 import logging
+import math
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -40,6 +50,32 @@ logger = logging.getLogger(__name__)
 DEFAULT_KELLY_FRACTION = 0.25   # ¼-Kelly
 DEFAULT_MAX_POSITION_PCT = 5.0  # hard per-position cap (% of capital)
 DEFAULT_MAX_RISK_PCT = 1.0      # max capital risked to the stop (% of capital)
+
+# Structural ceiling on the win probability Kelly is allowed to act on.
+# The walk-forward evidence shows even the best setups realise ~53-62% WR;
+# no honest per-trade estimate should imply more edge than ~0.85. This is a
+# *last line of defence* so that a caller passing an over-optimistic p (e.g.
+# a raw empirical 0.95 on a handful of trades) can never size for ruin. It
+# does not replace per-signal Wilson shrinkage — it backstops it.
+MAX_WIN_PROB = 0.85
+
+
+def wilson_lower_bound(wins: int, n: int, z: float = 1.96) -> float:
+    """Wilson 95% lower bound on a win rate.
+
+    The conservative win probability to plan around: it shrinks the point
+    estimate toward 0.5 in proportion to how little data supports it, so a
+    55% rate on 20 trades is treated very differently from 55% on 2,000.
+    Returns ``0.0`` for an empty sample (no evidence ⇒ no edge).
+    """
+    if n <= 0:
+        return 0.0
+    phat = max(0.0, min(1.0, wins / n))
+    z2 = z * z
+    denom = 1.0 + z2 / n
+    centre = phat + z2 / (2 * n)
+    margin = z * math.sqrt((phat * (1 - phat) + z2 / (4 * n)) / n)
+    return max(0.0, (centre - margin) / denom)
 
 
 def payoff_ratio(entry: float, stop: float, target: float, direction: str) -> float | None:
@@ -75,7 +111,9 @@ def kelly_fraction(win_prob: float, b: float) -> float:
     """
     if b <= 0:
         return 0.0
-    p = max(0.0, min(1.0, win_prob))
+    # Clamp to [0, MAX_WIN_PROB]: no input is allowed to imply more edge than
+    # the historical evidence supports, so f* cannot blow up on a bad p.
+    p = max(0.0, min(MAX_WIN_PROB, win_prob))
     f = p - (1.0 - p) / b
     return max(0.0, f)
 
@@ -87,6 +125,7 @@ def kelly_position_size(
     target: float,
     win_prob: float,
     *,
+    win_prob_n: int | None = None,
     direction: str = "bullish",
     kelly_fraction_mult: float = DEFAULT_KELLY_FRACTION,
     max_position_pct: float = DEFAULT_MAX_POSITION_PCT,
@@ -116,6 +155,7 @@ def kelly_position_size(
         "shares": 0, "skip": True, "reason": "", "position_value": 0.0,
         "capital_pct": 0.0, "risk_amount": 0.0, "kelly_f_full": 0.0,
         "kelly_f_used": 0.0, "payoff_ratio": 0.0, "binding_constraint": "kelly",
+        "win_prob_raw": round(float(win_prob), 4), "win_prob_used": round(float(win_prob), 4),
     }
     if capital <= 0 or entry <= 0:
         base["reason"] = "invalid capital/entry"
@@ -127,11 +167,24 @@ def kelly_position_size(
         return base
     base["payoff_ratio"] = round(b, 4)
 
-    f_full = kelly_fraction(win_prob, b)
+    # Conservative-p guard. When the caller supplies the sample size the
+    # win_prob was measured on (``win_prob_n``), we never size off the raw
+    # point estimate — we size off its Wilson 95% lower bound. This makes it
+    # *structurally impossible* to oversize on a lucky small sample: e.g. a
+    # 55% rate on 80 trades is sized as ~44%, which on poor odds drops the
+    # trade entirely. Callers that already pass a calibrated/shrunk p (no n)
+    # are unaffected.
+    p_used = win_prob
+    if win_prob_n is not None and win_prob_n > 0:
+        p_used = min(win_prob, wilson_lower_bound(round(win_prob * win_prob_n), win_prob_n))
+    base["win_prob_raw"] = round(float(win_prob), 4)
+    base["win_prob_used"] = round(float(p_used), 4)
+
+    f_full = kelly_fraction(p_used, b)
     base["kelly_f_full"] = round(f_full, 4)
     if f_full <= 0:
         base["reason"] = (
-            f"non-positive Kelly edge (p={win_prob:.2f}, b={b:.2f}) — skip"
+            f"non-positive Kelly edge (p={p_used:.2f}, b={b:.2f}) — skip"
         )
         return base
 
@@ -170,4 +223,6 @@ def kelly_position_size(
         "kelly_f_used": round(f_used, 4),
         "payoff_ratio": round(b, 4),
         "binding_constraint": binding,
+        "win_prob_raw": round(float(win_prob), 4),
+        "win_prob_used": round(float(p_used), 4),
     }

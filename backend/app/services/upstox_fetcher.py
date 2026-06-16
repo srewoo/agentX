@@ -69,6 +69,42 @@ def has_token(settings: dict[str, Any]) -> bool:
     return bool((settings or {}).get("upstox_access_token"))
 
 
+# ── Rate-limit (HTTP 429) handling ───────────────────────────
+# Upstox returns 429 when we exceed its request budget. We back off ONCE for
+# the server-advertised window (Retry-After), then return None so the caller's
+# source-health cooldown + next scan cycle handle the rest — no retry loop.
+_RATELIMIT_DEFAULT = 2.0   # seconds — when Retry-After is missing/unparseable
+_RATELIMIT_CAP = 30.0      # seconds — never sleep longer than this
+
+
+class _RateLimited(Exception):
+    """Raised inside a sync request path on HTTP 429 to defer the async sleep.
+
+    Carries the parsed back-off (seconds) so the async wrapper can
+    ``await asyncio.sleep`` it without blocking the executor thread.
+    """
+
+    def __init__(self, backoff: float) -> None:
+        super().__init__(f"rate-limited; backing off {backoff:.0f}s")
+        self.backoff = backoff
+
+
+def _parse_retry_after(value: Optional[str]) -> float:
+    """Parse a ``Retry-After`` header (integer seconds) into a capped back-off.
+
+    Only the integer-seconds form is handled; an HTTP-date or unparseable
+    value falls back to :data:`_RATELIMIT_DEFAULT`. Result is clamped to
+    ``[_RATELIMIT_DEFAULT, _RATELIMIT_CAP]``.
+    """
+    try:
+        secs = float(int((value or "").strip()))
+    except (ValueError, TypeError):
+        return _RATELIMIT_DEFAULT
+    if secs <= 0:
+        return _RATELIMIT_DEFAULT
+    return min(secs, _RATELIMIT_CAP)
+
+
 # ── Instrument key resolution ────────────────────────────────
 
 def _load_instrument_map(exchange: str) -> dict[str, str]:
@@ -163,8 +199,12 @@ def _sync_fetch_history(
         if resp.status_code == 401:
             logger.warning("upstox: 401 on history — token lacks market-data access (use an Analytics Token; see Settings)")
             return None
+        if resp.status_code == 429:
+            raise _RateLimited(_parse_retry_after(resp.headers.get("Retry-After")))
         resp.raise_for_status()
         candles = (resp.json().get("data") or {}).get("candles") or []
+    except _RateLimited:
+        raise
     except Exception as e:
         logger.debug("upstox history failed for %s: %s", symbol, e)
         return None
@@ -199,9 +239,14 @@ async def upstox_fetch_history(
 ) -> Optional[pd.DataFrame]:
     """Async daily/weekly/monthly OHLCV via Upstox. ``None`` on any failure."""
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(
-        None, _sync_fetch_history, symbol, days, interval, token, exchange,
-    )
+    try:
+        return await loop.run_in_executor(
+            None, _sync_fetch_history, symbol, days, interval, token, exchange,
+        )
+    except _RateLimited as e:
+        logger.warning("Upstox rate-limited (429), backing off %ss", int(e.backoff))
+        await asyncio.sleep(e.backoff)
+        return None
 
 
 # ── Live quote ───────────────────────────────────────────────
@@ -222,8 +267,12 @@ def _sync_fetch_quote(symbol: str, token: str, exchange: str) -> Optional[dict]:
         if resp.status_code == 401:
             logger.warning("upstox: 401 on quote — token lacks market-data access (use an Analytics Token; see Settings)")
             return None
+        if resp.status_code == 429:
+            raise _RateLimited(_parse_retry_after(resp.headers.get("Retry-After")))
         resp.raise_for_status()
         data = resp.json().get("data") or {}
+    except _RateLimited:
+        raise
     except Exception as e:
         logger.debug("upstox quote failed for %s: %s", symbol, e)
         return None
@@ -259,7 +308,12 @@ async def upstox_fetch_quote(
 ) -> Optional[dict]:
     """Async live quote via Upstox. ``None`` on any failure."""
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _sync_fetch_quote, symbol, token, exchange)
+    try:
+        return await loop.run_in_executor(None, _sync_fetch_quote, symbol, token, exchange)
+    except _RateLimited as e:
+        logger.warning("Upstox rate-limited (429), backing off %ss", int(e.backoff))
+        await asyncio.sleep(e.backoff)
+        return None
 
 
 # ── Intraday OHLCV ───────────────────────────────────────────
@@ -279,8 +333,12 @@ def _sync_fetch_intraday(symbol: str, interval: str, token: str, exchange: str) 
         if resp.status_code == 401:
             logger.warning("upstox: 401 on intraday — token lacks market-data access (use an Analytics Token; see Settings)")
             return None
+        if resp.status_code == 429:
+            raise _RateLimited(_parse_retry_after(resp.headers.get("Retry-After")))
         resp.raise_for_status()
         candles = (resp.json().get("data") or {}).get("candles") or []
+    except _RateLimited:
+        raise
     except Exception as e:
         logger.debug("upstox intraday failed for %s: %s", symbol, e)
         return None
@@ -306,9 +364,14 @@ async def upstox_fetch_intraday(
 ) -> Optional[pd.DataFrame]:
     """Async intraday OHLCV via Upstox (1minute / 30minute only). ``None`` otherwise."""
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(
-        None, _sync_fetch_intraday, symbol, interval, token, exchange,
-    )
+    try:
+        return await loop.run_in_executor(
+            None, _sync_fetch_intraday, symbol, interval, token, exchange,
+        )
+    except _RateLimited as e:
+        logger.warning("Upstox rate-limited (429), backing off %ss", int(e.backoff))
+        await asyncio.sleep(e.backoff)
+        return None
 
 
 # ── Option chain (normalized to the NSE record shape) ────────
@@ -358,6 +421,8 @@ def _sync_fetch_option_chain(symbol: str, token: str, exchange: str) -> Optional
         if cresp.status_code == 401:
             logger.warning("upstox: 401 on option/contract — token lacks market-data access (use an Analytics Token; see Settings)")
             return None
+        if cresp.status_code == 429:
+            raise _RateLimited(_parse_retry_after(cresp.headers.get("Retry-After")))
         cresp.raise_for_status()
         contracts = cresp.json().get("data") or []
         expiries = sorted({c.get("expiry") for c in contracts if c.get("expiry")})
@@ -372,8 +437,12 @@ def _sync_fetch_option_chain(symbol: str, token: str, exchange: str) -> Optional
             params={"instrument_key": key, "expiry_date": expiry},
             timeout=_HTTP_TIMEOUT,
         )
+        if oresp.status_code == 429:
+            raise _RateLimited(_parse_retry_after(oresp.headers.get("Retry-After")))
         oresp.raise_for_status()
         rows = oresp.json().get("data") or []
+    except _RateLimited:
+        raise
     except Exception as e:
         logger.debug("upstox option chain failed for %s: %s", symbol, e)
         return None
@@ -403,9 +472,14 @@ async def upstox_fetch_option_chain(
 ) -> Optional[dict]:
     """Async normalized option chain. ``None`` on any failure."""
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(
-        None, _sync_fetch_option_chain, symbol, token, exchange,
-    )
+    try:
+        return await loop.run_in_executor(
+            None, _sync_fetch_option_chain, symbol, token, exchange,
+        )
+    except _RateLimited as e:
+        logger.warning("Upstox rate-limited (429), backing off %ss", int(e.backoff))
+        await asyncio.sleep(e.backoff)
+        return None
 
 
 # ── OAuth2 token generation (for the Settings UI flow) ───────

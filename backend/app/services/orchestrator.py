@@ -507,6 +507,14 @@ async def run_scan_cycle() -> list[dict]:
     # Rate-limited concurrent fetching (max 3 concurrent to avoid yfinance rate limits)
     semaphore = asyncio.Semaphore(3)
 
+    # Data-quality counters for this cycle. The best-effort enrichment fetches
+    # (earnings, news, delivery, fundamentals) swallow failures so a flaky data
+    # source never blocks a scan — but swallowing silently means a degraded
+    # source is invisible until it shows up as bad trades. We count each miss
+    # and log a summary at the end of the cycle so degradation is observable.
+    from collections import Counter as _Counter
+    quality_misses: "_Counter[str]" = _Counter()
+
     async def process_symbol(sym: str) -> list[dict]:
         async with semaphore:
             # Skip symbols that consistently fail (delisted, bad ticker, etc.)
@@ -581,8 +589,10 @@ async def run_scan_cycle() -> list[dict]:
                         if days is not None and days <= 0:
                             # Results landed 0-5 sessions ago → PEAD candidate.
                             earnings_recent_days_sym = abs(days)
-                except Exception:
-                    pass  # Non-critical — proceed without earnings context
+                except Exception as e:
+                    # Non-critical — proceed without earnings context, but count it.
+                    quality_misses["earnings"] += 1
+                    logger.debug("earnings fetch failed for %s: %s", sym, e)
 
                 sr = compute_support_resistance(df)
                 await asyncio.sleep(0)
@@ -596,8 +606,9 @@ async def run_scan_cycle() -> list[dict]:
                         if news:
                             scores = [a["sentiment_score"] for a in news]
                             sentiment_score = sum(scores) / len(scores)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        quality_misses["news_sentiment"] += 1
+                        logger.debug("news fetch failed for %s: %s", sym, e)
 
                 if current_price:
                     current_prices[sym] = current_price
@@ -615,8 +626,9 @@ async def run_scan_cycle() -> list[dict]:
                     try:
                         delivery_data = await get_delivery_volume(sym)
                         sym_delivery_pct = delivery_data.get("delivery_pct")
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        quality_misses["delivery_volume"] += 1
+                        logger.debug("delivery fetch failed for %s: %s", sym, e)
 
                 # ── Lazy fundamentals for PEAD / Quality Breakout ───────────
                 # Fetch only when the symbol is *interesting* (in watchlist,
@@ -632,8 +644,9 @@ async def run_scan_cycle() -> list[dict]:
                     try:
                         from app.services.fundamentals import get_fundamentals as _gf
                         sym_fundamentals = await _gf(sym, exchange=sym_exchange)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        quality_misses["fundamentals"] += 1
+                        logger.debug("fundamentals fetch failed for %s: %s", sym, e)
 
                 sigs = scan_symbol(
                     symbol=sym,
@@ -685,6 +698,16 @@ async def run_scan_cycle() -> list[dict]:
         all_signals.extend(result)
     async with _scan_state.lock:
         _scan_state.signals_so_far = len(all_signals)
+
+    # Surface data-quality degradation. A best-effort source failing on a
+    # handful of symbols is normal; failing on a large fraction means the
+    # source is down and signals this cycle are enriched on partial data.
+    if quality_misses:
+        n = max(1, len(all_symbols))
+        summary = ", ".join(f"{src}={c} ({c / n:.0%})" for src, c in sorted(quality_misses.items()))
+        worst = max(quality_misses.values()) / n
+        log = logger.warning if worst >= 0.5 else logger.info
+        log("Scan data-quality misses across %d symbols: %s", len(all_symbols), summary)
 
     # Save current prices for next cycle's spike detection
     await _store_current_prices(current_prices)
@@ -1582,6 +1605,44 @@ class SignalOrchestrator:
             except Exception as e:
                 logger.warning("Edge override refresh failed (non-critical): %s", e)
 
+            # Autonomous gating (A1/A2/A4): advance the promote/demote state
+            # machine on this run's per-combo win records (FDR-gated, with
+            # hysteresis), refresh the live overlay the engine consults, and
+            # run the champion rollback-safety check on the forward record.
+            try:
+                from app.services.multiple_testing import Candidate
+                from app.services import gating_state
+                cands = [
+                    Candidate(
+                        key=f"{stype}|{direction}",
+                        wins=int(s["wins"]),
+                        n=int(s["wins"]) + int(s["losses"]),
+                    )
+                    for (stype, direction), s in type_dir_stats.items()
+                    if (int(s["wins"]) + int(s["losses"])) > 0
+                ]
+                if cands:
+                    res = await gating_state.update_gating_state(cands)
+                    loaded = await gating_state.seed_overlay()
+                    logger.info(
+                        "Autonomous gating: %d combos, %d transitions, overlay=%d keys",
+                        len(cands), len(res.get("transitions", [])), loaded,
+                    )
+                # A4 rollback safety: if the live forward record has decayed
+                # below the floor, log it loudly (operator review). True
+                # config-level rollback needs shadow forward metrics per arm.
+                from app.services.forward_report import forward_performance
+                from app.services.champion_challenger import rollback_decision
+                fwd = await forward_performance()
+                rb = rollback_decision({
+                    "expectancy_pct": fwd.get("expectancy_pct", 0.0),
+                    "trades": fwd.get("trades", 0),
+                })
+                if rb["rollback"]:
+                    logger.warning("CHAMPION ROLLBACK SIGNAL: %s", rb["reason"])
+            except Exception as e:
+                logger.warning("Autonomous gating update failed (non-critical): %s", e)
+
     async def _run_weekly_backtest(self) -> None:
         """Weekly broad-universe backtest — watchlist + top-25 NIFTY, refreshes edges."""
         symbols = await _get_watchlist_symbols()
@@ -1590,17 +1651,27 @@ class SignalOrchestrator:
         await self._run_backtest_job(all_syms, period="1y", run_kind="weekly", refresh_edges=True)
 
     async def _run_daily_backtest(self) -> None:
-        """Daily lightweight backtest — small liquid universe, does NOT touch edges.
+        """Daily backtest over a broad liquid universe — refreshes live edges.
 
-        A fast pulse so /insights and the automation-status panel show a fresh
-        number every trading day without the cost of the 50-symbol weekly run.
+        Previously this ran on 10 symbols with ``refresh_edges=False`` on the
+        theory that a daily sample is "too thin" to drive the edge table, with
+        the weekly 50-symbol run owning edge refresh. In practice the weekly
+        run rarely fires (it needs the app up at one specific Monday slot), so
+        ``signal_edge_overrides`` stayed empty and the engine ran on the frozen
+        baseline indefinitely. A 1y backtest over even 10 liquid names already
+        yields 100+ trades per (signal_type, direction) key — far above the
+        ``min_trades`` guard — so the "too thin" concern was unfounded.
+
+        This now refreshes edges every trading day over a broad universe, so
+        the backtest→live-edge loop actually closes. The weekly run still runs
+        as a wider/longer cross-check.
         """
         db_settings = await _get_settings()
-        n = int(db_settings.get("daily_backtest_symbols", 10))
+        n = int(db_settings.get("daily_backtest_symbols", 40))
         symbols = await _get_watchlist_symbols()
         baseline = [s["symbol"] for s in MAJOR_STOCKS[:n]]
         all_syms = list(dict.fromkeys(baseline + symbols))[: max(5, n)]
-        await self._run_backtest_job(all_syms, period="1y", run_kind="daily", refresh_edges=False)
+        await self._run_backtest_job(all_syms, period="1y", run_kind="daily", refresh_edges=True)
 
     async def _daily_backtest_loop(self) -> None:
         """Run a lightweight backtest once per day at 11:00 IST.
@@ -1627,6 +1698,18 @@ class SignalOrchestrator:
                 now_ist = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
                 if now_ist.weekday() >= 5:
                     continue
+                # Resolve recommendation outcomes DAILY (not just in the weekly
+                # calibration loop). Swing trades resolve in ~5-10 days, so a
+                # weekly-only resolver leaves trades that already hit their
+                # target/stop sitting unresolved for days — starving the
+                # ≥200-trade learner threshold and pushing activation out by
+                # months. Running it here closes that gap.
+                try:
+                    from app.services.recommendation_tracker import evaluate_recommendation_outcomes
+                    res = await evaluate_recommendation_outcomes()
+                    logger.info("Daily recommendation-outcome resolution: %s", res)
+                except Exception as e:
+                    logger.warning("Daily recommendation-outcome resolution failed: %s", e)
                 await self._run_daily_backtest()
             except asyncio.CancelledError:
                 break

@@ -15,6 +15,8 @@ from app.services.kelly_sizing import (
     payoff_ratio,
     kelly_fraction,
     kelly_position_size,
+    wilson_lower_bound,
+    MAX_WIN_PROB,
 )
 
 
@@ -115,3 +117,38 @@ class TestKellyPositionSize:
         lo = kelly_position_size(win_prob=0.55, **kw)
         hi = kelly_position_size(win_prob=0.70, **kw)
         assert hi["shares"] > lo["shares"]
+
+
+class TestConservativeGuards:
+    """The structural anti-oversizing guards — a caller cannot size for ruin."""
+
+    def test_win_prob_ceiling_caps_edge(self):
+        # An over-optimistic p=0.99 must be treated as no more than MAX_WIN_PROB.
+        f_absurd = kelly_fraction(0.99, 2.0)
+        f_capped = kelly_fraction(MAX_WIN_PROB, 2.0)
+        assert f_absurd == pytest.approx(f_capped)
+
+    def test_wilson_lower_bound_shrinks_small_samples(self):
+        # Same 55% rate: a tiny sample is shrunk far below a large one.
+        small = wilson_lower_bound(11, 20)   # 55% on 20 trades
+        large = wilson_lower_bound(1100, 2000)  # 55% on 2000 trades
+        assert small < large < 0.55
+        assert wilson_lower_bound(0, 0) == 0.0
+
+    def test_win_prob_n_uses_wilson_lower_bound(self):
+        # A lucky 60% on only 25 trades should be sized off its Wilson LB,
+        # producing a strictly smaller (or zero) position than trusting 0.60.
+        kw = dict(capital=1_000_000, entry=100, stop=95, target=115,
+                  kelly_fraction_mult=0.25, max_position_pct=100, max_risk_pct=100)
+        trusting = kelly_position_size(win_prob=0.60, **kw)
+        conservative = kelly_position_size(win_prob=0.60, win_prob_n=25, **kw)
+        assert conservative["win_prob_used"] < conservative["win_prob_raw"]
+        assert conservative["shares"] < trusting["shares"]
+
+    def test_small_sample_can_drop_marginal_trade(self):
+        # b=1 (1:1 odds), 55% on 30 trades -> Wilson LB ~0.37 -> negative edge -> skip.
+        r = kelly_position_size(
+            capital=1_000_000, entry=100, stop=90, target=110,  # b = 1.0
+            win_prob=0.55, win_prob_n=30,
+        )
+        assert r["skip"] is True
