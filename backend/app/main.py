@@ -148,6 +148,22 @@ async def lifespan(app: FastAPI):
     if overrides_seeded:
         logger.info("Signal edge overrides loaded: %d keys", overrides_seeded)
 
+    # Autonomous gating (A1/A2): seed the state machine from the hand-curated
+    # constants on first run (so it starts where the human left off), then load
+    # the derived sets into the sync overlay the engine consults.
+    try:
+        from app.services import gating_state
+        from app.services import signal_edge as _se
+        seeded = await gating_state.seed_from_constants(
+            promoted=list(_se.PROMOTED_SIGNALS),
+            muted=list(_se.DIRECTIONAL_MUTES),
+            blocked=list(_se.SYMBOL_BLOCKLIST),
+        )
+        loaded = await gating_state.seed_overlay()
+        logger.info("Gating state seeded (%d new) and overlay loaded (%d keys)", seeded, loaded)
+    except Exception as e:
+        logger.warning("Gating state seed/overlay skipped (non-critical): %s", e)
+
     await orchestrator.start()
     logger.info("StockPilot backend ready")
 
