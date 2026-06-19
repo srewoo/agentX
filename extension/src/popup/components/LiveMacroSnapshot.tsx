@@ -59,8 +59,6 @@ export default function LiveMacroSnapshot() {
         <span className="text-zinc-200 text-right">{fmt(snap.india_vix, 2)}</span>
         <span className="text-zinc-500">USD/INR</span>
         <span className="text-zinc-200 text-right">{fmt(snap.usd_inr, 2)}</span>
-        <span className="text-zinc-500">Brent</span>
-        <span className="text-zinc-200 text-right">${fmt(snap.brent_usd, 2)}</span>
         <span className="text-zinc-500">FII net</span>
         <span className="text-zinc-200 text-right">₹{fmt(snap.fii_net_cr, 0)} Cr</span>
         <span className="text-zinc-500">DII net</span>

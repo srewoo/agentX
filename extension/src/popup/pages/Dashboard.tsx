@@ -416,8 +416,8 @@ export default function Dashboard({ onSelectSymbol }: DashboardProps = {}) {
         />
       </div>
 
-      {/* Market context bar: Indices + Regime + VIX + FII/DII */}
-      {(indices || (marketCtx && (marketCtx.market_regime || marketCtx.india_vix != null || marketCtx.fii_dii))) && (
+      {/* Market context bar: Indices + Regime + VIX (FII/DII live in Live Macro) */}
+      {(indices || (marketCtx && (marketCtx.market_regime || marketCtx.india_vix != null))) && (
         <div className="flex items-center gap-2 px-3 py-1 border-b border-border bg-zinc-900/30 text-[10px] overflow-x-auto">
           {/* NIFTY 50 */}
           {indices?.["NIFTY 50"] && (
@@ -468,24 +468,8 @@ export default function Dashboard({ onSelectSymbol }: DashboardProps = {}) {
               VIX {marketCtx.india_vix.toFixed(1)}
             </span>
           )}
-          {marketCtx?.fii_dii && marketCtx.fii_dii.fii_net != null && (
-            <span className={`font-medium px-1.5 py-0.5 rounded border ${
-              marketCtx.fii_dii.fii_net > 0
-                ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/25"
-                : "bg-red-500/10 text-red-400 border-red-500/25"
-            }`}>
-              FII {marketCtx.fii_dii.fii_net > 0 ? "+" : ""}{(marketCtx.fii_dii.fii_net / 100).toFixed(0)}Cr
-            </span>
-          )}
-          {marketCtx?.fii_dii && marketCtx.fii_dii.dii_net != null && (
-            <span className={`font-medium px-1.5 py-0.5 rounded border ${
-              marketCtx.fii_dii.dii_net > 0
-                ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/25"
-                : "bg-red-500/10 text-red-400 border-red-500/25"
-            }`}>
-              DII {marketCtx.fii_dii.dii_net > 0 ? "+" : ""}{(marketCtx.fii_dii.dii_net / 100).toFixed(0)}Cr
-            </span>
-          )}
+          {/* FII/DII pills intentionally omitted here — the Live Macro panel
+              already shows FII net / DII net, so repeating them is redundant. */}
         </div>
       )}
 

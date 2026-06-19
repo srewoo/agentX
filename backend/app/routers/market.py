@@ -88,8 +88,9 @@ async def get_indices():
             logger.warning("Failed to fetch %s: %s", symbol, e)
             return None
 
-    # NSE indices and BSE SENSEX in parallel — SENSEX always comes from yfinance
-    # because NSE's status endpoint doesn't carry it.
+    # NSE indices and BSE SENSEX in parallel. NSE's status endpoint doesn't
+    # carry SENSEX, so we source it from Upstox (authenticated, reliable) and
+    # fall back to yfinance only if Upstox is unavailable.
     async def _nse():
         try:
             return await nse_fetch_indices()
@@ -97,7 +98,27 @@ async def get_indices():
             logger.debug("NSE indices failed: %s", e)
             return None
 
-    nse_data, sensex = await asyncio.gather(_nse(), _from_yf("^BSESN", "BSE SENSEX"))
+    async def _sensex():
+        try:
+            from app.services import upstox_fetcher
+            from app.services.data_fetcher import _get_data_settings
+            settings = await _get_data_settings()
+            if upstox_fetcher.has_token(settings):
+                uq = await upstox_fetcher.upstox_fetch_quote(
+                    "SENSEX", token=settings["upstox_access_token"], exchange="BSE",
+                )
+                if uq and uq.get("lastPrice") is not None:
+                    return "BSE SENSEX", {
+                        "symbol": "BSE SENSEX",
+                        "price": safe_float(uq.get("lastPrice")),
+                        "change": safe_float(uq.get("change")),
+                        "change_pct": safe_float(uq.get("pChange")),
+                    }
+        except Exception as e:
+            logger.debug("Upstox SENSEX failed, falling back to yfinance: %s", e)
+        return await _from_yf("^BSESN", "BSE SENSEX")
+
+    nse_data, sensex = await asyncio.gather(_nse(), _sensex())
 
     if nse_data:
         for name, data in nse_data.items():
@@ -324,9 +345,9 @@ async def scan_status():
     return await get_scan_status()
 
 
-@router.get("/snapshot")
+@router.get("/market/snapshot")
 async def market_snapshot_endpoint(force: bool = False):
-    """Today's macro tuple (NIFTY/FII/DII/VIX/USDINR/Brent) used by LLM prompts.
+    """Today's macro tuple (NIFTY/FII/DII/VIX/USDINR) used by LLM prompts.
 
     The same data is injected into every LLM call. Surfaced via API so the
     extension can display it in the Live tab and so manual debugging can

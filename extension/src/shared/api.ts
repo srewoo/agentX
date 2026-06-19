@@ -233,14 +233,14 @@ export const api = {
         considered_holds: number };
     }>(`/api/performance/cohort${since ? `?since=${encodeURIComponent(since)}` : ""}`),
 
-  // #2 Live market snapshot (FII/DII/VIX/USDINR/Brent + sector rotation).
+  // #2 Live market snapshot (FII/DII/VIX/USDINR + sector rotation).
   getMarketSnapshot: (force = false) =>
     request<{
       data: {
         as_of: string;
         nifty_close: number | null; nifty_pct: number | null;
         bank_nifty_close: number | null; bank_nifty_pct: number | null;
-        india_vix: number | null; usd_inr: number | null; brent_usd: number | null;
+        india_vix: number | null; usd_inr: number | null;
         fii_net_cr: number | null; dii_net_cr: number | null;
         sector_rotation: string | null;
         sector_movers: Array<{ sector: string; pct5d: number }>;

@@ -125,6 +125,43 @@ async def get_quote(symbol: str, exchange: str = "NSE"):
         except Exception as e:
             logger.debug("NSE quote failed for %s, trying yfinance: %s", symbol, e)
 
+    # --- Strategy 1b: Upstox live quote (primary for BSE) ---
+    # BSE has no NSE-style public quote endpoint; Upstox serves it authenticated
+    # (segment BSE_EQ). Gives BSE a real-time LTP instead of a candle-derived one.
+    if exchange_norm == "BSE":
+        try:
+            from app.services import upstox_fetcher
+            from app.services.data_fetcher import _get_data_settings
+            settings = await _get_data_settings()
+            if upstox_fetcher.has_token(settings):
+                uq = await upstox_fetcher.upstox_fetch_quote(
+                    symbol, token=settings["upstox_access_token"], exchange="BSE",
+                )
+                if uq and uq.get("lastPrice") is not None:
+                    name = symbol
+                    for s in _SEARCH_INDEX:
+                        if s["symbol"] == symbol:
+                            name = s["name"]
+                            break
+                    result = {
+                        "symbol": symbol,
+                        "exchange": "BSE",
+                        "price": safe_float(uq.get("lastPrice")),
+                        "change": safe_float(uq.get("change")),
+                        "change_pct": safe_float(uq.get("pChange")),
+                        "volume": safe_float(uq.get("totalTradedVolume")),
+                        "high": safe_float(uq.get("high")),
+                        "low": safe_float(uq.get("low")),
+                        "open": safe_float(uq.get("open")),
+                        "prev_close": safe_float(uq.get("previousClose")),
+                        "name": name,
+                        "market_cap": None,
+                    }
+                    await cache_manager.set(cache_key, result, ttl=timedelta(minutes=2))
+                    return result
+        except Exception as e:
+            logger.debug("Upstox BSE quote failed for %s, trying yfinance: %s", symbol, e)
+
     # --- Strategy 2: yfinance fallback (also primary for BSE) ---
     try:
         hist = await async_fetch_history(

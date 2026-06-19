@@ -55,12 +55,14 @@ _INTERVAL_MAP = {"1d": "day", "1wk": "week", "1mo": "month"}
 # serve natively (5m/15m/1h) return None so the caller cascades to yfinance.
 _INTRADAY_MAP = {"1m": "1minute", "30m": "30minute"}
 
-# Underlying instrument keys for the F&O indices (not in the EQ master).
+# Underlying instrument keys for indices (not in the EQ master). NSE F&O
+# indices + the BSE SENSEX benchmark (BSE_INDEX|SENSEX).
 _INDEX_KEYS = {
     "NIFTY": "NSE_INDEX|Nifty 50",
     "BANKNIFTY": "NSE_INDEX|Nifty Bank",
     "FINNIFTY": "NSE_INDEX|Nifty Fin Service",
     "MIDCPNIFTY": "NSE_INDEX|NIFTY MID SELECT",
+    "SENSEX": "BSE_INDEX|SENSEX",
 }
 
 
@@ -148,9 +150,17 @@ def _load_instrument_map(exchange: str) -> dict[str, str]:
             logger.warning("upstox: instrument master download failed for %s: %s", exch, e)
             return {}
 
+    # NSE tags cash equities as instrument_type == "EQ". BSE has no "EQ" type —
+    # its equities live in segment "BSE_EQ" tagged by trade group (A/B/T/X/…),
+    # so filtering on instrument_type drops every BSE stock. Scope by the
+    # cash-equity segment instead, and on NSE additionally keep only true "EQ"
+    # rows (NSE_EQ also carries SGBs/SME/T2T we don't want to resolve symbols to).
+    eq_segment = f"{exch}_EQ"
     mapping: dict[str, str] = {}
     for rec in records or []:
-        if rec.get("instrument_type") != "EQ":
+        if rec.get("segment") != eq_segment:
+            continue
+        if exch == "NSE" and rec.get("instrument_type") != "EQ":
             continue
         sym = rec.get("trading_symbol")
         key = rec.get("instrument_key")
@@ -254,7 +264,9 @@ async def upstox_fetch_history(
 def _sync_fetch_quote(symbol: str, token: str, exchange: str) -> Optional[dict]:
     import requests
 
-    key = _resolve_instrument_key(symbol, exchange)
+    # Indices (e.g. SENSEX, NIFTY) aren't in the EQ master — resolve those from
+    # _INDEX_KEYS first, falling back to the equity instrument map.
+    key = _INDEX_KEYS.get(symbol.upper()) or _resolve_instrument_key(symbol, exchange)
     if not key:
         return None
     try:
@@ -285,15 +297,29 @@ def _sync_fetch_quote(symbol: str, token: str, exchange: str) -> Optional[dict]:
         return None
     ohlc = payload.get("ohlc") or {}
     last = payload.get("last_price")
-    prev_close = ohlc.get("close")
+    net = payload.get("net_change")
+    # Derive previous close from net_change rather than ohlc.close: when the
+    # market is closed Upstox sets ohlc.close == last_price, which would zero
+    # the percent change even though net_change still carries the real day move
+    # (e.g. SENSEX net_change -607 but ohlc.close == last → 0%). Fall back to
+    # ohlc.close only when net_change is unavailable.
+    if net is not None and last is not None and (last - net) != 0:
+        prev_close = round(last - net, 2)
+        change = net
+    else:
+        prev_close = ohlc.get("close")
+        change = net if net is not None else (
+            round(last - prev_close, 2) if (last is not None and prev_close) else None
+        )
+    pchange = (
+        round(change / prev_close * 100, 2)
+        if (change is not None and prev_close) else None
+    )
     return {
         "symbol": symbol,
         "lastPrice": last,
-        "change": payload.get("net_change"),
-        "pChange": (
-            round((last - prev_close) / prev_close * 100, 2)
-            if prev_close else None
-        ),
+        "change": change,
+        "pChange": pchange,
         "open": ohlc.get("open"),
         "high": ohlc.get("high"),
         "low": ohlc.get("low"),

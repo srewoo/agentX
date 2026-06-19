@@ -300,16 +300,17 @@ async def async_fetch_history(
     is_intraday = interval not in ("1d", "1wk", "1mo")
     days = _PERIOD_TO_DAYS.get(period, 370)
 
-    # When the caller explicitly picked BSE we skip the NSE-only primary
-    # path entirely — NseIndiaApi/jugaad have no BSE coverage. Go straight to
-    # yfinance with the .BO suffix preferred.
-    bse_only = exchange.upper() == "BSE" and not is_index
+    # BSE has no coverage from the NSE-only scrapers (NseIndiaApi/jugaad), but
+    # Upstox *does* serve BSE (segment BSE_EQ). So for BSE we still use Upstox
+    # as the authenticated primary and only skip the NSE-specific sources,
+    # falling back to yfinance (.BO preferred) + Twelve Data.
+    is_bse = exchange.upper() == "BSE" and not is_index
 
     settings = await _get_data_settings()
+    from app.services import upstox_fetcher
 
-    # Intraday (non-index, non-BSE): try Upstox 1m/30m first, else yfinance.
-    if is_intraday and not is_index and not bse_only:
-        from app.services import upstox_fetcher
+    # Intraday (non-index): try Upstox 1m/30m first, else yfinance.
+    if is_intraday and not is_index:
         if upstox_fetcher.has_token(settings) and not source_health.is_down("upstox"):
             try:
                 up_intra = await upstox_fetcher.upstox_fetch_intraday(
@@ -324,11 +325,10 @@ async def async_fetch_history(
         return await _yfinance_with_cooldown(symbol, period, interval, exchange)
 
     # Index data — only yfinance serves it here.
-    if is_index or bse_only:
+    if is_index:
         return await _yfinance_with_cooldown(symbol, period, interval, exchange)
 
-    # 1. Upstox (authenticated primary) — daily/weekly/monthly only.
-    from app.services import upstox_fetcher
+    # 1. Upstox (authenticated primary) — daily/weekly/monthly, NSE *and* BSE.
     if upstox_fetcher.has_token(settings) and not source_health.is_down("upstox"):
         try:
             up_df = await upstox_fetcher.upstox_fetch_history(
@@ -341,25 +341,27 @@ async def async_fetch_history(
         except Exception as e:
             logger.debug("Upstox historical failed for %s: %s", clean_symbol, e)
 
-    # 2. NSE direct.
-    if not source_health.is_down("nse"):
-        try:
-            nse_df = await nse_fetch_history(clean_symbol, days=days)
-            if nse_df is not None and not nse_df.empty and len(nse_df) >= 5:
-                source_health.mark_up("nse")
-                return nse_df
-        except Exception as e:
-            logger.debug("NSE historical failed for %s: %s", clean_symbol, e)
-        else:
-            # Reached here ⇒ NSE returned empty; likely 403/throttle. Park it.
-            source_health.mark_down("nse")
+    # 2. NSE direct + 3. jugaad — NSE-only sources; skip entirely for BSE.
+    if not is_bse:
+        # 2. NSE direct.
+        if not source_health.is_down("nse"):
+            try:
+                nse_df = await nse_fetch_history(clean_symbol, days=days)
+                if nse_df is not None and not nse_df.empty and len(nse_df) >= 5:
+                    source_health.mark_up("nse")
+                    return nse_df
+            except Exception as e:
+                logger.debug("NSE historical failed for %s: %s", clean_symbol, e)
+            else:
+                # Reached here ⇒ NSE returned empty; likely 403/throttle. Park it.
+                source_health.mark_down("nse")
 
-    # 3. jugaad-data (free EOD, no account).
-    if not source_health.is_down("jugaad"):
-        jd = await _jugaad_fetch(clean_symbol, days)
-        if not jd.empty and len(jd) >= 5:
-            source_health.mark_up("jugaad")
-            return jd
+        # 3. jugaad-data (free EOD, no account).
+        if not source_health.is_down("jugaad"):
+            jd = await _jugaad_fetch(clean_symbol, days)
+            if not jd.empty and len(jd) >= 5:
+                source_health.mark_up("jugaad")
+                return jd
 
     # 4. yfinance.
     yf_df = await _yfinance_with_cooldown(symbol, period, interval, exchange)

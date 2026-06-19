@@ -1,5 +1,5 @@
 from __future__ import annotations
-"""Live macro snapshot — today's NIFTY / FII / DII / VIX / USDINR / Brent.
+"""Live macro snapshot — today's NIFTY / FII / DII / VIX / USDINR.
 
 Used by every LLM layer so reasoning is grounded in *today's* numbers,
 not abstract rules. Cached at 15-min granularity to keep token cost and
@@ -40,7 +40,6 @@ class MarketSnapshot:
     bank_nifty_pct: Optional[float] = None
     india_vix: Optional[float] = None
     usd_inr: Optional[float] = None
-    brent_usd: Optional[float] = None
     fii_net_cr: Optional[float] = None
     dii_net_cr: Optional[float] = None
     sector_rotation: Optional[str] = None
@@ -70,7 +69,6 @@ class MarketSnapshot:
             ),
             (
                 f"- India VIX: {fmt(self.india_vix)}  |  USD/INR: {fmt(self.usd_inr, dp=2)}"
-                f"  |  Brent: ${fmt(self.brent_usd, dp=2)}"
             ),
             (
                 f"- FII net: ₹{fmt(self.fii_net_cr, dp=0)} Cr  |  DII net: ₹{fmt(self.dii_net_cr, dp=0)} Cr"
@@ -121,6 +119,32 @@ async def _fetch_fii_dii() -> tuple[Optional[float], Optional[float]]:
         return None, None
 
 
+async def _nse_index_snapshot() -> dict[str, dict[str, Optional[float]]]:
+    """NIFTY 50 / NIFTY BANK / INDIA VIX from the NSE indices feed.
+
+    This is the same source that powers the Dashboard pills and keeps working
+    when yfinance is throttled (which zeroes the ``^NSEI``/``^NSEBANK`` paths).
+    Returns ``{name: {"close": float, "pct": float}}``; empty dict on failure.
+    """
+    try:
+        from app.services.nse_fetcher import nse_fetch_indices
+        from app.utils import safe_float
+        data = await nse_fetch_indices() or {}
+    except Exception as e:
+        logger.debug("market_snapshot nse indices failed: %s", e)
+        return {}
+    out: dict[str, dict[str, Optional[float]]] = {}
+    for name in ("NIFTY 50", "NIFTY BANK", "INDIA VIX"):
+        row = data.get(name)
+        if not row:
+            continue
+        out[name] = {
+            "close": safe_float(row.get("last")),
+            "pct": safe_float(row.get("percentChange")),
+        }
+    return out
+
+
 async def _fetch_vix() -> Optional[float]:
     try:
         from app.services.market_data import get_india_vix
@@ -131,7 +155,11 @@ async def _fetch_vix() -> Optional[float]:
 
 
 async def _fetch_usd_inr() -> Optional[float]:
-    """USD/INR: Finnhub first (real-time, well-maintained), yfinance fallback."""
+    """USD/INR: Finnhub (paid) → free keyless FX (er-api/frankfurter) → yfinance.
+
+    Finnhub forex is paid-tier only, so on a free key it 403s and we fall
+    through to the free FX source, which is the reliable path in practice.
+    """
     try:
         from app.services.finnhub_fetcher import get_usd_inr
         rate = await get_usd_inr()
@@ -139,6 +167,13 @@ async def _fetch_usd_inr() -> Optional[float]:
             return rate
     except Exception as e:
         logger.debug("market_snapshot finnhub usd_inr failed: %s", e)
+    try:
+        from app.services.fx_fetcher import get_usd_inr as get_usd_inr_free
+        rate = await get_usd_inr_free()
+        if rate is not None:
+            return rate
+    except Exception as e:
+        logger.debug("market_snapshot free-fx usd_inr failed: %s", e)
     last, _ = await _safe_last_close("INR=X", period="5d")
     return last
 
@@ -210,16 +245,32 @@ async def get_market_snapshot(force_refresh: bool = False) -> MarketSnapshot:
         as_of = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M %Z")
         errors: list[str] = []
 
+        # Prefer the NSE indices feed (reliable, same as Dashboard pills) for
+        # NIFTY / BANKNIFTY / VIX; fall back to yfinance only when NSE misses a
+        # row. This keeps the macro block populated even while yfinance is down.
+        nse_idx = await _nse_index_snapshot()
+
+        async def _index_with_fallback(nse_name: str, yf_sym: str):
+            row = nse_idx.get(nse_name)
+            if row and row.get("close") is not None:
+                return row["close"], row.get("pct")
+            return await _safe_last_close(yf_sym)
+
+        async def _vix_with_fallback() -> Optional[float]:
+            row = nse_idx.get("INDIA VIX")
+            if row and row.get("close") is not None:
+                return row["close"]
+            return await _fetch_vix()
+
         nifty_t, bn_t, vix, fii_dii, rotation_t = await asyncio.gather(
-            _safe_last_close("^NSEI"),
-            _safe_last_close("^NSEBANK"),
-            _fetch_vix(),
+            _index_with_fallback("NIFTY 50", "^NSEI"),
+            _index_with_fallback("NIFTY BANK", "^NSEBANK"),
+            _vix_with_fallback(),
             _fetch_fii_dii(),
             _compute_sector_rotation(),
             return_exceptions=False,
         )
         usd_inr = await _fetch_usd_inr()
-        brent_t = await _safe_last_close("BZ=F", period="5d")
 
         snapshot = MarketSnapshot(
             as_of=as_of,
@@ -229,7 +280,6 @@ async def get_market_snapshot(force_refresh: bool = False) -> MarketSnapshot:
             bank_nifty_pct=bn_t[1],
             india_vix=vix,
             usd_inr=usd_inr,
-            brent_usd=brent_t[0],
             fii_net_cr=fii_dii[0],
             dii_net_cr=fii_dii[1],
             sector_rotation=rotation_t[0],
