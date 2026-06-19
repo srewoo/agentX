@@ -62,30 +62,58 @@ find_pid() {
   lsof -ti :"$PORT" 2>/dev/null | head -1
 }
 
+# Every PID bound to the backend port (a wedged uvicorn can leave a parent +
+# spawned child both LISTENing — stopping only one leaks the other).
+all_port_pids() {
+  lsof -ti :"$PORT" 2>/dev/null
+}
+
+# Is the backend actually answering HTTP, not just holding the socket? A hung
+# process keeps the port bound but never replies — that is "down", not "up".
+health_ok() {
+  command -v curl &>/dev/null || return 1
+  curl -fsS --max-time 4 "http://localhost:$PORT/api/health" >/dev/null 2>&1
+}
+
 # ── Commands ─────────────────────────────────────────────────
 
 do_stop() {
-  local pid
-  pid=$(find_pid)
-  if [ -z "$pid" ]; then
+  # Collect every PID on the port plus the PID-file PID, deduped — so a wedged
+  # parent+child pair is fully torn down, not half-killed.
+  local pids
+  pids=$(
+    {
+      [ -f "$PID_FILE" ] && cat "$PID_FILE" 2>/dev/null
+      all_port_pids
+    } | grep -E '^[0-9]+$' | sort -u
+  )
+
+  if [ -z "$pids" ]; then
     log "No running backend found"
+    rm -f "$PID_FILE"
     return
   fi
 
-  log "Stopping backend (PID $pid)..."
-  kill "$pid" 2>/dev/null || true
+  log "Stopping backend (PIDs: $(echo "$pids" | tr '\n' ' '))..."
+  for pid in $pids; do
+    kill "$pid" 2>/dev/null || true
+  done
 
-  # Wait up to 5 seconds for graceful shutdown
+  # Wait up to 5 seconds for graceful shutdown of all of them.
   local count=0
-  while kill -0 "$pid" 2>/dev/null && [ $count -lt 10 ]; do
+  while [ -n "$(all_port_pids)" ] && [ $count -lt 10 ]; do
     sleep 0.5
     count=$((count + 1))
   done
 
-  # Force kill if still running
-  if kill -0 "$pid" 2>/dev/null; then
+  # Force kill anything still holding the port.
+  local remaining
+  remaining=$(all_port_pids)
+  if [ -n "$remaining" ]; then
     warn "Graceful shutdown timed out, force killing..."
-    kill -9 "$pid" 2>/dev/null || true
+    for pid in $remaining; do
+      kill -9 "$pid" 2>/dev/null || true
+    done
   fi
 
   rm -f "$PID_FILE"
@@ -93,13 +121,22 @@ do_stop() {
 }
 
 do_start() {
-  # Check if already running
+  # Check if already running — but "the port is bound" is NOT the same as
+  # "the backend is up". A hung process keeps the socket while answering
+  # nothing, which previously deadlocked auto-start: do_start saw the port
+  # taken and refused to launch a healthy replacement. So probe health.
   local existing_pid
   existing_pid=$(find_pid)
   if [ -n "$existing_pid" ]; then
-    warn "Backend already running on port $PORT (PID $existing_pid)"
-    warn "Use './start.sh restart' to restart or './start.sh stop' to stop"
-    return 1
+    if health_ok; then
+      warn "Backend already running and healthy on port $PORT (PID $existing_pid)"
+      warn "Use './start.sh restart' to restart or './start.sh stop' to stop"
+      return 1
+    fi
+    warn "Port $PORT held by PID $existing_pid but /api/health is not responding"
+    warn "Treating it as wedged — stopping it and starting a fresh backend"
+    do_stop
+    sleep 1
   fi
 
   cd "$BACKEND_DIR"
@@ -168,14 +205,16 @@ do_status() {
   local pid
   pid=$(find_pid)
   if [ -n "$pid" ]; then
-    log "Backend is RUNNING on port $PORT (PID $pid)"
-    # Quick health check
-    if command -v curl &>/dev/null; then
-      local health
-      health=$(curl -s --max-time 3 "http://localhost:$PORT/api/health" 2>/dev/null)
-      if [ -n "$health" ]; then
-        log "Health: $health"
+    if health_ok; then
+      log "Backend is RUNNING and healthy on port $PORT (PID $pid)"
+      if command -v curl &>/dev/null; then
+        local health
+        health=$(curl -s --max-time 3 "http://localhost:$PORT/api/health" 2>/dev/null)
+        [ -n "$health" ] && log "Health: $health"
       fi
+    else
+      warn "Backend process is alive (PID $pid) but WEDGED — /api/health not responding"
+      warn "Run './start.sh restart' to recover"
     fi
   else
     log "Backend is NOT running"

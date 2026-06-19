@@ -23,6 +23,7 @@ import random
 import threading
 import time
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 import pandas as pd
 import yfinance as yf
@@ -649,6 +650,17 @@ _NSE_DELIVERY_HEADERS = {
 _NSE_HOMEPAGE = "https://www.nseindia.com"
 _NSE_QUOTES_PAGE = "https://www.nseindia.com/get-quotes/equity?symbol={symbol}"
 _NSE_DELIVERY_TIMEOUT = 12.0
+# A bare float timeout lets a stalled TCP connect ride the OS default (~60s
+# ETIMEDOUT on macOS) — which is what wedged the server. Pass requests an
+# explicit (connect, read) tuple so a dead socket is abandoned in seconds.
+_NSE_CONNECT_TIMEOUT = 5.0
+_NSE_REQUEST_TIMEOUT = (_NSE_CONNECT_TIMEOUT, _NSE_DELIVERY_TIMEOUT)
+
+# NSE blocking fetches run on a *dedicated* bounded thread pool, not the shared
+# default executor. A burst of slow NSE calls can no longer starve the default
+# pool and freeze unrelated async work (event-loop hang with the process still
+# alive). Bounded so the pool itself can't grow without limit.
+_nse_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="nse-fetch")
 
 # Anti-bot throttle. NSE rate-limits per IP at roughly 3 req/s; staying under
 # that (with jitter) is what stops the 403 feedback loop the scan loop triggers
@@ -705,12 +717,12 @@ def _warm_nse_session(session: Any, symbol: str | None = None) -> None:
     """
     global _nse_session_warmed_at
     try:
-        session.get(_NSE_HOMEPAGE, timeout=_NSE_DELIVERY_TIMEOUT)
+        session.get(_NSE_HOMEPAGE, timeout=_NSE_REQUEST_TIMEOUT)
         if symbol:
             time.sleep(0.3)
             session.get(
                 _NSE_QUOTES_PAGE.format(symbol=symbol),
-                timeout=_NSE_DELIVERY_TIMEOUT,
+                timeout=_NSE_REQUEST_TIMEOUT,
             )
         time.sleep(0.3)
         _nse_session_warmed_at = time.monotonic()
@@ -751,7 +763,7 @@ async def _fetch_nse_delivery(symbol: str) -> dict[str, Any] | None:
 
         def _do_request() -> requests.Response:
             _throttle_nse()
-            return session.get(url, timeout=_NSE_DELIVERY_TIMEOUT)
+            return session.get(url, timeout=_NSE_REQUEST_TIMEOUT)
 
         # First attempt — may 403 if cookies are stale.
         try:
@@ -838,7 +850,7 @@ async def _fetch_nse_delivery(symbol: str) -> dict[str, Any] | None:
     overall_timeout = (_NSE_DELIVERY_TIMEOUT * 2) + _NSE_DELIVERY_TIMEOUT
     try:
         return await asyncio.wait_for(
-            loop.run_in_executor(None, _sync_fetch),
+            loop.run_in_executor(_nse_executor, _sync_fetch),
             timeout=overall_timeout,
         )
     except asyncio.TimeoutError:

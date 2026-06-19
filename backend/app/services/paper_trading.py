@@ -8,6 +8,7 @@ signal is allowed to become a paper trade.
 """
 
 import csv
+import logging
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,6 +18,8 @@ import aiosqlite
 
 from app.database import DB_PATH, CREATE_SIGNAL_OUTCOMES_TABLE
 from app.services.signal_edge import get_edge
+
+logger = logging.getLogger(__name__)
 
 
 async def _record_paper_outcome(
@@ -257,6 +260,18 @@ async def close_paper_trade(
             return None
 
         trade = dict(row)
+        # Idempotency guard: a trade may be closed only once. Concurrent
+        # triggers (duplicate open rows for the same symbol, or an overlapping
+        # monitor pass) must not re-close it — doing so would double-count P&L
+        # into the learning loop and double-hit the daily-loss circuit
+        # breaker. Treat a re-close as a no-op.
+        if trade.get("status") == "closed":
+            logger.info(
+                "close_paper_trade: %s already closed — skipping re-close",
+                trade_id,
+            )
+            return None
+
         entry = float(trade["entry_price"])
         pnl_pct = ((float(exit_price) - entry) / entry) * 100.0 if entry else 0.0
         if trade["direction"] == "bearish":

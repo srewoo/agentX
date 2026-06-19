@@ -117,7 +117,14 @@ async def stop_loss_loop(
             trade_payload = await list_paper_trades(status="open")
             positions = trade_payload.get("trades", []) if isinstance(trade_payload, dict) else trade_payload
             triggered = await evaluate_open_positions(positions)
+            seen_ids: set[Any] = set()
             for t in triggered:
+                trade_id = t.get("id")
+                # Skip duplicate triggers for the same trade within one pass —
+                # close_paper_trade is also idempotent, this just avoids noise.
+                if trade_id is not None and trade_id in seen_ids:
+                    continue
+                seen_ids.add(trade_id)
                 try:
                     closed = await close_paper_trade(
                         trade_id=t.get("id"),
