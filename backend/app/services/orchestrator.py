@@ -1396,6 +1396,8 @@ class SignalOrchestrator:
                         min_conviction=cfg["min_conviction"],
                         max_per_day=cfg["max_per_day"],
                         max_open_positions=cfg["max_open_positions"],
+                        max_directional_concentration=cfg["max_directional_concentration"],
+                        min_positions_for_concentration=cfg["min_positions_for_concentration"],
                     )
                     logger.info(
                         "Auto-paper loop: opened=%d closed=%d",
@@ -1674,17 +1676,24 @@ class SignalOrchestrator:
         await self._run_backtest_job(all_syms, period="1y", run_kind="daily", refresh_edges=True)
 
     async def _daily_backtest_loop(self) -> None:
-        """Run a lightweight backtest once per day at 11:00 IST.
+        """Run a lightweight backtest once per day at 15:45 IST.
 
         Gated by the ``daily_backtest_enabled`` setting (default on). Skips
-        weekends — a backtest on a non-trading day adds nothing new. 11:00 IST
-        is mid-session, so it runs on bars through the previous close (today's
-        bar is still forming); that's the intended daily pulse.
+        weekends — a backtest on a non-trading day adds nothing new. 15:45 IST
+        is just after the NSE close (15:30), so it runs on a complete final bar
+        for the day — the intended daily pulse.
+
+        Deliberately NOT 11:00 IST: the paper-trade cron runs at 11:00 and
+        health-checks the backend. A CPU-heavy backtest firing at the same
+        minute used to stall /api/health long enough that the cron declared the
+        backend wedged and killed it mid-run. Running after close removes the
+        collision entirely (the per-bar event-loop yield in backtester.py is the
+        belt; this is the suspenders).
         """
         await asyncio.sleep(420)  # boot grace; offset from the other loops
         while self._running:
             try:
-                next_run = _next_daily_at(hour=11, minute=0)
+                next_run = _next_daily_at(hour=15, minute=45)
                 wait_s = max(60, (next_run - datetime.now(timezone.utc)).total_seconds())
                 logger.info("Next daily backtest at %s UTC (in %.1fh)", next_run.isoformat(), wait_s / 3600)
                 await asyncio.sleep(wait_s)

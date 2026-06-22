@@ -87,15 +87,18 @@ class TestIsOpenAIReasoning:
 
 class TestValidateProviderModel:
     def test_valid_openai_model(self):
-        _validate_provider_model("openai", "gpt-5")  # should not raise
+        assert _validate_provider_model("openai", "gpt-5") == "gpt-5"
 
     def test_unknown_provider_raises(self):
         with pytest.raises(ValueError, match="Unknown provider"):
             _validate_provider_model("groq", "llama3")
 
-    def test_unknown_model_raises(self):
-        with pytest.raises(ValueError, match="Unknown model"):
-            _validate_provider_model("openai", "gpt-99")
+    def test_unknown_model_falls_back_to_default(self):
+        # An unknown model for a known provider must NOT raise — a single stale
+        # settings value used to kill every LLM call. It now degrades to the
+        # provider default so the AI layer keeps working.
+        assert _validate_provider_model("openai", "gpt-99") == "gpt-5-mini"
+        assert _validate_provider_model("gemini", "gemini-2.0-flash") == "gemini-3.1-flash"
 
 
 # ─────────────────────────────────────────────
@@ -249,7 +252,7 @@ class TestCallGemini:
         mock_genai.GenerativeModel.return_value = mock_model
 
         with patch("app.services.llm_client.genai", mock_genai):
-            result = await call_llm("gemini", "gemini-2.0-flash", "gemini-key", "prompt")
+            result = await call_llm("gemini", "gemini-3.1-flash", "gemini-key", "prompt")
 
         assert result == '{"result": "gemini"}'
 
@@ -277,7 +280,7 @@ class TestCallGemini:
 
         with patch("app.services.llm_client.genai", mock_genai):
             with pytest.raises(RuntimeError, match="Gemini error"):
-                await call_llm("gemini", "gemini-2.0-flash", "key", "prompt")
+                await call_llm("gemini", "gemini-3.1-flash", "key", "prompt")
 
 
 # ─────────────────────────────────────────────

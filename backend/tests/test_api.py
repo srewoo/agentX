@@ -84,7 +84,7 @@ async def _init_test_db():
             "alert_interval_minutes": "30",
             "risk_mode": "balanced",
             "llm_provider": "gemini",
-            "llm_model": "gemini-2.0-flash",
+            "llm_model": "gemini-3.1-flash",
         }.items():
             await db.execute(
                 "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",

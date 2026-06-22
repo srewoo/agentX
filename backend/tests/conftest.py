@@ -128,7 +128,7 @@ _DEFAULT_SETTINGS = {
     "risk_mode": "balanced",
     "signal_types": '["intraday","swing","long_term"]',
     "llm_provider": "gemini",
-    "llm_model": "gemini-2.0-flash",
+    "llm_model": "gemini-3.1-flash",
     "llm_api_key": "",
     "openai_api_key": "",
     "gemini_api_key": "",

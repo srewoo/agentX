@@ -105,9 +105,12 @@ check_backend() {
       log "Attempting auto-start: ${start_script}"
       # Detached so cron doesn't block; its own logs go to start.sh's sinks.
       (nohup "$start_script" > /dev/null 2>&1 &) || true
-      # Poll up to ~45s for health to come up.
+      # Poll up to ~120s for health to come up. A cold start may need to create
+      # the venv and install dependencies before the server binds the port —
+      # the old 45s window expired mid-boot and raised a false "did not come up"
+      # alert even though the backend was seconds away.
       local i
-      for i in $(seq 1 15); do
+      for i in $(seq 1 40); do
         sleep 3
         if backend_up; then
           ok "Backend came up after auto-start (waited ~$((i * 3))s)."
@@ -417,10 +420,13 @@ with open(trades_file, 'r') as f:
 
 closed_today = 0
 total_pnl = 0.0
+skipped_no_price = 0
+open_seen = 0
 
 for row in rows:
     if row['status'] != 'open':
         continue
+    open_seen += 1
 
     symbol = row['symbol']
     entry_price = float(row['entry_price'])
@@ -447,13 +453,16 @@ for row in rows:
             data = json.loads(resp.read())
         current_price = data.get('price')
         if not current_price:
+            skipped_no_price += 1
+            print(f'  SKIP {symbol:14s} — quote returned no price (held, not exited)')
             continue
         # day_low and day_high for intraday stop-loss check
         # Falls back to current_price if not provided by the API
         day_low = data.get('day_low') or current_price
         day_high = data.get('day_high') or current_price
-    except:
-        print(f'  SKIP {symbol:14s} — could not fetch price')
+    except Exception as exc:
+        skipped_no_price += 1
+        print(f'  SKIP {symbol:14s} — could not fetch price ({type(exc).__name__}); held, not exited')
         continue
 
     # Update trailing stop before checking exit conditions
@@ -543,6 +552,11 @@ with open(trades_file, 'w', newline='') as f:
 
 print(f'---')
 print(f'Closed today: {closed_today}, PnL today: Rs.{total_pnl:+.0f}')
+if skipped_no_price:
+    pct = skipped_no_price / open_seen * 100 if open_seen else 0
+    print(f'DATA WARNING: {skipped_no_price}/{open_seen} open positions ({pct:.0f}%) could not be priced this run.')
+    print(f'  These were NOT evaluated for stop/target/time exits — the quote source is degraded.')
+    print(f'  Check the NSE/Upstox Analytics Token wiring (see app/services/data_fetcher). Stops may be late.')
 " 2>&1 | while IFS= read -r line; do
     echo -e "  $line"
   done

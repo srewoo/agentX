@@ -262,7 +262,7 @@ async def call_llm(
         raise ValueError("No API key configured. Please set your API key in Settings.")
 
     provider = provider.lower().strip()
-    _validate_provider_model(provider, model)
+    model = _validate_provider_model(provider, model)
 
     # Check cap once up-front. Cheaper than checking per-attempt and the
     # cap is a soft guard, not a hard token-level meter.
@@ -323,7 +323,7 @@ async def call_openai_responses_json(
     """
     if not api_key:
         raise ValueError("No OpenAI API key configured.")
-    _validate_provider_model("openai", model)
+    model = _validate_provider_model("openai", model)
     await _enforce_daily_cap()
     if openai is None:  # pragma: no cover
         raise RuntimeError("openai SDK not installed")
@@ -432,16 +432,38 @@ async def _record_failure(
 # Internal dispatch
 # ─────────────────────────────────────────────
 
-def _validate_provider_model(provider: str, model: str) -> None:
+# Safe default model per provider — the first (flagship) entry is intentional
+# but we name it explicitly so a list reorder can't silently change the default.
+DEFAULT_MODEL: dict[str, str] = {
+    "openai": "gpt-5-mini",
+    "gemini": "gemini-3.1-flash",
+    "claude": "claude-sonnet-4-5",
+}
+
+
+def _validate_provider_model(provider: str, model: str) -> str:
+    """Validate (provider, model) and return the model to actually use.
+
+    An unknown *provider* is a hard error — we cannot guess which API to call.
+    But an unknown *model* for a known provider is recoverable: a single stale
+    value persisted in the settings table (e.g. a since-retired model id) used
+    to raise and kill *every* enrichment/judge call across the app. Instead we
+    fall back to the provider's known-good default and warn loudly, so one bad
+    setting degrades gracefully rather than taking the whole AI layer down.
+    """
     if provider not in SUPPORTED_MODELS:
         raise ValueError(
             f"Unknown provider '{provider}'. Choose from: {list(SUPPORTED_MODELS)}"
         )
     if model not in SUPPORTED_MODELS[provider]:
-        raise ValueError(
-            f"Unknown model '{model}' for provider '{provider}'. "
-            f"Choose from: {SUPPORTED_MODELS[provider]}"
+        fallback = DEFAULT_MODEL.get(provider, SUPPORTED_MODELS[provider][0])
+        logger.warning(
+            "Unknown model '%s' for provider '%s' — falling back to '%s'. "
+            "Update the llm_model setting to a supported id: %s",
+            model, provider, fallback, SUPPORTED_MODELS[provider],
         )
+        return fallback
+    return model
 
 
 async def _dispatch(

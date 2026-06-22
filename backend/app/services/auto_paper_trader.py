@@ -37,6 +37,17 @@ DEFAULT_MIN_CONVICTION = 65
 DEFAULT_MAX_PER_DAY = 5
 DEFAULT_MAX_OPEN_POSITIONS = 12
 
+# Directional-concentration guardrail. The engine can lock into a one-sided
+# posture (e.g. 100% short) and bleed when the market runs the other way —
+# observed live as a 0-for-33 run of SELL recos into a rising tape. This caps
+# how lopsided the OPEN book may get: once a direction holds >80% of an open
+# book of at least N positions, no further same-direction entries are taken
+# until the book rebalances (winners close / opposite-side entries appear).
+# This protects capital without faking edge; it does not change what the
+# engine *recommends*, only what the auto-trader is willing to *commit to*.
+DEFAULT_MAX_DIRECTIONAL_CONCENTRATION = 0.80
+DEFAULT_MIN_POSITIONS_FOR_CONCENTRATION = 3
+
 # Conviction → win-probability mapping for Kelly sizing.
 # Deliberately conservative: the walk-forward evidence shows even strong
 # signals realise only ~53% WR, so conviction 100 maps to just ~0.57 and
@@ -180,6 +191,8 @@ async def auto_open_from_recommendations(
     min_conviction: int = DEFAULT_MIN_CONVICTION,
     max_per_day: int = DEFAULT_MAX_PER_DAY,
     max_open_positions: int = DEFAULT_MAX_OPEN_POSITIONS,
+    max_directional_concentration: float = DEFAULT_MAX_DIRECTIONAL_CONCENTRATION,
+    min_positions_for_concentration: int = DEFAULT_MIN_POSITIONS_FOR_CONCENTRATION,
 ) -> dict[str, Any]:
     """Open paper trades for the top BUY/SELL recommendations.
 
@@ -272,6 +285,27 @@ async def auto_open_from_recommendations(
     except Exception:
         open_positions_rows = []
 
+    # ── directional-concentration tally ──────────────────────────────────
+    # Seed from the current open book, then keep it current as we open within
+    # this cycle so the cap is cumulative across multiple opens (mirrors the
+    # B3 exposure-cap bookkeeping below).
+    dir_counts: dict[str, int] = {"bullish": 0, "bearish": 0}
+    for p in open_positions_rows:
+        d = p.get("direction")
+        if d in dir_counts:
+            dir_counts[d] += 1
+
+    def _would_breach_concentration(direction: str) -> bool:
+        """True if opening one more `direction` position would push that side
+        above the concentration cap on a book of at least the floor size."""
+        if max_directional_concentration >= 1.0:
+            return False  # cap disabled
+        proj_dir = dir_counts.get(direction, 0) + 1
+        proj_total = dir_counts["bullish"] + dir_counts["bearish"] + 1
+        if proj_total < max(1, min_positions_for_concentration):
+            return False  # too few positions for the cap to be meaningful
+        return (proj_dir / proj_total) > max_directional_concentration
+
     # Capital floor for the risk gate: best-effort from settings, fallback 100k.
     capital = 100_000.0
     try:
@@ -360,6 +394,23 @@ async def auto_open_from_recommendations(
         if await _already_open(sym, direction, today):
             skip_counts["already_open"] = skip_counts.get("already_open", 0) + 1
             _record(r, conv, rr, taken=False, skip_reason="already_open", direction=direction)
+            continue
+        # ── directional-concentration guardrail ──
+        # Refuse to add to an already-lopsided book. Candidates are sorted by
+        # conviction desc, so the strongest same-direction names are kept and
+        # only the marginal over-concentrating ones are dropped.
+        if _would_breach_concentration(direction):
+            skip_counts["directional_concentration_cap"] = (
+                skip_counts.get("directional_concentration_cap", 0) + 1
+            )
+            logger.info(
+                "SKIP auto-open %s: directional concentration cap "
+                "(%s book would exceed %.0f%%; open bullish=%d bearish=%d)",
+                sym, direction, max_directional_concentration * 100.0,
+                dir_counts["bullish"], dir_counts["bearish"],
+            )
+            _record(r, conv, rr, taken=False,
+                    skip_reason="directional_concentration_cap", direction=direction)
             continue
         entry = float(getattr(r, "entry", None) or r.get("entry") or 0)
         sl = float(getattr(r, "stoploss", None) or r.get("stoploss") or 0)
@@ -532,6 +583,10 @@ async def auto_open_from_recommendations(
             opened.append({"symbol": sym, "direction": direction, "conviction": conv,
                             "trade_id": trade["trade_id"], "shares": kelly_shares,
                             "position_size": position_size})
+            # Keep the directional tally current so the concentration cap is
+            # cumulative across opens within this cycle.
+            if direction in dir_counts:
+                dir_counts[direction] += 1
             _record(r, conv, rr, taken=True, direction=direction,
                     sizing=sizing, max_corr=max_corr)
             # Keep the open-book aggregates current so B3 caps are cumulative
@@ -629,9 +684,21 @@ async def get_auto_paper_settings(db_settings: dict[str, Any]) -> dict[str, Any]
             return int(db_settings.get(key, default))
         except Exception:
             return default
+
+    def _f(key: str, default: float) -> float:
+        try:
+            return float(db_settings.get(key, default))
+        except Exception:
+            return default
     return {
         "enabled": str(db_settings.get("auto_paper_trade_enabled", "true")).lower() == "true",
         "min_conviction": _i("auto_paper_min_conviction", DEFAULT_MIN_CONVICTION),
         "max_per_day": _i("auto_paper_max_per_day", DEFAULT_MAX_PER_DAY),
         "max_open_positions": _i("auto_paper_max_open_positions", DEFAULT_MAX_OPEN_POSITIONS),
+        "max_directional_concentration": _f(
+            "auto_paper_max_directional_concentration",
+            DEFAULT_MAX_DIRECTIONAL_CONCENTRATION),
+        "min_positions_for_concentration": _i(
+            "auto_paper_min_positions_for_concentration",
+            DEFAULT_MIN_POSITIONS_FOR_CONCENTRATION),
     }

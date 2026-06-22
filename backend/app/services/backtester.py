@@ -7,6 +7,7 @@ on each slice, and measures how well signals predicted future price movement.
 
 Uses yfinance (free) via the existing data_fetcher. No LLM calls.
 """
+import asyncio
 import logging
 from typing import Any, Optional
 
@@ -183,6 +184,14 @@ async def run_backtest(
         if (i - MIN_LOOKBACK) % progress_step == 0:
             pct = round((i - MIN_LOOKBACK) / (scan_end - MIN_LOOKBACK) * 100)
             logger.info("Backtest progress: %s — %d%% (%d/%d bars)", symbol, pct, i - MIN_LOOKBACK, scan_end - MIN_LOOKBACK)
+
+        # Cooperative yield: the per-bar work below (technicals + signal scan on
+        # a pandas slice) is pure CPU and never awaits, so a multi-symbol
+        # backtest would otherwise monopolise the event loop and starve
+        # /api/health — which made the paper-trade cron believe the backend was
+        # "wedged" and kill it mid-run. Yielding once per bar lets the HTTP
+        # server service health/requests between bars at negligible cost.
+        await asyncio.sleep(0)
 
         # Slice: only data up to and including day i (simulates "today")
         window_df = df.iloc[: i + 1].copy()

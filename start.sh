@@ -24,15 +24,24 @@ log()  { echo -e "\033[1;36m[agentX]\033[0m $*"; }
 warn() { echo -e "\033[1;33m[agentX]\033[0m $*"; }
 err()  { echo -e "\033[1;31m[agentX]\033[0m $*" >&2; }
 
+NEEDS_INSTALL=0
 ensure_venv() {
   if [ ! -d "$VENV_DIR" ]; then
     log "Creating Python virtual environment..."
     python3 -m venv "$VENV_DIR"
+    NEEDS_INSTALL=1   # fresh venv → deps definitely missing
   fi
   source "$VENV_DIR/bin/activate"
 }
 
+# Only (re)install when the venv was just created or the caller forces it with
+# AGENTX_FORCE_INSTALL=1. Running `pip install` on every auto-start added tens
+# of seconds to the critical path — long enough that the paper-trade cron's
+# health poll timed out before the server ever bound the port.
 install_deps() {
+  if [ "$NEEDS_INSTALL" != "1" ] && [ "${AGENTX_FORCE_INSTALL:-0}" != "1" ]; then
+    return 0
+  fi
   log "Installing dependencies..."
   pip install -r "$BACKEND_DIR/requirements.txt" -q --disable-pip-version-check
 }
@@ -73,6 +82,19 @@ all_port_pids() {
 health_ok() {
   command -v curl &>/dev/null || return 1
   curl -fsS --max-time 4 "http://localhost:$PORT/api/health" >/dev/null 2>&1
+}
+
+# A single failed probe is not proof a backend is dead — it may just be busy
+# (e.g. crunching a backtest). Retry a few times over ~15s before concluding it
+# is genuinely wedged, so we never kill a healthy-but-busy server out from under
+# the paper-trade cron.
+health_ok_persistent() {
+  local tries="${1:-5}" i
+  for ((i = 1; i <= tries; i++)); do
+    if health_ok; then return 0; fi
+    sleep 3
+  done
+  return 1
 }
 
 # ── Commands ─────────────────────────────────────────────────
@@ -128,12 +150,14 @@ do_start() {
   local existing_pid
   existing_pid=$(find_pid)
   if [ -n "$existing_pid" ]; then
-    if health_ok; then
+    # Probe persistently: a busy backend (mid-backtest) can miss one health
+    # check without being wedged. Only tear it down if it stays unresponsive.
+    if health_ok_persistent 5; then
       warn "Backend already running and healthy on port $PORT (PID $existing_pid)"
       warn "Use './start.sh restart' to restart or './start.sh stop' to stop"
       return 1
     fi
-    warn "Port $PORT held by PID $existing_pid but /api/health is not responding"
+    warn "Port $PORT held by PID $existing_pid but /api/health stayed unresponsive (~15s)"
     warn "Treating it as wedged — stopping it and starting a fresh backend"
     do_stop
     sleep 1

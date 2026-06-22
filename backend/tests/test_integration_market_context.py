@@ -63,7 +63,7 @@ async def _init_db():
         for stmt in _SCHEMA:
             await db.execute(stmt)
         for key, val in {"alert_interval_minutes": "30", "risk_mode": "balanced",
-                         "llm_provider": "gemini", "llm_model": "gemini-2.0-flash"}.items():
+                         "llm_provider": "gemini", "llm_model": "gemini-3.1-flash"}.items():
             await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (key, val))
         await db.commit()
 

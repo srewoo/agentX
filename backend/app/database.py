@@ -364,6 +364,17 @@ CREATE_PAPER_TRADES_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_paper_trades_symbol ON paper_trades(symbol);",
     "CREATE INDEX IF NOT EXISTS idx_paper_trades_entry_date ON paper_trades(entry_date DESC);",
 ]
+
+# Defense-in-depth against duplicate OPEN positions for the same logical trade
+# (symbol, direction, entry_price) regardless of `source`. Partial so it only
+# constrains OPEN rows — closed history (legitimately repeatable across days)
+# is untouched. Applied separately + tolerantly: creating it on a DB that
+# still holds duplicates raises, which must NOT crash startup — run
+# `scripts/dedup_paper_data.py` first, which dedups then creates this index.
+CREATE_PAPER_TRADES_DEDUP_INDEX = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_trades_open_dedup "
+    "ON paper_trades(symbol, direction, entry_price) WHERE status = 'open';"
+)
 CREATE_LLM_USAGE_TABLE = _create_llm_usage_sql("sqlite")
 CREATE_LLM_USAGE_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_llm_usage_ts ON llm_usage(ts DESC);",
@@ -496,6 +507,16 @@ async def _init_db_sqlite() -> None:
             await db.execute(idx_sql)
         for idx_sql in CREATE_PAPER_TRADES_INDEXES:
             await db.execute(idx_sql)
+        # Tolerant: fails loudly in logs (not at startup) if legacy duplicates
+        # still exist — operator runs scripts/dedup_paper_data.py to resolve.
+        try:
+            await db.execute(CREATE_PAPER_TRADES_DEDUP_INDEX)
+        except Exception as e:
+            logger.warning(
+                "paper_trades open-dedup unique index not created — duplicate "
+                "OPEN rows likely present. Run scripts/dedup_paper_data.py. (%s)",
+                e,
+            )
         for idx_sql in CREATE_DECISION_LOG_INDEXES:
             await db.execute(idx_sql)
         for idx_sql in CREATE_LLM_USAGE_INDEXES:

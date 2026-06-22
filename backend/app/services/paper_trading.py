@@ -204,6 +204,34 @@ async def create_paper_trade(
     source: str = "api",
 ) -> dict[str, Any]:
     now = datetime.now(timezone.utc).isoformat()
+
+    # ── source-agnostic dedup guard ──────────────────────────────────────
+    # A logical position is identified by (symbol, direction, entry_price).
+    # The same trade used to be written once via the live API/auto path and
+    # again via the legacy CSV import — different `source`, same position —
+    # because the only guard (`auto_paper_trader._already_open`) was scoped
+    # to source='auto'. That double-counted P&L and skewed every win-rate /
+    # avg-PnL stat the Perf tab reports. We now reject a second OPEN row for
+    # an already-open logical position regardless of source, returning the
+    # existing row so callers stay idempotent.
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """SELECT * FROM paper_trades
+               WHERE symbol = ? AND direction = ? AND entry_price = ?
+                 AND status = 'open' LIMIT 1""",
+            (symbol, direction, float(entry_price)),
+        ) as cur:
+            existing = await cur.fetchone()
+        if existing is not None:
+            logger.info(
+                "create_paper_trade: %s %s @%.4f already open (source=%s) "
+                "— returning existing, skipping duplicate (source=%s)",
+                symbol, direction, float(entry_price),
+                existing["source"], source,
+            )
+            return _row_to_trade(existing)
+
     trade = {
         "trade_id": uuid.uuid4().hex[:12],
         "symbol": symbol,

@@ -1,0 +1,7 @@
+# runLocal config for the agentX backend.
+# Lets `run-local.sh <this-dir>` start the service with no flags.
+run_cmd: python run.py
+port: 8020
+env:
+  # start.sh sets this; the app needs it or it exits with SecretsKeyMissing.
+  AGENTX_DEV: "1"
