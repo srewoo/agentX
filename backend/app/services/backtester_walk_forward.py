@@ -223,6 +223,11 @@ def _fold_metrics(trades: list[dict[str, Any]], eval_windows: list[int]) -> dict
         # Per-trade Sharpe-like ratio (no annualisation — eval window varies).
         sharpe = (avg / vol) if vol > 1e-9 else 0.0
         metrics[f"win_rate_{w}d"] = round(wins / evaluated * 100, 2) if evaluated > 0 else None
+        # Raw counts exposed so downstream (e.g. autonomous gating) can build
+        # significance candidates from OOS wins/n directly, rather than
+        # reconstructing them from the rounded win-rate.
+        metrics[f"wins_{w}d"] = wins
+        metrics[f"evaluated_{w}d"] = evaluated
         metrics[f"avg_pnl_{w}d"] = round(avg, 4)
         metrics[f"sharpe_{w}d"] = round(sharpe, 3)
         metrics[f"max_drawdown_{w}d"] = round(min(pnls), 4) if pnls else 0.0

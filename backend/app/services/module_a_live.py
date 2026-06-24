@@ -14,6 +14,8 @@ swing engine — which is the WHOLE POINT.
 """
 import asyncio
 import logging
+import uuid
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 import pandas as pd
@@ -174,6 +176,39 @@ async def _already_open_module_a(symbol: str) -> bool:
             return (await cur.fetchone()) is not None
 
 
+def _build_module_a_signal(c: dict[str, Any], trade_id: str) -> dict[str, Any]:
+    """Build a `signals`-table row for a Module A pick so it surfaces in the
+    extension feed alongside the multi-factor engine's signals. Strength 10
+    mirrors the paper trade; direction is always bullish (QV is long-only)."""
+    pct = c.get("pct_above_low")
+    pct_txt = f"{pct:.1f}% above 52w low" if pct is not None else "near 52w low"
+    return {
+        "id": uuid.uuid4().hex,
+        "symbol": c["symbol"],
+        "signal_type": "quality_value_52w_low",
+        "direction": "bullish",
+        "strength": 10,
+        "reason": (
+            f"Quality+Value pick: composite {c.get('composite_score', 0):.0f}, "
+            f"{pct_txt}. 180-day hold (Module A)."
+        ),
+        "risk": "Long-horizon position; -20% catastrophe stop, 180-day time exit.",
+        "current_price": c.get("entry"),
+        "exchange": "NSE",
+        "metadata": {
+            "source": "module_a",
+            "trade_id": trade_id,
+            "composite_score": c.get("composite_score"),
+            "pct_above_low": pct,
+            "horizon_days": 180,
+            "entry": c.get("entry"),
+            "stop_loss": c.get("stoploss"),
+            "target": c.get("target1"),
+        },
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 async def scan_and_open_module_a(
     db_settings: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
@@ -224,6 +259,7 @@ async def scan_and_open_module_a(
     candidates.sort(key=lambda c: (-c["composite_score"], c["pct_above_low"] or 999))
 
     opened: list[dict[str, Any]] = []
+    emitted_signals: list[dict[str, Any]] = []
     skipped_already_open = 0
     for c in candidates:
         if len(opened) >= min(remaining, int(cfg["max_picks_per_run"])):
@@ -244,8 +280,21 @@ async def scan_and_open_module_a(
                 "composite": c["composite_score"], "pct_above_low": c["pct_above_low"],
                 "entry": c["entry"], "stop_loss": c["stoploss"], "target": c["target1"],
             })
+            emitted_signals.append(_build_module_a_signal(c, trade["trade_id"]))
         except Exception as e:
             logger.warning("Module A open failed for %s: %s", c["symbol"], e)
+
+    # Surface Module A picks in the signals feed (the extension reads `signals`,
+    # not `paper_trades`). Without this, the only long-term BUY strategy was
+    # invisible in the UI. Best-effort: a feed-write failure must not roll back
+    # an already-opened paper trade.
+    if emitted_signals:
+        try:
+            from app.services.orchestrator import _store_signals
+            await _store_signals(emitted_signals)
+        except Exception as e:
+            logger.warning("Module A: failed to emit %d feed signals: %s",
+                           len(emitted_signals), e)
 
     if opened:
         logger.info("Module A: opened %d picks (open=%d, candidates=%d)",

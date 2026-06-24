@@ -234,12 +234,15 @@ def _compute_outcome(
     pnl_pct = round(pnl_pct, 2)
     hold_days = _days_since(sig["created_at"], now)
 
-    # Determine outcome
+    # Determine outcome. A true breakeven (pnl_pct == 0) is neither win nor
+    # loss — the old `<= 0` booked it as a loss (downward WR bias) and made the
+    # `open` branch unreachable. Leave 0.0% unresolved so it re-evaluates next
+    # cycle instead of freezing as a loss.
     if hold_days >= 30:
         outcome = "expired"
     elif pnl_pct > 0:
         outcome = "win"
-    elif pnl_pct <= 0:
+    elif pnl_pct < 0:
         outcome = "loss"
     else:
         outcome = "open"
@@ -309,13 +312,17 @@ async def _recalculate_performance() -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
 
-        # Aggregate by (signal_type, direction) for resolved outcomes
+        # Aggregate by (signal_type, direction). Win rate is computed over
+        # RESOLVED trades only (wins + losses). The old denominator used
+        # COUNT(*) including 'expired' rows, which silently dragged win rates
+        # down as signals aged out — and disagreed with performance_cohort,
+        # which already divides by wins+losses. avg_pnl is likewise averaged
+        # over resolved trades only, not the expired rows.
         query = """
             SELECT signal_type, direction,
-                   COUNT(*) as total,
                    SUM(CASE WHEN outcome = 'win' THEN 1 ELSE 0 END) as wins,
                    SUM(CASE WHEN outcome = 'loss' THEN 1 ELSE 0 END) as losses,
-                   AVG(CASE WHEN pnl_pct IS NOT NULL THEN pnl_pct ELSE 0 END) as avg_pnl
+                   AVG(CASE WHEN outcome IN ('win','loss') THEN pnl_pct END) as avg_pnl
             FROM signal_outcomes
             WHERE outcome IN ('win', 'loss', 'expired')
             GROUP BY signal_type, direction
@@ -324,10 +331,12 @@ async def _recalculate_performance() -> None:
             rows = await cursor.fetchall()
 
         for row in rows:
-            total = row["total"]
-            wins = row["wins"]
-            win_rate = round((wins / total) * 100, 1) if total > 0 else 0.0
-            avg_pnl = round(row["avg_pnl"], 2) if row["avg_pnl"] else 0.0
+            wins = row["wins"] or 0
+            losses = row["losses"] or 0
+            resolved = wins + losses
+            total = resolved
+            win_rate = round((wins / resolved) * 100, 1) if resolved > 0 else 0.0
+            avg_pnl = round(row["avg_pnl"], 2) if row["avg_pnl"] is not None else 0.0
 
             await db.execute(
                 """INSERT OR REPLACE INTO signal_performance

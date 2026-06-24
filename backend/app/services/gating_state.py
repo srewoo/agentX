@@ -304,14 +304,18 @@ async def seed_from_constants(
 ) -> int:
     """One-time seed of the state table from the existing hand-curated sets.
 
-    Starts the autonomous machine where the human left off, so we don't lose
-    accumulated judgment on the first derived run. Idempotent — only inserts
-    keys that don't already exist.
+    HONESTY FIX (2026-06): hand-curated *promotions* are seeded as **candidate**,
+    not promoted. Seeding them 'promoted' meant the FDR machine inherited an
+    in-sample edge it never had to earn — it could only ever demote, never
+    validate, so the amplification outlived its own forward refutation. Now a
+    promotion must be EARNED by the gate (3 FDR-significant disjoint rounds).
+    Mutes and blocks are still inherited as-is: they only ever REDUCE risk, so
+    starting conservative is safe. Idempotent — only inserts new keys.
     """
     path = db_path or DB_PATH
     now = datetime.now(timezone.utc).isoformat()
     rows = (
-        [(f"{s}|{d}", "combo", "promoted") for s, d in promoted]
+        [(f"{s}|{d}", "combo", "candidate") for s, d in promoted]
         + [(f"{s}|{d}", "combo", "muted") for s, d in muted]
         + [(s, "symbol", "blocked") for s in blocked]
     )

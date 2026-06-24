@@ -37,6 +37,42 @@ DEFAULT_MIN_CONVICTION = 65
 DEFAULT_MAX_PER_DAY = 5
 DEFAULT_MAX_OPEN_POSITIONS = 12
 
+# Time-exit horizons (calendar days), derived from the signal_outcomes
+# backtest hold periods: the validated short-fuse setups resolve in a
+# 1-3 SESSION move (double_top median 1d / p90 3d; gaps 1d/2d; breakout
+# 1d/2d; rsi_extreme/macd_divergence ~2d). Holding past that just gives
+# volatility room to hit the stop — observed live as double_top shorts
+# held ~2 weeks going 1-for-9. Values are calendar days (p90 trading days
+# + a weekend buffer). `auto_close_hits` force-exits at market once held.
+DEFAULT_MAX_HOLD_DAYS = 7
+MAX_HOLD_DAYS: dict[str, int] = {
+    "price_spike": 2, "volume_spike": 2,
+    "gap_up": 3, "gap_down": 3,
+    "breakout": 4, "consolidation_breakout": 4,
+    "rsi_extreme": 4, "ema_crossover": 4,
+    "double_top": 5, "double_bottom": 5,
+    "head_and_shoulders": 5, "inverse_head_and_shoulders": 5,
+    "macd_divergence": 5, "macd_crossover": 5,
+}
+
+
+def _max_hold_days(signal_type: str | None) -> int:
+    return MAX_HOLD_DAYS.get(signal_type or "", DEFAULT_MAX_HOLD_DAYS)
+
+
+def _days_held(entry_date: str | None, now: datetime) -> Optional[int]:
+    """Calendar days between entry_date and now. Tolerates both
+    'YYYY-MM-DD' (csv import) and full ISO timestamps (api/auto)."""
+    if not entry_date:
+        return None
+    try:
+        dt = datetime.fromisoformat(entry_date.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return max(0, (now - dt).days)
+    except Exception:
+        return None
+
 # Directional-concentration guardrail. The engine can lock into a one-sided
 # posture (e.g. 100% short) and bleed when the market runs the other way —
 # observed live as a 0-for-33 run of SELL recos into a rising tape. This caps
@@ -631,12 +667,14 @@ async def auto_close_hits() -> dict[str, Any]:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            """SELECT trade_id, symbol, direction, entry_price, stop_loss, target
+            """SELECT trade_id, symbol, direction, entry_price, stop_loss, target,
+                      signal_type, entry_date
                FROM paper_trades
                WHERE status = 'open' AND source = 'auto'"""
         ) as cur:
             rows = [dict(r) for r in await cur.fetchall()]
 
+    now = datetime.now(timezone.utc)
     closed: list[dict[str, Any]] = []
     for row in rows:
         try:
@@ -661,6 +699,13 @@ async def auto_close_hits() -> dict[str, Any]:
                 exit_reason, exit_price = "stoploss_hit", sl
             elif tgt and price <= tgt:
                 exit_reason, exit_price = "target_hit", tgt
+        # Time-exit: the signal's edge is a short-fuse move (see MAX_HOLD_DAYS).
+        # If neither stop nor target hit within the horizon, exit at market —
+        # don't let a 1-3 day edge bleed out over weeks.
+        if not exit_reason:
+            held = _days_held(row.get("entry_date"), now)
+            if held is not None and held >= _max_hold_days(row.get("signal_type")):
+                exit_reason, exit_price = "time_exit", price
         if exit_reason:
             try:
                 result = await close_paper_trade(

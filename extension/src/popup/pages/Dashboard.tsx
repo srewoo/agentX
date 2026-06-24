@@ -115,23 +115,17 @@ export default function Dashboard({ onSelectSymbol }: DashboardProps = {}) {
   const [indices, setIndices] = useState<Record<string, { price: number; change: number; change_pct: number }> | null>(null);
   const [actionFilter, setActionFilter] = useState<ActionFilter>("ALL");
   const [timeframeFilter, setTimeframeFilter] = useState<TimeframeFilter>("ALL");
-  // Tracks whether the user has manually picked a timeframe since the last
-  // action filter change. We only auto-tune on action change if they haven't.
-  const [tfManual, setTfManual] = useState<boolean>(false);
 
-  // Direction-aware timeframe defaults — backtest showed bullish setups need
-  // a longer hold (10d > 5d for cumulative PnL); bearish setups peak around 5d.
+  // Action and timeframe are independent filter axes. We deliberately do NOT
+  // auto-snap timeframe when the action changes: the old coupling (BUY→Long-term,
+  // SELL→Swing) created unreachable filter combinations that hid valid signals
+  // (e.g. the 214 active bearish-swing signals, and long-term BUYs). Users pick
+  // each axis themselves; "ALL" on either axis means no constraint on that axis.
   const handleActionFilter = (f: ActionFilter) => {
     setActionFilter(f);
-    if (!tfManual) {
-      if (f === "BUY") setTimeframeFilter("Long-term");
-      else if (f === "SELL") setTimeframeFilter("Swing");
-      else setTimeframeFilter("ALL");
-    }
   };
   const handleTimeframeFilter = (f: TimeframeFilter) => {
     setTimeframeFilter(f);
-    setTfManual(true);
   };
   const [cleared, setCleared] = useState(false);
 

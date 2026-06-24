@@ -39,7 +39,10 @@ async def _record_paper_outcome(
             hold_days = max(0, (xd - ed).days)
         except Exception:
             hold_days = None
-        outcome = "win" if pnl_pct > 0 else "loss"
+        # A closed trade at exactly 0% is a breakeven, not a loss. Tagging it
+        # 'breakeven' keeps it out of the win/loss WR denominator (which filters
+        # to win/loss/expired) rather than biasing win rate downward.
+        outcome = "win" if pnl_pct > 0 else "loss" if pnl_pct < 0 else "breakeven"
         await db.execute(CREATE_SIGNAL_OUTCOMES_TABLE)
         await db.execute(
             """INSERT OR REPLACE INTO signal_outcomes
@@ -100,15 +103,15 @@ def _float_or_none(value: Any) -> float | None:
 def _int_or_none(value: Any) -> int | None:
     if value in (None, ""):
         return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
 
 
 def _row_to_trade(row: aiosqlite.Row | dict[str, Any]) -> dict[str, Any]:
     data = dict(row)
     return data
-    try:
-        return int(float(value))
-    except (TypeError, ValueError):
-        return None
 
 
 async def import_paper_trades_csv(csv_path: str | Path) -> dict[str, int]:

@@ -91,7 +91,10 @@ async def test_seed_from_constants_then_visible(db_path):
     )
     assert n == 4
     active = await gs.get_active_gating(db_path=db_path)
-    assert "double_top|bearish" in active["promoted"]
+    # Hand-curated promotions are now seeded as CANDIDATES — they must EARN
+    # promotion from forward data, not inherit it. Mutes/blocks still inherit.
+    assert "double_top|bearish" in active["candidate"]
+    assert "double_top|bearish" not in active["promoted"]
     assert "gap_up|bullish" in active["muted"]
     assert "ITC" in active["blocked"] and "SBIN" in active["blocked"]
     # Idempotent: re-seeding inserts nothing new.
@@ -104,8 +107,12 @@ async def test_overlay_seed_and_predicates(db_path):
         promoted=[("double_top", "bearish")], muted=[("gap_up", "bullish")],
         blocked=["ITC"], db_path=db_path)
     loaded = await gs.seed_overlay(db_path=db_path)
-    assert loaded == 3
-    assert gs.overlay_is_promoted("double_top", "bearish") is True
+    # double_top seeds as a candidate now, so only the mute + block load into
+    # the active overlay (candidates are not promoted/muted/blocked).
+    assert loaded == 2
+    # An active overlay (mute present) reports a seeded promotion-candidate as
+    # NOT promoted — it must earn promotion before is_promoted() boosts it.
+    assert gs.overlay_is_promoted("double_top", "bearish") is False
     assert gs.overlay_is_promoted("rsi_extreme", "bullish") is False
     assert gs.overlay_is_muted("gap_up", "bullish") is True
     assert gs.overlay_is_blocked("ITC") is True

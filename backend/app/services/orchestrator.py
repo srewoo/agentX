@@ -113,6 +113,13 @@ def _mark_module_a_ran_today() -> None:
 # NSE rate limits happy while still finishing ~50 symbols in reasonable time.
 _BACKTEST_CONCURRENCY = 5
 _BACKTEST_PER_SYMBOL_TIMEOUT = 30.0  # seconds — backtests that exceed this are skipped
+# Minimum spacing between autonomous-gating advances. The promote/demote
+# hysteresis ("3 consecutive significant rounds") only carries information if
+# rounds are disjoint in time; advancing on every (daily) backtest made "3
+# rounds" ≈ 3 same-week re-measurements. We trigger gating from the reliable
+# daily job but rate-limit advances to this interval so rounds stay ~weekly
+# and disjoint, without depending on the fragile weekly slot firing.
+_GATING_MIN_INTERVAL_DAYS = 6
 
 # Track symbols that consistently fail — skip them to avoid wasting time
 _bad_symbol_strikes: dict[str, int] = {}  # symbol → consecutive failure count
@@ -1470,6 +1477,7 @@ class SignalOrchestrator:
         period: str = "1y",
         run_kind: str = "weekly",
         refresh_edges: bool = True,
+        advance_gating: bool = False,
     ) -> None:
         """Execute a backtest over ``all_syms`` and persist the result row.
 
@@ -1477,6 +1485,17 @@ class SignalOrchestrator:
         signal_edge overrides) and the daily loop (small universe,
         ``refresh_edges=False`` so a thin daily sample never clobbers the
         broader weekly edge table). Records a runtime heartbeat either way.
+
+        ``advance_gating`` drives the autonomous promote/demote state machine.
+        Both the daily and weekly jobs pass it True, but advances are
+        rate-limited internally to ``_GATING_MIN_INTERVAL_DAYS`` so the
+        hysteresis ("3 consecutive significant rounds → promote") spans disjoint
+        ~weekly rounds rather than same-week re-measurements — while still
+        firing reliably off the daily job (the weekly slot is unreliable).
+        Critically, when advancing, gating candidates are built from an
+        OUT-OF-SAMPLE walk-forward (run_universe_walk_forward), not the
+        in-sample full-history run_backtest below — so a promotion reflects
+        forward-held-out edge, not the data it was selected on.
         """
         from app.services.backtester import run_backtest
         import json
@@ -1607,41 +1626,82 @@ class SignalOrchestrator:
             except Exception as e:
                 logger.warning("Edge override refresh failed (non-critical): %s", e)
 
-            # Autonomous gating (A1/A2/A4): advance the promote/demote state
-            # machine on this run's per-combo win records (FDR-gated, with
-            # hysteresis), refresh the live overlay the engine consults, and
-            # run the champion rollback-safety check on the forward record.
+        # Autonomous gating — advance the promote/demote state machine on
+        # OUT-OF-SAMPLE walk-forward stats, FDR-gated with hysteresis.
+        # Two deliberate changes from the old loop:
+        #   1. Source: run_universe_walk_forward (held-out folds), NOT the
+        #      in-sample full-history run_backtest above. A promotion now
+        #      reflects forward-held-out edge, not the data it was selected on.
+        #   2. Cadence: rate-limited to _GATING_MIN_INTERVAL_DAYS (below), so
+        #      the "3 consecutive significant rounds" hysteresis spans disjoint
+        #      ~weekly rounds rather than same-day re-measurements — while still
+        #      triggering off the reliable daily job.
+        # NOTE: when it does advance, this runs a second backtest pass (the OOS
+        # walk-forward) on top of the in-sample run above (~doubles that run's
+        # wall-clock) — an accepted, infrequent cost for honest gating.
+        if advance_gating:
             try:
+                from app.services.backtester_walk_forward import run_universe_walk_forward
                 from app.services.multiple_testing import Candidate
                 from app.services import gating_state
-                cands = [
-                    Candidate(
-                        key=f"{stype}|{direction}",
-                        wins=int(s["wins"]),
-                        n=int(s["wins"]) + int(s["losses"]),
-                    )
-                    for (stype, direction), s in type_dir_stats.items()
-                    if (int(s["wins"]) + int(s["losses"])) > 0
-                ]
-                if cands:
-                    res = await gating_state.update_gating_state(cands)
-                    loaded = await gating_state.seed_overlay()
-                    logger.info(
-                        "Autonomous gating: %d combos, %d transitions, overlay=%d keys",
-                        len(cands), len(res.get("transitions", [])), loaded,
-                    )
-                # A4 rollback safety: if the live forward record has decayed
-                # below the floor, log it loudly (operator review). True
-                # config-level rollback needs shadow forward metrics per arm.
-                from app.services.forward_report import forward_performance
-                from app.services.champion_challenger import rollback_decision
-                fwd = await forward_performance()
-                rb = rollback_decision({
-                    "expectancy_pct": fwd.get("expectancy_pct", 0.0),
-                    "trades": fwd.get("trades", 0),
-                })
-                if rb["rollback"]:
-                    logger.warning("CHAMPION ROLLBACK SIGNAL: %s", rb["reason"])
+                from app.services.runtime_status import record_run, get_status
+
+                # Rate-limit: keep gating rounds disjoint (~weekly) even though
+                # this is triggered from the (reliable) daily job. Skip the
+                # advance if we advanced within the min interval.
+                throttled = False
+                try:
+                    status = await get_status()
+                    last = (status.get("autonomous_gating") or {}).get("last_run_at")
+                    if last:
+                        age_days = (datetime.now(timezone.utc)
+                                    - datetime.fromisoformat(last)).days
+                        if age_days < _GATING_MIN_INTERVAL_DAYS:
+                            logger.info(
+                                "Autonomous gating: skipped (last advance %dd ago < %dd min interval)",
+                                age_days, _GATING_MIN_INTERVAL_DAYS,
+                            )
+                            throttled = True
+                except Exception as e:
+                    logger.debug("gating cadence check failed (proceeding): %s", e)
+
+                if not throttled:
+                    wf = await run_universe_walk_forward(symbols=all_syms, period=period)
+                    by_sig = wf.get("by_signal_type_oos") or {}
+                    cands = []
+                    for stype, dirs in by_sig.items():
+                        for direction, m in (dirs or {}).items():
+                            if direction == "neutral":
+                                continue
+                            wins = int(m.get("wins_5d") or 0)
+                            n = int(m.get("evaluated_5d") or 0)
+                            if n > 0:
+                                cands.append(Candidate(key=f"{stype}|{direction}", wins=wins, n=n))
+                    if cands:
+                        res = await gating_state.update_gating_state(cands)
+                        loaded = await gating_state.seed_overlay()
+                        # Mark the advance so the rate-limit spaces the next one.
+                        await record_run("autonomous_gating", summary={
+                            "combos": len(cands),
+                            "transitions": len(res.get("transitions", [])),
+                            "source": "oos_walk_forward",
+                        })
+                        logger.info(
+                            "Autonomous gating (OOS): %d combos, %d transitions, overlay=%d keys",
+                            len(cands), len(res.get("transitions", [])), loaded,
+                        )
+                    # A4 rollback safety: if the live forward record has decayed
+                    # below the floor, log it loudly (operator review). True
+                    # config-level rollback needs shadow forward metrics per arm.
+                    from app.services.forward_report import forward_performance
+                    from app.services.champion_challenger import rollback_decision
+                    fwd = await forward_performance()
+                    rb = rollback_decision({
+                        "expectancy_pct": fwd.get("expectancy_pct", 0.0),
+                        "trades": fwd.get("trades", 0),
+                    })
+                    if rb["rollback"]:
+                        logger.warning("CHAMPION ROLLBACK SIGNAL: %s", rb["reason"])
             except Exception as e:
                 logger.warning("Autonomous gating update failed (non-critical): %s", e)
 
@@ -1650,7 +1710,8 @@ class SignalOrchestrator:
         symbols = await _get_watchlist_symbols()
         baseline = [s["symbol"] for s in MAJOR_STOCKS[:25]]
         all_syms = list(dict.fromkeys(baseline + symbols))[:50]  # de-dupe, cap at 50
-        await self._run_backtest_job(all_syms, period="1y", run_kind="weekly", refresh_edges=True)
+        await self._run_backtest_job(all_syms, period="1y", run_kind="weekly",
+                                     refresh_edges=True, advance_gating=True)
 
     async def _run_daily_backtest(self) -> None:
         """Daily backtest over a broad liquid universe — refreshes live edges.
@@ -1673,7 +1734,11 @@ class SignalOrchestrator:
         symbols = await _get_watchlist_symbols()
         baseline = [s["symbol"] for s in MAJOR_STOCKS[:n]]
         all_syms = list(dict.fromkeys(baseline + symbols))[: max(5, n)]
-        await self._run_backtest_job(all_syms, period="1y", run_kind="daily", refresh_edges=True)
+        # The daily job triggers gating too (it runs reliably, unlike weekly),
+        # but _run_backtest_job rate-limits advances to _GATING_MIN_INTERVAL_DAYS
+        # so the promote/demote rounds stay disjoint (~weekly).
+        await self._run_backtest_job(all_syms, period="1y", run_kind="daily",
+                                     refresh_edges=True, advance_gating=True)
 
     async def _daily_backtest_loop(self) -> None:
         """Run a lightweight backtest once per day at 15:45 IST.

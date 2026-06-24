@@ -174,32 +174,42 @@ DIRECTIONAL_MUTES: set[tuple[str, str]] = {
     ("price_spike", "bullish"),       # n=74,  WR 39.2%, avg -1.69%
 }
 
-# Setups the engine considers genuine edge sources after the walk-forward.
-# Used by the scoring layer to amplify signal weight when one of these
-# fires, and shown in the UI as "high-conviction signals".
+# COLD-START PRIOR ONLY — not proof of edge.
+#
+# These are hand-curated hypotheses used as the amplification default *until*
+# the autonomous FDR gate (gating_state) has a forward verdict. Once the gate
+# is active, `is_promoted` defers to it entirely (see below): a combo here that
+# the gate has NOT forward-confirmed is NOT boosted. This is the honest
+# behaviour — the gate, with its Benjamini-Hochberg correction and disjoint
+# rounds, is the only thing that validates an edge; this set is just where the
+# machine starts before it has data.
+#
+# CAUTION on the per-combo numbers below: they come from different in-sample
+# runs that disagree (e.g. double_top/bearish reads 46.5%/+0.036% in SIGNAL_EDGE
+# (n=5161) but a stray comment once claimed 44.4%/+0.80% (n=153) — the latter
+# was decorative and is removed). Treat them as rough priors, not measured edge.
 PROMOTED_SIGNALS: set[tuple[str, str]] = {
-    ("gap_up", "bullish"),               # lb95 53.19, +1.13% avg PnL
-    ("macd_divergence", "bullish"),      # confirmed: 2y n=137 +0.03% avg, +1.1% Kelly
-    # 2026-05-26 walk-forward: only TWO combos survive the realistic-cost
-    # evaluator with positive net avg P&L on n>=100 across 10 NIFTY
-    # names. double_top/bearish is the standout: +0.80% avg, +14.2%
-    # Kelly, n=153. macd_divergence/bullish kept above.
-    ("double_top", "bearish"),           # n=153, WR 44.4%, +0.80% avg, +14.2% Kelly
-    # 2026-05-26: new bullish detectors with documented academic edge.
-    # Walk-forward win-rates are pending; these are promoted prospectively
-    # because their underlying anomaly literature (PEAD, quality
-    # breakout) is among the most-replicated in equities research, and
-    # the in-detector gates (delivery %, fundamentals composite, gap
-    # magnitude, volume multiple) sharply restrict false positives. Will
-    # be re-validated against the next walk-forward run.
+    ("gap_up", "bullish"),               # prior: SIGNAL_EDGE lb95 53.19
+    ("macd_divergence", "bullish"),      # prior: SIGNAL_EDGE n=137, ~+0.03% avg
+    # double_top/bearish: SIGNAL_EDGE table reads WR 46.5% / +0.036% avg / n=5161
+    # — i.e. essentially break-even after the 0.20% cost assumption. Kept as a
+    # cold-start prior, but the live FDR gate has already demoted it (it is the
+    # only counter-trend short allowed, so it must clear the gate to be boosted).
+    ("double_top", "bearish"),
+    # pead / quality_breakout: UNVALIDATED LITERATURE PRIORS (n=0 forward).
+    # They are listed so the detectors run, but they are seeded into the gate as
+    # CANDIDATES, not promoted (see gating_state.seed_from_constants) — they must
+    # EARN promotion from real forward data before getting the amplification.
     ("pead", "bullish"),
     ("quality_breakout", "bullish"),
-    # REMOVED 2026-05-26: rsi_extreme/bearish — was promoted on gross
-    # data; net of realistic Indian-market costs (apply_costs), it is
-    # n=206 WR 32.5% avg -0.89%. Demoted; the symbol won't be killed
-    # entirely because the LLM judge may still find value in it.
-    # REMOVED: evening_star/bearish — net avg -0.94% on n=116. Moved
-    # to DIRECTIONAL_MUTES above.
+}
+
+# Subset of PROMOTED_SIGNALS that have NO forward validation at all — pure
+# literature priors. Used to seed the gate as candidates rather than promoted,
+# so the system never amplifies them as proven edge until data confirms.
+UNVALIDATED_PRIORS: set[tuple[str, str]] = {
+    ("pead", "bullish"),
+    ("quality_breakout", "bullish"),
 }
 
 # Weight multiplier applied to a promoted signal's contribution in the
@@ -332,15 +342,22 @@ WEAK_DIRECTIONAL_SETUPS = HARD_CONFIRMATION_REQUIRED | SOFT_CONFIRMATION_REQUIRE
 
 # Methodology metadata so the UI can disclose what it's looking at.
 EDGE_META = {
-    "source": "walk_forward_oos_2026-05-21",
-    "method": "expanding_window_walk_forward",
-    "folds": 4,
+    "source": "full_history_backtest_2026-05-21",
+    # HONESTY FIX (2026-06): the prior values claimed an "expanding_window
+    # walk-forward" with "out_of_sample_only" stats and 37,403 OOS trades. No
+    # fold-based train/test code exists in the repo — run_backtest does a
+    # single pass over the full history (it avoids intra-trade look-ahead, but
+    # that is NOT validation-style OOS). These numbers are therefore in-sample
+    # selections, not out-of-sample edge. The autonomous FDR gate (gating_state)
+    # is the only mechanism that validates a combo forward; trust IT, not this
+    # table, for whether an edge is real.
+    "method": "single_pass_full_history_backtest",
     "period": "2y",
     "eval_window_days": 5,
     "stocks": 40,
-    "total_signals": 37403,
     "transaction_cost_pct": 0.20,
-    "stat_basis": "out_of_sample_only",
+    "stat_basis": "in_sample_full_history",
+    "validation": "none_in_this_table__see_gating_state_for_forward_validation",
     "win_rate_lb95": "Wilson 95% lower bound — penalises small samples",
 }
 
@@ -392,13 +409,23 @@ def is_muted(signal_type: str, direction: Optional[str] = None) -> bool:
 
 
 def is_promoted(signal_type: str, direction: str) -> bool:
-    """True for walk-forward-confirmed positive-edge setups.
+    """True only for FORWARD-VALIDATED positive-edge setups.
 
-    Consults the autonomous-gating overlay first (derived promotions add to,
-    never remove, the hand-curated set), then the PROMOTED_SIGNALS constant.
+    The autonomous FDR gate is authoritative: when it has an opinion (its
+    overlay is active), we defer to it ENTIRELY — including its *demotions*.
+    The old logic only let the overlay ADD promotions, so a hardcoded
+    promotion the gate had demoted kept getting the 1.6x boost forever (the
+    in-sample "edge" outliving its own forward refutation). Now:
+
+      - overlay says True  -> promoted (gate-confirmed)
+      - overlay says False -> NOT promoted (gate-demoted / never earned),
+                              even if it's in the hardcoded constant
+      - overlay says None  -> cold start (gate not seeded yet) -> fall back
+                              to the PROMOTED_SIGNALS prior
     """
-    if _overlay_promoted(signal_type, direction):
-        return True
+    ov = _overlay_promoted_state(signal_type, direction)
+    if ov is not None:
+        return ov
     return (signal_type, direction) in PROMOTED_SIGNALS
 
 
@@ -413,6 +440,17 @@ def _overlay_promoted(signal_type: str, direction: str) -> bool:
         return overlay_is_promoted(signal_type, direction) is True
     except Exception:
         return False
+
+
+def _overlay_promoted_state(signal_type: str, direction: str) -> Optional[bool]:
+    """Tri-state view of the gate's promotion opinion: True (promoted),
+    False (active gate, not promoted → demoted/unearned), None (gate not
+    seeded → defer to the hand-curated prior). Fail-safe to None."""
+    try:
+        from app.services.gating_state import overlay_is_promoted
+        return overlay_is_promoted(signal_type, direction)
+    except Exception:
+        return None
 
 
 def _overlay_muted(signal_type: str, direction: str) -> bool:

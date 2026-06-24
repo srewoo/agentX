@@ -119,7 +119,10 @@ async def stop_loss_loop(
             triggered = await evaluate_open_positions(positions)
             seen_ids: set[Any] = set()
             for t in triggered:
-                trade_id = t.get("id")
+                # paper_trades rows are keyed by `trade_id` (see _row_to_trade);
+                # the old `t.get("id")` was always None, so close_paper_trade(None)
+                # found no row and this monitor silently closed nothing.
+                trade_id = t.get("trade_id")
                 # Skip duplicate triggers for the same trade within one pass —
                 # close_paper_trade is also idempotent, this just avoids noise.
                 if trade_id is not None and trade_id in seen_ids:
@@ -127,7 +130,7 @@ async def stop_loss_loop(
                 seen_ids.add(trade_id)
                 try:
                     closed = await close_paper_trade(
-                        trade_id=t.get("id"),
+                        trade_id=trade_id,
                         exit_price=t["trigger_price"],
                         exit_reason="stop_loss",
                     )

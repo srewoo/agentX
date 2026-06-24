@@ -52,29 +52,27 @@ describe("constants", () => {
       expect(getSignalTimeframe("cup_and_handle", 5)).toBe("Long-term");
     });
 
-    it("should promote breakout to Long-term when strength >= 7", () => {
-      expect(getSignalTimeframe("breakout", 6)).toBe("Swing");
-      expect(getSignalTimeframe("breakout", 7)).toBe("Long-term");
-      expect(getSignalTimeframe("breakout", 10)).toBe("Long-term");
-    });
-
     it("should default to Swing for unknown signal types", () => {
       expect(getSignalTimeframe("unknown_signal", 5)).toBe("Swing");
     });
 
-    it("should promote high-strength multi-bar patterns to Long-term", () => {
-      expect(getSignalTimeframe("head_and_shoulders", 7)).toBe("Swing");
-      expect(getSignalTimeframe("head_and_shoulders", 8)).toBe("Long-term");
-      expect(getSignalTimeframe("double_top", 8)).toBe("Long-term");
-      expect(getSignalTimeframe("inverse_head_and_shoulders", 9)).toBe("Long-term");
-      expect(getSignalTimeframe("consolidation_breakout", 8)).toBe("Long-term");
+    it("should be strength-independent (timeframe is type-driven only)", () => {
+      // Strength must never move a signal between timeframe tabs.
+      for (const s of [1, 5, 6, 7, 8, 9, 10]) {
+        expect(getSignalTimeframe("breakout", s)).toBe("Swing");
+        expect(getSignalTimeframe("double_top", s)).toBe("Swing");
+        expect(getSignalTimeframe("head_and_shoulders", s)).toBe("Swing");
+        expect(getSignalTimeframe("gap_up", s)).toBe("Intraday");
+        expect(getSignalTimeframe("gap_down", s)).toBe("Intraday");
+        expect(getSignalTimeframe("hammer", s)).toBe("Intraday");
+        expect(getSignalTimeframe("bullish_engulfing", s)).toBe("Intraday");
+      }
     });
 
-    it("should promote high-strength candle patterns to Swing", () => {
-      expect(getSignalTimeframe("bullish_engulfing", 6)).toBe("Intraday");
-      expect(getSignalTimeframe("bullish_engulfing", 7)).toBe("Swing");
-      expect(getSignalTimeframe("gap_down", 7)).toBe("Swing");
-      expect(getSignalTimeframe("hammer", 8)).toBe("Swing");
+    it("should map the long-term buy-and-hold types to Long-term", () => {
+      expect(getSignalTimeframe("quality_value_52w_low", 10)).toBe("Long-term");
+      expect(getSignalTimeframe("pead", 5)).toBe("Long-term");
+      expect(getSignalTimeframe("quality_breakout", 5)).toBe("Long-term");
     });
   });
 

@@ -43,15 +43,27 @@ logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("dedup_paper_data")
 
 # Higher = preferred when picking which duplicate row to keep.
-_SOURCE_RANK = {"api": 4, "auto": 3, "module_a": 2, "csv_import": 1}
+# auto (the real live engine) wins if it ever collides; then csv_import is
+# preferred over api because, for the legacy api/csv duplicate pairs, the csv
+# copy carries the realistic trailing/time exit while the api copy exited at a
+# too-tight fixed -3% hard stop (the exit model we are moving away from) — that
+# pessimistic copy was also the only one feeding the learning loop. Keeping the
+# csv copy de-biases both the aggregate stats and the learner.
+_SOURCE_RANK = {"auto": 4, "csv_import": 3, "api": 2, "module_a": 1}
 
 
 def _paper_keep_score(row: dict[str, Any]) -> tuple:
-    """Sort key — the row with the largest tuple is kept."""
-    has_shares = 1 if row.get("shares") is not None else 0
+    """Sort key — the row with the largest tuple is kept.
+
+    Source rank is the PRIMARY key (ahead of has_shares): the legacy csv copies
+    have NULL shares due to the old _int_or_none bug, so ranking has_shares first
+    would always keep the api copy and defeat the csv-preferred policy above.
+    has_shares stays as a secondary tiebreak within the same source.
+    """
     source_rank = _SOURCE_RANK.get(row.get("source") or "", 0)
+    has_shares = 1 if row.get("shares") is not None else 0
     created = row.get("created_at") or ""
-    return (has_shares, source_rank, created)
+    return (source_rank, has_shares, created)
 
 
 def _reco_keep_score(row: dict[str, Any]) -> tuple:

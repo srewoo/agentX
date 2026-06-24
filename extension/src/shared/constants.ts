@@ -38,6 +38,7 @@ export const SIGNAL_TYPE_LABELS: Record<string, string> = {
   pead: "Post-Earnings Drift",
   quality_breakout: "Quality Breakout",
   unusual_options_activity: "Unusual Options Activity",
+  quality_value_52w_low: "Quality Value (52w Low)",
 };
 
 // Derived timeframe for each signal type
@@ -79,6 +80,8 @@ export const SIGNAL_TIMEFRAME: Record<string, "Intraday" | "Swing" | "Long-term"
   quality_breakout: "Long-term",
   // Unusual options flow is typically a short-fuse signal.
   unusual_options_activity: "Swing",
+  // Module A: QV + 52w-low, 180-day hold by design → Long-term.
+  quality_value_52w_low: "Long-term",
 };
 
 // Derive action label from direction
@@ -103,47 +106,23 @@ export const DIRECTION_COLORS: Record<string, string> = {
 /**
  * Resolve the display timeframe for a signal.
  *
- * Beyond the static type → timeframe table we promote high-conviction
- * patterns to longer horizons, because the same chart pattern at
- * strength 9 implies a multi-week setup, not the 1–5 day "Swing" hold
- * its base type suggests. Without this, the Long-term tab was almost
- * always empty (only cup_and_handle / 52w extremes ever landed there).
+ * Timeframe is a property of the signal TYPE — each detector encodes its
+ * own natural horizon (a gap is an intraday/next-day event; a chart
+ * pattern plays out over a swing; a quality/value setup is a multi-month
+ * hold). Conviction is a SEPARATE axis, already surfaced as `strength` on
+ * the card, so we deliberately do NOT let strength move a signal between
+ * timeframe tabs.
  *
- * Promotion rules:
- *   - High-strength multi-bar reversal/continuation patterns → Long-term
- *   - High-strength swing patterns → still Swing (no demotion to Intraday)
- *   - Single-day candle patterns never promote past Swing
+ * History: an earlier version promoted high-strength signals to longer
+ * horizons. In practice the detectors saturate near the top of the
+ * strength scale (gaps fire 7–10, double_top fires 10), so the promotion
+ * thresholds sat below the firing floor and promoted ~everything —
+ * emptying the Intraday tab and making the mapping non-deterministic.
+ * Removed in favour of this pure type → timeframe lookup. The `strength`
+ * argument is retained for call-site stability and a possible future
+ * "horizon badge" that annotates conviction without re-bucketing.
  */
-const _LONG_TERM_PROMOTION_AT_STRENGTH_8: ReadonlySet<string> = new Set([
-  "breakout",
-  "head_and_shoulders",
-  "inverse_head_and_shoulders",
-  "double_top",
-  "double_bottom",
-  "consolidation_breakout",
-]);
-
-const _SWING_PROMOTION_AT_STRENGTH_7: ReadonlySet<string> = new Set([
-  // Intraday candle patterns escalate to Swing on a strong reading —
-  // they tend to play out over 2–4 sessions when conviction is high.
-  "bullish_engulfing",
-  "bearish_engulfing",
-  "hammer",
-  "shooting_star",
-  "gap_up",
-  "gap_down",
-]);
-
-export function getSignalTimeframe(signalType: string, strength: number): "Intraday" | "Swing" | "Long-term" {
-  // Legacy override kept for explicit breakout/strength=7 coverage.
-  if (signalType === "breakout" && strength >= 7) return "Long-term";
-
-  if (strength >= 8 && _LONG_TERM_PROMOTION_AT_STRENGTH_8.has(signalType)) {
-    return "Long-term";
-  }
-  if (strength >= 7 && _SWING_PROMOTION_AT_STRENGTH_7.has(signalType)) {
-    return "Swing";
-  }
+export function getSignalTimeframe(signalType: string, _strength?: number): "Intraday" | "Swing" | "Long-term" {
   return SIGNAL_TIMEFRAME[signalType] ?? "Swing";
 }
 

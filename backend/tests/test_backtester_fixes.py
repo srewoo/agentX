@@ -104,3 +104,22 @@ class TestVixThresholds:
         base = {"price_spike_pct": "3.0"}
         result = get_vix_adjusted_thresholds(None, base)
         assert result == base
+
+
+class TestFoldMetricsCounts:
+    """Item 7: _fold_metrics must expose raw wins/evaluated counts so the
+    autonomous gating loop can build OOS significance candidates directly,
+    excluding neutral trades. Pins the contract the orchestrator depends on."""
+
+    def test_exposes_wins_and_evaluated_excluding_neutral(self):
+        from app.services.backtester_walk_forward import _fold_metrics
+        trades = [
+            {"win_5d": True, "pnl_5d": 2.0},
+            {"win_5d": False, "pnl_5d": -1.0},
+            {"win_5d": True, "pnl_5d": 1.5},
+            {"neutral_5d": True, "win_5d": False, "pnl_5d": 0.0},  # excluded
+        ]
+        m = _fold_metrics(trades, [5])
+        assert m["wins_5d"] == 2
+        assert m["evaluated_5d"] == 3  # neutral excluded
+        assert m["win_rate_5d"] == pytest.approx(66.67, abs=0.01)
