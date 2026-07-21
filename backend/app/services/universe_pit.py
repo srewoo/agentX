@@ -33,6 +33,16 @@ logger = logging.getLogger(__name__)
 # Optional data drop. Absent by default — see module docstring.
 _HISTORY_CSV = Path(__file__).resolve().parent.parent.parent / "models" / "nse_constituents_history.csv"
 
+# Completeness guard (3.2). The decisive integrity check is TURNOVER: a CSV that
+# encodes no `removed` dates is a snapshot of *today's* members, and applying it
+# to the past re-introduces the exact survivorship bias this module removes — so
+# a no-turnover file is never trusted. A tiny sanity floor also rejects a
+# near-empty file. This is a heuristic, not a proof: a file that bolts a couple
+# of removals onto an otherwise-current snapshot can still be biased, so genuine
+# completeness remains a data-entry responsibility (see the CSV template header).
+_MIN_MEMBERS_FOR_PIT = 2
+
+
 
 def _to_date(v: object) -> Optional[date]:
     if not v:
@@ -108,9 +118,15 @@ def get_universe_at_date(
     if has_constituent_history() and asof_d is not None:
         rows = _load_history()
         syms = members_at(rows, asof_d)
-        if syms:
+        has_turnover = any(r.get("removed") is not None for r in rows)
+        # Only trust the CSV as survivorship-free when it's plausibly complete
+        # AND encodes real turnover — otherwise it's a biased snapshot.
+        if len(syms) >= _MIN_MEMBERS_FOR_PIT and has_turnover:
             return (syms[:limit] if limit else syms), True
-        logger.warning("universe_pit: history CSV present but no members at %s — falling back", asof_d)
+        logger.warning(
+            "universe_pit: history CSV at %s is incomplete (members=%d < %d or "
+            "no turnover=%s) — NOT trusting as survivorship-free, falling back",
+            asof_d, len(syms), _MIN_MEMBERS_FOR_PIT, not has_turnover)
 
     # Fallback: today's static list. Survivorship bias remains.
     from app.services.data_fetcher import MAJOR_STOCKS

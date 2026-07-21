@@ -4,6 +4,7 @@ import { Disclaimer } from "../components/Disclaimer";
 import TodaysPlan from "../components/TodaysPlan";
 import NewsPanel from "../components/NewsPanel";
 import InsightsCard from "../components/InsightsCard";
+import ScorecardCard from "../components/ScorecardCard";
 import LiveMacroSnapshot from "../components/LiveMacroSnapshot";
 import { useSignals } from "../hooks/useSignals";
 import { useAudioAlerts } from "../hooks/useAudioAlerts";
@@ -308,7 +309,7 @@ export default function Dashboard({ onSelectSymbol }: DashboardProps = {}) {
           )}
         </div>
         <div className="flex gap-2">
-          {unreadCount > 0 && (
+          {!cleared && filteredSignals.length > 0 && (
             <button
               onClick={handleMarkAllRead}
               className="text-xs text-zinc-500 hover:text-zinc-300"
@@ -330,9 +331,14 @@ export default function Dashboard({ onSelectSymbol }: DashboardProps = {}) {
         </div>
       </div>
 
+      {/* North-star scorecard — leads the dashboard so every decision keys off
+          cost-adjusted excess expectancy + N/300, not the win-rate below. */}
+      <ScorecardCard />
+
       {/* Performance summary — rolling window so numbers move as outcomes
           evaluate. Lifetime aggregates barely shift once n grows past a
-          few thousand, which made the bar feel static. */}
+          few thousand, which made the bar feel static. NOTE: win rate here is
+          a SUPPORTING stat — the ScorecardCard above is the objective. */}
       {perfSummary && (
         <div
           className="flex items-center justify-center gap-3 px-3 py-1.5 border-b border-border bg-zinc-900/40 text-[11px]"

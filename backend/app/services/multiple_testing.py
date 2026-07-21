@@ -80,12 +80,37 @@ def benjamini_hochberg(pvalues: list[float], alpha: float = 0.05) -> list[bool]:
     return keep
 
 
+def wilson_lower_bound(wins: int, n: int, z: float = 1.96) -> float:
+    """Wilson score lower bound of a win-rate proportion (0.0 for empty n).
+
+    The conservative end of the confidence interval — used by the per-signal
+    kill rule so a combo dies only when even the *optimistic* case for it is
+    weak, not on a single unlucky sample.
+    """
+    if n <= 0:
+        return 0.0
+    p = max(0.0, min(1.0, wins / n))
+    z2 = z * z
+    denom = 1.0 + z2 / n
+    centre = p + z2 / (2 * n)
+    margin = z * math.sqrt((p * (1 - p) + z2 / (4 * n)) / n)
+    return max(0.0, (centre - margin) / denom)
+
+
 @dataclass(frozen=True)
 class Candidate:
-    """A combo's win record put forward for promotion."""
+    """A combo's win record put forward for promotion.
+
+    ``wins``/``n`` are the (typically backtest / walk-forward) record the FDR
+    gate scores. ``live_wins``/``live_n`` are the FORWARD (paper/live) record,
+    used by the per-signal kill rule and to justify overturning an irreversible
+    demotion — backtest passes alone can't re-promote a demoted combo.
+    """
     key: str
     wins: int
     n: int
+    live_wins: int = 0
+    live_n: int = 0
 
 
 @dataclass(frozen=True)

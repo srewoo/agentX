@@ -134,6 +134,13 @@ _DEFAULT_MIN_STOCK_PRICE = 10.0
 # Sector concentration — max open positions per sector
 _MAX_SECTOR_POSITIONS = 2
 
+# Meta-judge deploy sanity gates. A trained model must (a) beat noise on AUC,
+# (b) keep a non-trivial fraction of its holdout (else it keeps ~0 live and
+# blocks every scan), and (c) not demand a near-certain probability to keep a
+# trade. A model failing (b)/(c) is degenerate and falls back to mutes-only.
+_META_JUDGE_MIN_KEEP_RATE = 0.10   # must keep ≥10% of holdout candidates
+_META_JUDGE_MAX_THRESHOLD = 0.90   # operating threshold above this is degenerate
+
 
 def is_market_open() -> bool:
     """Check if NSE/BSE is currently open (9:15 AM - 3:30 PM IST, Mon-Fri)."""
@@ -290,6 +297,36 @@ async def get_scan_status() -> dict:
         }
 
 
+def _dedup_by_sector(
+    signals: list[dict],
+    sector_lookup: dict[str, str],
+    max_positions: int,
+) -> list[dict]:
+    """Cap correlated signals: keep only the strongest `max_positions` per sector.
+
+    Signals must arrive pre-sorted strongest-first. Symbols with a KNOWN sector
+    share a concentration bucket (they move together). Symbols with no sector
+    mapping (or "Unknown") get their OWN bucket keyed by symbol — they are NOT
+    collapsed into one giant "Unknown" group, which previously capped the whole
+    scan at `max_positions` unrelated names and silently starved the feed.
+    """
+    sector_count: dict[str, int] = {}
+    kept: list[dict] = []
+    for sig in signals:
+        sym = sig["symbol"]
+        mapped = sector_lookup.get(sym)
+        sector = mapped if mapped and mapped != "Unknown" else f"__unmapped__:{sym}"
+        sector_count[sector] = sector_count.get(sector, 0) + 1
+        if sector_count[sector] <= max_positions:
+            kept.append(sig)
+        else:
+            logger.debug(
+                "Sector concentration limit: dropping %s (%s) — already have %d in %s",
+                sym, sig.get("signal_type"), max_positions, sector,
+            )
+    return kept
+
+
 async def _store_signals(signals: list[dict]) -> None:
     """Persist signals to SQLite."""
     if not signals:
@@ -365,8 +402,14 @@ async def run_scan_cycle() -> list[dict]:
         "breakout_min_score": db_settings.get("breakout_min_score", "4"),
     }
 
-    # Build scan list: watchlist + TradingView pre-screened stocks (momentum/volume/price extremes).
-    # This replaces scanning ALL 160+ MAJOR_STOCKS — only scan watchlist + pre-screened.
+    # Build scan list: watchlist (priority) + TradingView pre-screened movers +
+    # the WIDE liquid universe (Phase 1.1 — 200+ liquid NSE names, ADV ≥ ₹5cr).
+    # The liquid universe is UNIONED in on every scan (not just as a pre-screen
+    # fallback) so the forward-test funnel is fed a broad, diverse candidate set
+    # — the pre-screener alone returns a narrow, often sector-skewed ~85 movers,
+    # which starves cadence. Every downstream guardrail (conviction floor, Kelly
+    # edge, risk gate, exposure/correlation/sector caps, per-symbol ADV floor)
+    # still applies — we widen breadth, never loosen the gates.
     watchlist_symbols = await _get_watchlist_symbols()
     watchlist_set = set(watchlist_symbols)
     # Per-symbol exchange map. Watchlist rows can be NSE or BSE; anything not
@@ -399,12 +442,15 @@ async def run_scan_cycle() -> list[dict]:
             all_symbols.append(sym)
             seen.add(sym)
 
-    # 3. Fallback: if pre-screening returned nothing, use MAJOR_STOCKS
-    if not pre_screened:
-        for s in MAJOR_STOCKS:
-            if s["symbol"] not in seen:
-                all_symbols.append(s["symbol"])
-                seen.add(s["symbol"])
+    # 3. The WIDE liquid universe (Phase 1.1 — 200+ liquid NSE names), unioned
+    #    in on EVERY scan so the funnel isn't limited to the pre-screener's
+    #    narrow ~85 movers. The per-symbol ADV floor + all entry guardrails
+    #    still gate what actually trades; this only widens what's *considered*.
+    from app.services.liquid_universe import liquid_symbols
+    for sym in liquid_symbols():
+        if sym not in seen:
+            all_symbols.append(sym)
+            seen.add(sym)
 
     # ── Fetch market-wide context in parallel (FII/DII, VIX, F&O ban, earnings) ─
     fii_dii_data: dict = {}
@@ -509,7 +555,13 @@ async def run_scan_cycle() -> list[dict]:
     min_price = float(db_settings.get("min_stock_price", _DEFAULT_MIN_STOCK_PRICE))
 
     # Build sector lookup from MAJOR_STOCKS for sector concentration check
+    # Sector lookup spans MAJOR_STOCKS + the wide liquid universe (1.1) so the
+    # sector-concentration guardrail still resolves for the widened funnel
+    # rather than defaulting new names to "Unknown".
+    from app.services.liquid_universe import LIQUID_UNIVERSE
     _sector_lookup: dict[str, str] = {s["symbol"]: s.get("sector", "Unknown") for s in MAJOR_STOCKS}
+    for s in LIQUID_UNIVERSE:
+        _sector_lookup.setdefault(s["symbol"], s.get("sector", "Unknown"))
 
     # Rate-limited concurrent fetching (max 3 concurrent to avoid yfinance rate limits)
     semaphore = asyncio.Semaphore(3)
@@ -571,6 +623,25 @@ async def run_scan_cycle() -> list[dict]:
                 if current_price and current_price < min_price:
                     logger.debug("Skipping %s — price Rs.%.2f below minimum Rs.%.2f", sym, current_price, min_price)
                     return []
+
+                # ── Liquidity floor (1.1) ─────────────────────────────────────
+                # The widened funnel must not admit names too thin to fill a
+                # paper order honestly. Prune when ADV is MEASURABLE and below
+                # the ₹5cr floor; watchlist names the user explicitly chose are
+                # exempt, and an unmeasurable ADV never prunes (fail-open here,
+                # since curated membership is already a liquidity proxy).
+                if sym not in watchlist_set:
+                    try:
+                        from app.services.liquid_universe import (
+                            compute_adv_cr, DEFAULT_ADV_FLOOR_CR,
+                        )
+                        adv_cr = compute_adv_cr(df)
+                        if adv_cr is not None and adv_cr < DEFAULT_ADV_FLOOR_CR:
+                            logger.debug("Skipping %s — ADV Rs.%.2fcr below floor Rs.%.1fcr",
+                                         sym, adv_cr, DEFAULT_ADV_FLOOR_CR)
+                            return []
+                    except Exception as e:
+                        logger.debug("liquidity floor check skipped for %s: %s", sym, e)
 
                 # ── F&O ban filter ────────────────────────────────────────────
                 if sym in fno_ban_set:
@@ -835,20 +906,7 @@ async def run_scan_cycle() -> list[dict]:
     # If 3+ signals fire for the same sector, keep only the strongest 2.
     # This prevents the system from flooding signals on banking/IT when the
     # whole sector moves, which would all be correlated positions.
-    sector_count: dict[str, int] = {}
-    sector_deduplicated: list[dict] = []
-    for sig in filtered:
-        sym = sig["symbol"]
-        sector = _sector_lookup.get(sym, "Unknown")
-        sector_count[sector] = sector_count.get(sector, 0) + 1
-        if sector_count[sector] <= _MAX_SECTOR_POSITIONS:
-            sector_deduplicated.append(sig)
-        else:
-            logger.debug(
-                "Sector concentration limit: dropping %s (%s) — already have %d signals in %s sector",
-                sym, sig["signal_type"], _MAX_SECTOR_POSITIONS, sector,
-            )
-    filtered = sector_deduplicated
+    filtered = _dedup_by_sector(filtered, _sector_lookup, _MAX_SECTOR_POSITIONS)
 
     # LLM enrichment: max 1 call per cycle, for the strongest signal
     if filtered:
@@ -914,19 +972,35 @@ async def run_scan_cycle() -> list[dict]:
         from app.services.meta_judge_trainer import load_active
         candidate = load_active()
         if candidate is not None:
-            holdout_auc = (
-                (candidate.train_meta or {})
-                .get("holdout_metrics", {})
-                .get("auc", 0.0)
-            )
-            if holdout_auc and float(holdout_auc) >= 0.55:
-                mj_model = candidate
-                logger.info("meta_judge: active (holdout AUC=%.3f)", float(holdout_auc))
-            else:
+            hm = (candidate.train_meta or {}).get("holdout_metrics", {}) or {}
+            holdout_auc = float(hm.get("auc", 0.0) or 0.0)
+            # Keep-rate sanity: a model that kept a pathologically tiny fraction
+            # of the holdout (e.g. 4/109 = 3.7% by over-fitting the operating
+            # threshold to a handful of "perfect" trades, threshold→0.99) will
+            # keep ~0% of live signals and silently block EVERY scan. That is
+            # strictly worse than no model, so it must fail the deploy gate and
+            # fall back to mutes-only. This was starving the whole funnel.
+            n_kept = int(hm.get("n_kept", 0) or 0)
+            n_dropped = int(hm.get("n_dropped", 0) or 0)
+            keep_rate = n_kept / (n_kept + n_dropped) if (n_kept + n_dropped) else 0.0
+            thr = float(getattr(candidate, "threshold", 0.5) or 0.5)
+            if holdout_auc < 0.55:
                 logger.info(
-                    "meta_judge: model present but holdout AUC=%.3f < 0.55; "
-                    "skipping to avoid adding noise (mutes + PROMOTED override carry it)",
-                    float(holdout_auc) if holdout_auc else 0.0,
+                    "meta_judge: holdout AUC=%.3f < 0.55; skipping (mutes + PROMOTED carry it)",
+                    holdout_auc,
+                )
+            elif keep_rate < _META_JUDGE_MIN_KEEP_RATE or thr >= _META_JUDGE_MAX_THRESHOLD:
+                logger.warning(
+                    "meta_judge: DEGENERATE model rejected — keep_rate=%.1f%% (min %.0f%%), "
+                    "threshold=%.3f (max %.2f). It would block ~all live signals; "
+                    "falling back to mutes-only. Retrain needed.",
+                    keep_rate * 100, _META_JUDGE_MIN_KEEP_RATE * 100, thr, _META_JUDGE_MAX_THRESHOLD,
+                )
+            else:
+                mj_model = candidate
+                logger.info(
+                    "meta_judge: active (holdout AUC=%.3f, keep_rate=%.1f%%, threshold=%.3f)",
+                    holdout_auc, keep_rate * 100, thr,
                 )
     except Exception as _e:
         logger.debug("meta_judge load skipped: %s", _e)
@@ -1340,6 +1414,56 @@ class SignalOrchestrator:
         except Exception as e:
             logger.warning("Weekly meta-label refit failed: %s", e)
 
+        # 2.4 — refit the conviction model over the same factors as the
+        # hand-tuned multiplier stack. It only DEPLOYS when it beats that stack
+        # on a chronological holdout, so a noisy refit can't degrade live
+        # conviction; otherwise the multiplicative stack keeps serving.
+        try:
+            from app.services.conviction_model import train_conviction_model
+            cm_res = await train_conviction_model()
+            logger.info(
+                "Weekly conviction-model refit: status=%s deployed=%s lift=%s",
+                cm_res.get("status"), cm_res.get("deployed"),
+                cm_res.get("expectancy_lift"),
+            )
+        except Exception as e:
+            logger.warning("Weekly conviction-model refit failed: %s", e)
+
+        # 3.3 — cross-source reconciliation + data-quality ledger over a bounded
+        # liquid subset. Records close disagreements (>0.5%) and residual
+        # suspicious jumps so data bugs surface at /api/health, not in a backtest.
+        try:
+            from app.services.data_quality import run_reconciliation
+            from app.services.data_fetcher import MAJOR_STOCKS
+            recon_syms = [s["symbol"] for s in MAJOR_STOCKS
+                          if not s["symbol"].startswith("^")][:40]
+            dq_res = await run_reconciliation(recon_syms)
+            logger.info("Data-quality reconciliation: %s", dq_res)
+        except Exception as e:
+            logger.warning("Data-quality reconciliation failed: %s", e)
+
+        # 3.1 — nightly ingest into the persistent PIT price store. Adjustment
+        # applied once at write time; consumers read the store for reproducible,
+        # never-re-fetched history.
+        try:
+            from app.services.pit_price_store import ingest_universe
+            from app.services.data_fetcher import MAJOR_STOCKS
+            pit_syms = [s["symbol"] for s in MAJOR_STOCKS
+                        if not s["symbol"].startswith("^")][:40]
+            pit_res = await ingest_universe(pit_syms, period="5y")
+            logger.info("PIT price store ingest: %s", pit_res)
+        except Exception as e:
+            logger.warning("PIT price store ingest failed: %s", e)
+
+        # 4.1 — weekly calibration snapshot + drift alert (predicted vs realized
+        # by decile; alert when high-conviction bins under-deliver 2 weeks running).
+        try:
+            from app.services.calibration_monitor import run_weekly_calibration_check
+            cal_res = await run_weekly_calibration_check()
+            logger.info("Weekly calibration check: %s", cal_res)
+        except Exception as e:
+            logger.warning("Weekly calibration check failed: %s", e)
+
         # Auto-retrain the deterministic AdaBoost meta-judge from resolved
         # outcomes. It only *deploys* when holdout AUC ≥ 0.55 (gate lives in
         # the scan path), so a noisy retrain can't degrade live filtering —
@@ -1668,6 +1792,11 @@ class SignalOrchestrator:
                 if not throttled:
                     wf = await run_universe_walk_forward(symbols=all_syms, period=period)
                     by_sig = wf.get("by_signal_type_oos") or {}
+                    # Live (forward) record per combo — feeds the per-signal kill
+                    # rule and the re-promotion bar (1.3). Backtest passes alone
+                    # can't revive a forward-refuted combo.
+                    from app.services.forward_report import live_combo_records
+                    live = await live_combo_records()
                     cands = []
                     for stype, dirs in by_sig.items():
                         for direction, m in (dirs or {}).items():
@@ -1676,7 +1805,11 @@ class SignalOrchestrator:
                             wins = int(m.get("wins_5d") or 0)
                             n = int(m.get("evaluated_5d") or 0)
                             if n > 0:
-                                cands.append(Candidate(key=f"{stype}|{direction}", wins=wins, n=n))
+                                key = f"{stype}|{direction}"
+                                lw, ln = live.get(key, (0, 0))
+                                cands.append(Candidate(
+                                    key=key, wins=wins, n=n,
+                                    live_wins=lw, live_n=ln))
                     if cands:
                         res = await gating_state.update_gating_state(cands)
                         loaded = await gating_state.seed_overlay()

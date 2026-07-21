@@ -94,8 +94,6 @@ class UpdateSettingsRequest(BaseModel):
     upstox_access_token: Optional[str] = Field(None, max_length=4000)
     upstox_api_key: Optional[str] = Field(None, max_length=200)
     upstox_api_secret: Optional[str] = Field(None, max_length=200)
-    # ── Twelve Data keyed fallback ───────────────────────────────────────
-    twelvedata_api_key: Optional[str] = Field(None, max_length=200)
     # ── Financial Modeling Prep + Finnhub (fundamentals / earnings / macro) ─
     fmp_api_key: Optional[str] = Field(None, max_length=200)
     finnhub_api_key: Optional[str] = Field(None, max_length=200)

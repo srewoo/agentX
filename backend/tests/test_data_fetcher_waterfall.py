@@ -4,7 +4,7 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-from app.services import data_fetcher, source_health
+from app.services import data_fetcher, price_adjuster, source_health
 
 
 def _df(n=10):
@@ -17,12 +17,19 @@ def _df(n=10):
 @pytest.fixture(autouse=True)
 def _reset(monkeypatch):
     source_health.reset()
-    # Default: no token, no twelvedata key.
+    price_adjuster.reset_split_cache()
+    # Default: no Upstox token.
     async def _settings():
         return {}
     monkeypatch.setattr(data_fetcher, "_get_data_settings", _settings)
+
+    # Keep the raw-source normalization hermetic — no live split lookups.
+    async def _no_splits(symbol):
+        return []
+    monkeypatch.setattr(price_adjuster, "get_split_events", _no_splits)
     yield
     source_health.reset()
+    price_adjuster.reset_split_cache()
 
 
 @pytest.mark.asyncio
@@ -53,14 +60,14 @@ async def test_upstox_used_first_when_token_present(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_falls_through_to_jugaad_when_nse_empty(monkeypatch):
+async def test_falls_through_to_yfinance_when_nse_empty(monkeypatch):
     async def _nse(*a, **k):
         return pd.DataFrame()  # NSE 403/empty
     monkeypatch.setattr(data_fetcher, "nse_fetch_history", _nse)
 
-    async def _jugaad(symbol, days):
+    async def _yf(symbol, period, interval, exchange):
         return _df()
-    monkeypatch.setattr(data_fetcher, "_jugaad_fetch", _jugaad)
+    monkeypatch.setattr(data_fetcher, "_yfinance_with_cooldown", _yf)
 
     out = await data_fetcher.async_fetch_history("RELIANCE", period="1y")
     assert not out.empty
@@ -79,13 +86,13 @@ async def test_parked_source_is_skipped(monkeypatch):
         return _df()
     monkeypatch.setattr(data_fetcher, "nse_fetch_history", _nse)
 
-    async def _jugaad(symbol, days):
+    async def _yf(symbol, period, interval, exchange):
         return _df()
-    monkeypatch.setattr(data_fetcher, "_jugaad_fetch", _jugaad)
+    monkeypatch.setattr(data_fetcher, "_yfinance_with_cooldown", _yf)
 
     out = await data_fetcher.async_fetch_history("RELIANCE", period="1y")
     assert not out.empty
-    assert nse_called["n"] == 0  # skipped while parked
+    assert nse_called["n"] == 0  # skipped while parked (yfinance served instead)
 
 
 @pytest.mark.asyncio

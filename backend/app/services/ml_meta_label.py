@@ -271,6 +271,8 @@ async def train_meta_label_model(
         trained_on = "all"
     final = _fit(Cls, fit_X, fit_y)
 
+    deployed, gate_reason = _passes_deploy_gate(holdout)
+
     _MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(_MODEL_PATH, "wb") as f:
         pickle.dump({
@@ -284,10 +286,18 @@ async def train_meta_label_model(
             "kind": "sklearn_gbm" if Cls is not None else "logistic_fallback",
         }, f)
 
-    global _in_memory_model
-    _in_memory_model = final
+    global _in_memory_model, _gate_rejected
+    if deployed:
+        _in_memory_model = final
+        _gate_rejected = False
+    else:
+        _in_memory_model = None
+        _gate_rejected = True
+        logger.warning("meta-label model trained but NOT deployed: %s", gate_reason)
     return {
         "status": "trained",
+        "deployed": deployed,
+        "deploy_gate": gate_reason,
         "samples": len(X),
         "trained_on": trained_on,
         "cv_accuracy_mean": round(sum(cv_scores) / max(1, len(cv_scores)), 4),
@@ -299,16 +309,53 @@ async def train_meta_label_model(
     }
 
 
+# ── Deploy gate ───────────────────────────────────────────────
+# Mirror of meta_judge's holdout-AUC gate. Before this existed the GBM was
+# applied to every recommendation whenever a pickle was on disk — a poorly-fit
+# model silently gated the whole pipeline. A model now serves predictions only
+# when its chronological holdout PROVED the filter adds expectancy on unseen
+# data. Fail-closed: no holdout evidence (too few samples, legacy pickle) → not
+# deployed.
+_DEPLOY_MIN_HOLDOUT_N = 40
+_DEPLOY_MIN_EXPECTANCY_LIFT = 0.0  # strictly-positive lift required
+
+_gate_rejected = False  # fast-path memo so a rejected pickle isn't re-read per call
+
+
+def _passes_deploy_gate(holdout: dict[str, Any] | None) -> tuple[bool, str]:
+    """Judge holdout evidence. Returns (deployable, human-readable reason)."""
+    if not holdout:
+        return False, "no chronological holdout evidence (fail-closed)"
+    n = int(holdout.get("holdout_n") or 0)
+    lift = holdout.get("holdout_expectancy_lift")
+    if n < _DEPLOY_MIN_HOLDOUT_N:
+        return False, f"holdout_n={n} < {_DEPLOY_MIN_HOLDOUT_N}"
+    if lift is None or float(lift) <= _DEPLOY_MIN_EXPECTANCY_LIFT:
+        return False, f"holdout_expectancy_lift={lift} — filter adds no value on unseen data"
+    return True, f"holdout_n={n}, expectancy_lift=+{float(lift):.3f}"
+
+
 def load_meta_label_model() -> Optional[Any]:
-    """Load the persisted model, or return None if not yet trained."""
-    global _in_memory_model
+    """Load the persisted model, or None when untrained OR gate-rejected.
+
+    The deploy gate is enforced at load time too, so a stale/legacy pickle
+    without positive holdout evidence never silently gates recommendations.
+    """
+    global _in_memory_model, _gate_rejected
     if _in_memory_model is not None:
         return _in_memory_model
+    if _gate_rejected:
+        return None
     if not _MODEL_PATH.exists():
         return None
     try:
         with open(_MODEL_PATH, "rb") as f:
             bundle = pickle.load(f)
+        ok, reason = _passes_deploy_gate(bundle.get("holdout"))
+        if not ok:
+            logger.warning("meta-label model on disk NOT deployed: %s", reason)
+            _gate_rejected = True
+            return None
         _in_memory_model = bundle.get("model")
         return _in_memory_model
     except Exception as e:

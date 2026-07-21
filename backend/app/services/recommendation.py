@@ -389,6 +389,25 @@ def calibrated_conviction(
         f"Calibrated from raw score {base}/100 using "
         f"{agreement:.0%} factor agreement, R:R {risk_reward:.2f}, regime {regime}."
     )
+
+    # 2.4 — if a fitted conviction model has EARNED deployment (beat this
+    # hand-tuned stack on a chronological holdout), let it replace the
+    # multiplicative constants. Fail-safe: returns None ⇒ keep the stack.
+    try:
+        from app.services.conviction_model import model_conviction
+        fitted = model_conviction(
+            weighted_score=weighted, agreement=agreement,
+            risk_reward=risk_reward, regime=regime)
+        if fitted is not None:
+            note = (
+                f"Fitted conviction model (deployed): {fitted}/100 over "
+                f"score={base}, agreement={agreement:.0%}, R:R {risk_reward:.2f}, "
+                f"regime {regime}. Replaces the hand-tuned multiplier stack."
+            )
+            return fitted, round(agreement, 3), note
+    except Exception as e:
+        logger.debug("conviction model consult skipped: %s", e)
+
     return conviction, round(agreement, 3), note
 
 

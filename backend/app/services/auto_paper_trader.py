@@ -34,8 +34,13 @@ logger = logging.getLogger(__name__)
 
 # Defaults — overridable via the settings table.
 DEFAULT_MIN_CONVICTION = 65
-DEFAULT_MAX_PER_DAY = 5
-DEFAULT_MAX_OPEN_POSITIONS = 12
+# 1.1 — widened forward-test funnel. A 200+ name universe can supply enough
+# candidates to sustain ≥25 trades/week; the book must be deep enough to hold
+# them given ~7-day time exits (5-8 new/day × ~7-day hold ⇒ ~30-40 concurrent).
+# Per-trade notional shrinks with the book (kelly_sizing.per_position_cap_pct)
+# so total gross exposure is unchanged vs the old 12-position book.
+DEFAULT_MAX_PER_DAY = 8
+DEFAULT_MAX_OPEN_POSITIONS = 30
 
 # Time-exit horizons (calendar days), derived from the signal_outcomes
 # backtest hold periods: the validated short-fuse setups resolve in a
@@ -107,20 +112,21 @@ def _win_probability(conviction: float) -> float:
 
 
 def _effective_win_prob(conviction: float, meta_label_prob: Optional[float]) -> float:
-    """Win probability to size Kelly on (B1).
+    """Win probability to size Kelly on (B1) — ONE probability source, used once.
 
-    The conviction map (`_win_probability`) is a hand-tuned heuristic. When the
-    recommendation carries an out-of-sample meta-label probability — a measured
-    p(win) from the trained secondary classifier — we bet off the **more
-    conservative** of the two. Taking the min means a weak measured edge always
-    shrinks the bet (and can drop it to zero via Kelly), while a strong
-    measured edge never *inflates* it beyond the conviction-only ceiling. With
-    no meta-label deployed yet, this is exactly the old behaviour.
+    When the recommendation carries a measured out-of-sample meta-label p(win),
+    that IS the sizing probability, clamped to the same conservative bounds as
+    the conviction map. The old ``min(conv_p, meta_p)`` double-counted a weak
+    p(win): the meta gate upstream (recommendation.py) had already scaled
+    conviction by p_meta, so the min shrank the bet by the same signal twice.
+    Without a deployed meta model, the conviction-only heuristic applies.
     """
-    conv_p = _win_probability(conviction)
-    if meta_label_prob is None:
-        return conv_p
-    return min(conv_p, max(0.0, min(1.0, float(meta_label_prob))))
+    if meta_label_prob is not None:
+        # Cap (never imply more edge than measured) but NO floor — flooring a
+        # weak measured p(win) upward would inflate the bet, the opposite of
+        # conservative. A low p simply lets Kelly skip the trade.
+        return min(_WIN_PROB_CAP, max(0.0, float(meta_label_prob)))
+    return _win_probability(conviction)
 
 
 async def _fetch_volatility(symbol: str) -> tuple[Optional[float], Optional[float]]:
@@ -321,28 +327,15 @@ async def auto_open_from_recommendations(
     except Exception:
         open_positions_rows = []
 
-    # ── directional-concentration tally ──────────────────────────────────
-    # Seed from the current open book, then keep it current as we open within
-    # this cycle so the cap is cumulative across multiple opens (mirrors the
-    # B3 exposure-cap bookkeeping below).
-    dir_counts: dict[str, int] = {"bullish": 0, "bearish": 0}
-    for p in open_positions_rows:
-        d = p.get("direction")
-        if d in dir_counts:
-            dir_counts[d] += 1
+    # ── 2.2: delegate the entry decision to the pure decision core ──
+    # All IO (already-open, correlation, ATR/ADX, earnings) is resolved here,
+    # then decide() applies the SAME rules the backtest uses. One decision
+    # function, live and backtest — no drift.
+    from app.services.decision_core import (
+        EntryCandidate, PortfolioCtx, DecisionConfig, decide,
+    )
 
-    def _would_breach_concentration(direction: str) -> bool:
-        """True if opening one more `direction` position would push that side
-        above the concentration cap on a book of at least the floor size."""
-        if max_directional_concentration >= 1.0:
-            return False  # cap disabled
-        proj_dir = dir_counts.get(direction, 0) + 1
-        proj_total = dir_counts["bullish"] + dir_counts["bearish"] + 1
-        if proj_total < max(1, min_positions_for_concentration):
-            return False  # too few positions for the cap to be meaningful
-        return (proj_dir / proj_total) > max_directional_concentration
-
-    # Capital floor for the risk gate: best-effort from settings, fallback 100k.
+    # Capital floor for sizing/gate: best-effort from settings, fallback 100k.
     capital = 100_000.0
     try:
         async with aiosqlite.connect(DB_PATH) as db:
@@ -355,11 +348,9 @@ async def auto_open_from_recommendations(
     except Exception:
         pass
 
-    # Lazy-import these so missing modules don't break the existing path.
+    # Risk-gate availability decides whether decide() runs the 10-rule gate.
     try:
-        from app.services.risk_gate import (
-            TradeCandidate, PortfolioState, evaluate_trade, GateVerdict,
-        )
+        import app.services.risk_gate as _rg  # noqa: F401
         _risk_gate_available = True
     except Exception:
         _risk_gate_available = False
@@ -370,132 +361,49 @@ async def auto_open_from_recommendations(
     except Exception:
         _corr_available = False
 
-    try:
-        from app.services.kelly_sizing import kelly_position_size
-        _kelly_available = True
-    except Exception:
-        _kelly_available = False
-
-    # ── B3/B4/B5 portfolio-aware sizing inputs (computed once per cycle) ──
-    try:
-        from app.services.portfolio_sizing import (
-            apply_exposure_caps, correlation_size_multiplier,
-            dynamic_kelly_fraction, drawdown_breaker_tripped,
-        )
-        _psizing_available = True
-    except Exception:
-        _psizing_available = False
-
-    # B4: shrink the Kelly fraction in high-VIX regimes / after a losing streak.
-    from app.services.kelly_sizing import DEFAULT_KELLY_FRACTION
-    dyn_fraction = DEFAULT_KELLY_FRACTION
-    # B3: aggregate the open book for sector + gross/net exposure caps.
+    # Directional tally + gross/net exposure seeded from the current open book.
+    dir_counts: dict[str, int] = {"bullish": 0, "bearish": 0}
     sector_open: dict[str, float] = {}
     gross_open = 0.0
     net_open = 0.0
     for p in open_positions_rows:
+        d = p.get("direction")
+        if d in dir_counts:
+            dir_counts[d] += 1
         val = float(p.get("position_size") or 0.0)
         gross_open += val
-        net_open += val if (p.get("direction") == "bullish") else -val
-    if _psizing_available:
-        try:
-            vix, recent_losses, peak_eq, cur_eq = await _portfolio_risk_state(capital)
-            dyn_fraction = dynamic_kelly_fraction(
-                DEFAULT_KELLY_FRACTION, vix=vix, recent_losses=recent_losses)
-            # B5: halt all new entries while in a deep drawdown.
-            breaker = drawdown_breaker_tripped(peak_eq, cur_eq)
-            if breaker["tripped"]:
-                logger.warning("Drawdown breaker tripped (%.1f%%) — no new auto entries",
-                               breaker["drawdown_pct"])
-                return {
-                    "opened": [],
-                    "skipped_reason_counts": {"drawdown_breaker": len(candidates)},
-                    "today_auto_trades": already_today,
-                    "open_positions": open_pos,
-                    "drawdown_pct": breaker["drawdown_pct"],
-                    "decisions_logged": 0,
-                }
-        except Exception as e:
-            logger.debug("portfolio risk state skipped: %s", e)
+        net_open += val if d == "bullish" else -val
 
-    skip_counts: dict[str, int] = {}
+    # B4/B5 portfolio risk state (VIX, recent-loss streak, equity peak/current).
+    vix = None
+    recent_losses = 0
+    peak_eq = cur_eq = None
+    try:
+        vix, recent_losses, peak_eq, cur_eq = await _portfolio_risk_state(capital)
+    except Exception as e:
+        logger.debug("portfolio risk state skipped: %s", e)
+
+    # ── Resolve per-candidate IO, then build the pure decision inputs. ──
+    open_syms_all = [p["symbol"] for p in open_positions_rows if p.get("symbol")]
+    entry_cands: list[EntryCandidate] = []
+    cand_meta: dict[tuple, tuple] = {}
     for conv, rr, r in candidates:
-        if len(opened) >= budget:
-            skip_counts["budget_exhausted"] = skip_counts.get("budget_exhausted", 0) + 1
-            _record(r, conv, rr, taken=False, skip_reason="budget_exhausted")
-            continue
         sym = getattr(r, "symbol", None) or r.get("symbol")
         action = getattr(r, "action", None) or r.get("action")
         direction = "bullish" if action == "BUY" else "bearish"
-        if await _already_open(sym, direction, today):
-            skip_counts["already_open"] = skip_counts.get("already_open", 0) + 1
-            _record(r, conv, rr, taken=False, skip_reason="already_open", direction=direction)
-            continue
-        # ── directional-concentration guardrail ──
-        # Refuse to add to an already-lopsided book. Candidates are sorted by
-        # conviction desc, so the strongest same-direction names are kept and
-        # only the marginal over-concentrating ones are dropped.
-        if _would_breach_concentration(direction):
-            skip_counts["directional_concentration_cap"] = (
-                skip_counts.get("directional_concentration_cap", 0) + 1
-            )
-            logger.info(
-                "SKIP auto-open %s: directional concentration cap "
-                "(%s book would exceed %.0f%%; open bullish=%d bearish=%d)",
-                sym, direction, max_directional_concentration * 100.0,
-                dir_counts["bullish"], dir_counts["bearish"],
-            )
-            _record(r, conv, rr, taken=False,
-                    skip_reason="directional_concentration_cap", direction=direction)
-            continue
         entry = float(getattr(r, "entry", None) or r.get("entry") or 0)
         sl = float(getattr(r, "stoploss", None) or r.get("stoploss") or 0)
         tgt = float(getattr(r, "target1", None) or r.get("target1") or 0)
-        if entry <= 0 or sl <= 0 or tgt <= 0:
-            skip_counts["invalid_prices"] = skip_counts.get("invalid_prices", 0) + 1
-            _record(r, conv, rr, taken=False, skip_reason="invalid_prices", direction=direction)
-            continue
-        # Strength = floor of conviction/10, clamped 1..10.
-        strength = max(1, min(10, int(conv // 10)))
+        meta_p = getattr(r, "meta_label_prob", None)
+        if meta_p is None and isinstance(r, dict):
+            meta_p = r.get("meta_label_prob")
+        win_prob = _effective_win_prob(conv, meta_p)
+        already = await _already_open(sym, direction, today)
 
-        # ── edge-aware Kelly sizing (the filter) ──
-        # Size the position to its measured edge. A non-positive Kelly
-        # fraction means the trade has no positive expectancy at this
-        # win-probability + reward:risk — we skip it entirely. This is the
-        # deterministic stand-in for the oracle that only bets positive-edge
-        # trades (see kelly_sizing.py / backtest_results/CEILING_ANALYSIS.md).
-        kelly_shares: int | None = None
-        position_size: float | None = None
-        sizing: dict[str, Any] | None = None
-        if _kelly_available:
-            try:
-                meta_p = getattr(r, "meta_label_prob", None)
-                if meta_p is None and isinstance(r, dict):
-                    meta_p = r.get("meta_label_prob")
-                sizing = kelly_position_size(
-                    capital=capital, entry=entry, stop=sl, target=tgt,
-                    win_prob=_effective_win_prob(conv, meta_p), direction=direction,
-                    kelly_fraction_mult=dyn_fraction,  # B4: regime/streak-adjusted
-                )
-                if sizing["skip"]:
-                    skip_counts["negative_kelly_edge"] = skip_counts.get("negative_kelly_edge", 0) + 1
-                    logger.info(
-                        "SKIP auto-open %s: %s (b=%.2f)",
-                        sym, sizing["reason"], sizing["payoff_ratio"],
-                    )
-                    _record(r, conv, rr, taken=False, skip_reason="negative_kelly_edge",
-                            direction=direction, sizing=sizing)
-                    continue
-                kelly_shares = int(sizing["shares"])
-                position_size = float(sizing["position_value"])
-            except Exception as e:
-                logger.debug("kelly sizing skipped for %s: %s", sym, e)
-
-        # ── pre-trade correlation check (≥ 0.7 to most-correlated open) ──
         max_corr = 0.0
-        if _corr_available and open_positions_rows:
+        if _corr_available and open_syms_all:
             try:
-                open_syms = [p["symbol"] for p in open_positions_rows if p.get("symbol") and p["symbol"] != sym]
+                open_syms = [s for s in open_syms_all if s != sym]
                 if open_syms:
                     corr = await correlation_to_open(sym, open_syms)
                     if isinstance(corr, dict):
@@ -504,139 +412,104 @@ async def auto_open_from_recommendations(
                         max_corr = float(corr)
             except Exception:
                 max_corr = 0.0
-        if max_corr >= 0.7:
-            skip_counts["correlated_to_open"] = skip_counts.get("correlated_to_open", 0) + 1
-            logger.info("REJECTED auto-open %s: corr %.2f >= 0.70 against open book", sym, max_corr)
-            _record(r, conv, rr, taken=False, skip_reason="correlated_to_open",
-                    direction=direction, sizing=sizing, max_corr=max_corr)
-            continue
 
-        # ── B2: graduated correlation trim (0.5 ≤ corr < 0.7 shrinks the bet) ──
-        # ── B3: sector + gross/net exposure caps ──
-        if _psizing_available and kelly_shares and position_size:
-            corr_mult = correlation_size_multiplier(max_corr)
-            capped = apply_exposure_caps(
-                position_size * corr_mult, direction, capital=capital,
-                sector=str(getattr(r, "sector", "") or (r.get("sector") if isinstance(r, dict) else "") or "Unknown"),
-                sector_value_open=sector_open.get(
-                    str(getattr(r, "sector", "") or (r.get("sector") if isinstance(r, dict) else "") or "Unknown"), 0.0),
-                gross_open=gross_open, net_open=net_open,
-            )
-            allowed_value = capped["allowed_value"]
-            new_shares = int(allowed_value / entry) if entry > 0 else 0
-            if new_shares <= 0:
-                skip_counts["exposure_capped"] = skip_counts.get("exposure_capped", 0) + 1
-                logger.info("SKIP auto-open %s: exposure cap (%s) left no room", sym, capped["binding"])
-                _record(r, conv, rr, taken=False,
-                        skip_reason=f"exposure_capped:{capped['binding']}",
-                        direction=direction, sizing=sizing, max_corr=max_corr)
-                continue
-            if new_shares < kelly_shares:
-                kelly_shares = new_shares
-                position_size = round(kelly_shares * entry, 2)
+        atr_pct, adx = await _fetch_volatility(sym)
+        earnings_blackout = False
+        try:
+            from app.services.fmp_fetcher import is_in_earnings_blackout
+            bl = await is_in_earnings_blackout(sym)
+            earnings_blackout = bool(bl) if bl is not None else False
+        except Exception as e:
+            logger.debug("earnings-blackout check skipped for %s: %s", sym, e)
 
-        # ── hard 10-rule risk gate ──
-        if _risk_gate_available:
-            try:
-                # Use the Kelly-sized share count as the gate's qty so the
-                # position-size / sector caps evaluate the size we actually
-                # intend to take (falls back to 1 when Kelly is unavailable).
-                gate_qty = kelly_shares if kelly_shares and kelly_shares > 0 else max(
-                    1, int(getattr(r, "shares", 0) or r.get("shares") or 1)
-                )
-                # Quality-gate inputs: data_quality off the recommendation
-                # (real), ATR%/ADX from a best-effort technicals fetch. Both
-                # gates stay inert when their inputs aren't available.
-                data_quality = (
-                    getattr(r, "data_quality", None)
-                    or (r.get("data_quality") if isinstance(r, dict) else None)
-                )
-                atr_pct, adx = await _fetch_volatility(sym)
-                # Earnings blackout via FMP calendar — None (no key/failed)
-                # leaves the gate inert; True triggers rejection in the gate.
-                earnings_blackout = False
-                try:
-                    from app.services.fmp_fetcher import is_in_earnings_blackout
-                    bl = await is_in_earnings_blackout(sym)
-                    earnings_blackout = bool(bl) if bl is not None else False
-                except Exception as e:
-                    logger.debug("earnings-blackout check skipped for %s: %s", sym, e)
-                candidate = TradeCandidate(
-                    symbol=sym,
-                    direction=direction,
-                    entry=entry,
-                    stop=sl,
-                    target=tgt,
-                    qty=gate_qty,
-                    sector=str(getattr(r, "sector", "") or r.get("sector") or "Unknown"),
-                    data_quality=data_quality,
-                    atr_pct=atr_pct,
-                    adx=adx,
-                    is_in_earnings_blackout=earnings_blackout,
-                )
-                portfolio = PortfolioState(
-                    capital=capital,
-                    open_positions=open_positions_rows,
-                    correlation_to_open=max_corr,
-                )
-                gate = evaluate_trade(candidate, portfolio)
-                if gate.verdict == GateVerdict.REJECTED:
-                    skip_counts["risk_gate_rejected"] = skip_counts.get("risk_gate_rejected", 0) + 1
-                    logger.info("REJECTED auto-open %s by risk_gate: %s", sym, "; ".join(gate.reasons))
-                    _record(r, conv, rr, taken=False,
-                            skip_reason="risk_gate_rejected: " + "; ".join(gate.reasons),
-                            direction=direction, sizing=sizing, max_corr=max_corr)
-                    continue
-                if gate.verdict == GateVerdict.MODIFIED and gate.modified_qty is not None:
-                    # The gate trimmed our size — clamp Kelly shares to it.
-                    if kelly_shares is not None:
-                        kelly_shares = max(0, min(kelly_shares, gate.modified_qty))
-                        if kelly_shares <= 0:
-                            skip_counts["risk_gate_rejected"] = skip_counts.get("risk_gate_rejected", 0) + 1
-                            logger.info("REJECTED auto-open %s: risk gate trimmed size to 0", sym)
-                            _record(r, conv, rr, taken=False,
-                                    skip_reason="risk_gate_trimmed_to_zero",
-                                    direction=direction, sizing=sizing, max_corr=max_corr)
-                            continue
-                        position_size = round(kelly_shares * entry, 2)
-                    strength = max(1, min(strength, gate.modified_qty))
-            except Exception as e:
-                logger.debug("risk_gate evaluation skipped for %s: %s", sym, e)
+        data_quality = (
+            getattr(r, "data_quality", None)
+            or (r.get("data_quality") if isinstance(r, dict) else None)
+        )
+        sector = str(getattr(r, "sector", "") or (r.get("sector") if isinstance(r, dict) else "") or "Unknown")
 
+        cand_meta[(sym, direction)] = (r, conv, rr)
+        entry_cands.append(EntryCandidate(
+            symbol=sym, direction=direction, conviction=conv, risk_reward=rr,
+            entry=entry, stop=sl, target=tgt, sector=sector, win_prob=win_prob,
+            already_open=already, max_correlation=max_corr, atr_pct=atr_pct,
+            adx=adx, data_quality=data_quality, earnings_blackout=earnings_blackout))
+
+    ctx = PortfolioCtx(
+        capital=capital, already_today=already_today, open_count=open_pos,
+        dir_counts=dir_counts, sector_open=sector_open, gross_open=gross_open,
+        net_open=net_open, vix=vix, recent_losses=recent_losses or 0,
+        peak_equity=peak_eq, cur_equity=cur_eq, open_positions=open_positions_rows)
+    cfg = DecisionConfig(
+        min_conviction=min_conviction, max_per_day=max_per_day,
+        max_open_positions=max_open_positions,
+        max_directional_concentration=max_directional_concentration,
+        min_positions_for_concentration=min_positions_for_concentration,
+        enable_risk_gate=_risk_gate_available)
+
+    result = decide(entry_cands, ctx, cfg)
+    skip_counts: dict[str, int] = dict(result.skip_reason_counts)
+
+    # ── Drawdown breaker halted all entries. ──
+    if result.drawdown_tripped:
+        logger.warning("Drawdown breaker tripped (%.1f%%) — no new auto entries",
+                       result.drawdown_pct)
+        for s in result.skipped:
+            r, conv, rr = cand_meta.get((s.symbol, s.direction), (None, 0, 0))
+            if r is not None:
+                _record(r, conv, rr, taken=False, skip_reason=s.reason, direction=s.direction)
+        try:
+            from app.services.decision_log import log_decisions
+            await log_decisions(decisions, db_path=DB_PATH)
+        except Exception as e:
+            logger.debug("decision_log persistence skipped: %s", e)
+        return {
+            "opened": [],
+            "skipped_reason_counts": {"drawdown_breaker": len(candidates)},
+            "today_auto_trades": already_today,
+            "open_positions": open_pos,
+            "drawdown_pct": result.drawdown_pct,
+            "decisions_logged": len(decisions),
+        }
+
+    # ── Execute the orders decide() returned. ──
+    for o in result.orders:
+        r, conv, rr = cand_meta[(o.symbol, o.direction)]
         try:
             trade = await create_paper_trade(
-                symbol=sym,
-                direction=direction,
-                signal_type="multi_factor_engine",
-                strength=strength,
-                entry_price=entry,
-                stop_loss=sl,
-                target=tgt,
-                position_size=position_size,
-                shares=kelly_shares,
-                source="auto",
-            )
-            opened.append({"symbol": sym, "direction": direction, "conviction": conv,
-                            "trade_id": trade["trade_id"], "shares": kelly_shares,
-                            "position_size": position_size})
-            # Keep the directional tally current so the concentration cap is
-            # cumulative across opens within this cycle.
-            if direction in dir_counts:
-                dir_counts[direction] += 1
-            _record(r, conv, rr, taken=True, direction=direction,
-                    sizing=sizing, max_corr=max_corr)
-            # Keep the open-book aggregates current so B3 caps are cumulative
-            # across multiple opens in the same cycle.
-            if position_size:
-                gross_open += position_size
-                net_open += position_size if direction == "bullish" else -position_size
-                _sec = str(getattr(r, "sector", "") or (r.get("sector") if isinstance(r, dict) else "") or "Unknown")
-                sector_open[_sec] = sector_open.get(_sec, 0.0) + position_size
+                symbol=o.symbol, direction=o.direction,
+                signal_type="multi_factor_engine", strength=o.strength,
+                entry_price=o.entry, stop_loss=o.stop, target=o.target,
+                position_size=o.position_size, shares=o.shares, source="auto")
+            opened.append({"symbol": o.symbol, "direction": o.direction,
+                           "conviction": conv, "trade_id": trade["trade_id"],
+                           "shares": o.shares, "position_size": o.position_size})
+            _record(r, conv, rr, taken=True, direction=o.direction,
+                    sizing=o.sizing, max_corr=o.max_correlation)
         except Exception as e:
-            logger.warning("auto-open failed for %s: %s", sym, e)
+            logger.warning("auto-open failed for %s: %s", o.symbol, e)
             skip_counts["create_error"] = skip_counts.get("create_error", 0) + 1
             _record(r, conv, rr, taken=False, skip_reason="create_error",
-                    direction=direction, sizing=sizing, max_corr=max_corr)
+                    direction=o.direction, sizing=o.sizing, max_corr=o.max_correlation)
+
+    # ── Log the skips (taken=False) with their reasons. ──
+    for s in result.skipped:
+        r, conv, rr = cand_meta[(s.symbol, s.direction)]
+        _record(r, conv, rr, taken=False, skip_reason=s.reason,
+                direction=s.direction, sizing=s.sizing, max_corr=s.max_correlation)
+        # 4.3 — log a random ~5% shadow sample of REJECTED candidates so the
+        # funnel's discard quality (selection bias) is measurable. Never trades
+        # real capital; outcomes simulated later. Fire-and-forget.
+        try:
+            from app.services.shadow_sample import log_shadow_reject
+            c = next((ec for ec in entry_cands
+                      if ec.symbol == s.symbol and ec.direction == s.direction), None)
+            if c is not None:
+                await log_shadow_reject(
+                    symbol=c.symbol, direction=c.direction, entry=c.entry,
+                    stop=c.stop, target=c.target, reason=s.reason)
+        except Exception as e:
+            logger.debug("shadow-reject log skipped: %s", e)
 
     if opened:
         logger.info("Auto paper-trades opened: %d (today=%d, open=%d)",

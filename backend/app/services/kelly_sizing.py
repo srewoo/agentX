@@ -51,6 +51,31 @@ DEFAULT_KELLY_FRACTION = 0.25   # ¼-Kelly
 DEFAULT_MAX_POSITION_PCT = 5.0  # hard per-position cap (% of capital)
 DEFAULT_MAX_RISK_PCT = 1.0      # max capital risked to the stop (% of capital)
 
+# 1.1 — exposure-preserving per-trade cap. Widening the funnel means a larger
+# open book; if each position kept its old 5% cap, total gross exposure would
+# balloon with the position count. Instead the per-position cap SHRINKS with the
+# book size so peak gross exposure stays ≈ TARGET_GROSS_EXPOSURE_PCT regardless
+# of how many names are open — "lower per-trade notional so total exposure is
+# unchanged". Never exceeds the hard DEFAULT_MAX_POSITION_PCT.
+TARGET_GROSS_EXPOSURE_PCT = 60.0
+
+
+def per_position_cap_pct(
+    max_open_positions: int,
+    *,
+    target_gross_pct: float = TARGET_GROSS_EXPOSURE_PCT,
+    hard_cap_pct: float = DEFAULT_MAX_POSITION_PCT,
+) -> float:
+    """Per-position cap (% of capital) that keeps peak gross exposure bounded.
+
+    = min(hard_cap, target_gross / max_open). With the historical book of 12 this
+    returns 5% (unchanged); at a widened book of 30 it returns 2%, so 30 full
+    positions still sum to ~60% gross rather than 150%.
+    """
+    if max_open_positions <= 0:
+        return hard_cap_pct
+    return min(hard_cap_pct, target_gross_pct / max_open_positions)
+
 # Structural ceiling on the win probability Kelly is allowed to act on.
 # The walk-forward evidence shows even the best setups realise ~53-62% WR;
 # no honest per-trade estimate should imply more edge than ~0.85. This is a

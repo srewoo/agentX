@@ -596,8 +596,10 @@ def _get_signal_weight(signal_type: str, direction: str) -> float:
     Priority order:
       1. Live performance cache (signal_tracker._performance_cache) — uses
          the user's actual signal outcomes once enough have been evaluated.
-      2. Static edge table from the 25k-signal internal backtest — used as
-         a cold-start prior so brand-new installs aren't flying blind.
+      2. Live edge overrides written by the weekly backtest (≥30 trades).
+      3. Neutral 1.0. The static in-sample SIGNAL_EDGE table is deliberately
+         NOT consulted — its numbers are unvalidated cold-start priors and
+         must never tilt live signal weights (see signal_edge docstring).
     Weight = win_rate / 50.0, clamped to [0.5, 1.5].
     """
     try:
@@ -609,11 +611,11 @@ def _get_signal_weight(signal_type: str, direction: str) -> float:
             return max(0.5, min(1.5, weight))
     except Exception:
         pass
-    # Cold-start fallback: static edge table.
+    # Live overrides only — the quarantined static baseline stays neutral.
     try:
         from app.services.signal_edge import get_edge
         edge = get_edge(signal_type, direction)
-        if edge:
+        if edge and edge.get("source") == "live":
             weight = edge["win_rate"] / 50.0
             return max(0.5, min(1.5, weight))
     except Exception:

@@ -53,7 +53,7 @@ if [ ! -f "$TRADES_FILE" ]; then
   log "Created trades file: $TRADES_FILE"
 fi
 if [ ! -f "$DAILY_LOG" ]; then
-  echo "date,open_trades,closed_today,total_closed,win_rate,total_pnl,capital" > "$DAILY_LOG"
+  echo "date,open_trades,closed_today,total_closed,win_rate,total_pnl,capital,status" > "$DAILY_LOG"
 fi
 
 # ── Loud alerting ────────────────────────────────────────────
@@ -65,6 +65,11 @@ fi
 # notification service here because that very backend may be the thing
 # that's down.
 ALERTS_FILE="${DATA_DIR}/ALERTS.log"
+# Stamped with today's date after a SUCCESSFUL full routine. The catch-up
+# cron entries (12:00 / 14:00) consult it via `full-if-needed` so a failed
+# 11:00 boot no longer voids the whole forward-test day — the window gaps
+# in ALERTS.log (Jun 19/22/24/26) were exactly this failure mode.
+LAST_FULL_MARKER="${DATA_DIR}/.last_full_run"
 raise_alert() {
   local msg="$1"
   local ts; ts="$(date '+%Y-%m-%d %H:%M:%S %Z')"
@@ -83,6 +88,86 @@ raise_alert() {
   # Optional external channel.
   if [ -n "${PAPER_ALERT_CMD:-}" ]; then
     printf '%s' "$msg" | eval "${PAPER_ALERT_CMD}" > /dev/null 2>&1 || true
+  fi
+}
+
+# ── Forward-window integrity (gap detection) ─────────────────
+# A missed daily run used to vanish as a simply-absent date in daily_log.csv —
+# indistinguishable from a market holiday. The final 300-trade verdict then
+# couldn't discount degraded windows. Now every weekday with no logged run,
+# between the last logged date and today, is written back as an explicit
+# `status=MISSED_RUN` row AND paged loudly. Weekends are excluded; NSE
+# holidays can't be known here without a calendar, so a holiday may
+# over-flag — conservative by design (better a false gap than a silent one).
+# The `status` column is appended (8th field); pre-existing 7-column rows read
+# back as status=None → treated as normal completed days.
+record_run_gaps() {
+  local gaps
+  gaps="$(python3 -c "
+import csv, os
+from datetime import date, timedelta
+
+daily_log = '${DAILY_LOG}'
+today = date.today()
+
+rows = []
+has_status = False
+existing = set()
+if os.path.exists(daily_log):
+    with open(daily_log, newline='') as f:
+        reader = csv.reader(f)
+        header = next(reader, None)
+        has_status = bool(header) and 'status' in header
+        for r in reader:
+            if r:
+                existing.add(r[0])
+                rows.append(r)
+
+# Last logged calendar date (any status). Nothing logged yet → no gaps.
+logged_dates = sorted(existing)
+if not logged_dates:
+    raise SystemExit(0)
+try:
+    last = date.fromisoformat(logged_dates[-1])
+except ValueError:
+    raise SystemExit(0)
+
+# Weekdays strictly between last logged date and today, not already logged.
+missed = []
+d = last + timedelta(days=1)
+while d < today:
+    if d.weekday() < 5 and d.isoformat() not in existing:
+        missed.append(d.isoformat())
+    d += timedelta(days=1)
+
+if not missed:
+    raise SystemExit(0)
+
+# Migrate header to include the status column if needed, then append gaps.
+base_header = ['date','open_trades','closed_today','total_closed','win_rate','total_pnl','capital']
+if not has_status:
+    all_rows = []
+    if os.path.exists(daily_log):
+        with open(daily_log, newline='') as f:
+            reader = csv.reader(f)
+            _hdr = next(reader, None)
+            all_rows = [r for r in reader if r]
+    with open(daily_log, 'w', newline='') as f:
+        w = csv.writer(f)
+        w.writerow(base_header + ['status'])
+        for r in all_rows:
+            w.writerow(r)  # old 7-col rows stay 7-col → status reads as absent
+
+with open(daily_log, 'a', newline='') as f:
+    w = csv.writer(f)
+    for md in missed:
+        w.writerow([md, 0, 0, '', '', '', '', 'MISSED_RUN'])
+
+print(' '.join(missed))
+" 2>/dev/null)"
+
+  if [ -n "$gaps" ]; then
+    raise_alert "Forward-window GAP detected — no daily run recorded on: ${gaps}. These weekdays are now logged as MISSED_RUN in daily_log.csv so the verdict can discount the degraded window. Investigate why the routine did not run."
   fi
 }
 
@@ -742,6 +827,9 @@ print('=' * 55)
 do_full() {
   log "${BOLD}Running daily paper trading routine${NC}"
   echo ""
+  # Detect & record any missed prior runs before today's run proceeds, so a
+  # degraded forward-test window is visible (and paged) even when today succeeds.
+  record_run_gaps
   do_evaluate
   echo ""
   do_scan
@@ -779,12 +867,46 @@ with open(trades_file, 'r') as f:
 
 win_rate = (wins / closed_total * 100) if closed_total > 0 else 0
 
+# Ensure the header carries the status column (added by the gap monitor).
+base_header = ['date','open_trades','closed_today','total_closed','win_rate','total_pnl','capital']
+if os.path.exists(daily_log):
+    with open(daily_log, newline='') as f:
+        header = next(csv.reader(f), None)
+    if header and 'status' not in header:
+        with open(daily_log, newline='') as f:
+            reader = csv.reader(f)
+            next(reader, None)
+            body = [r for r in reader if r]
+        with open(daily_log, 'w', newline='') as f:
+            w = csv.writer(f)
+            w.writerow(base_header + ['status'])
+            for r in body:
+                w.writerow(r)
+
 with open(daily_log, 'a', newline='') as f:
     writer = csv.writer(f)
     writer.writerow([today, open_count, closed_today_count, closed_total,
-                     f'{win_rate:.1f}', f'{total_pnl:.0f}', capital])
+                     f'{win_rate:.1f}', f'{total_pnl:.0f}', capital, 'ok'])
 " 2>/dev/null
   log "Daily log updated: ${DAILY_LOG}"
+
+  # Mark today as successfully completed so catch-up runs no-op. Reached only
+  # when evaluate+scan didn't exit early (check_backend exits 1 on failure).
+  date +%Y-%m-%d > "$LAST_FULL_MARKER"
+}
+
+# ── Catch-up wrapper ─────────────────────────────────────────
+# Runs the full routine ONLY if it hasn't succeeded today. Installed at
+# 12:00/14:00 as a retry lane: if the 11:00 primary succeeded this exits
+# silently; if it failed (backend boot race, transient network), the day's
+# forward-test window is recovered instead of voided.
+do_full_if_needed() {
+  if [ -f "$LAST_FULL_MARKER" ] && [ "$(cat "$LAST_FULL_MARKER" 2>/dev/null)" = "$(date +%Y-%m-%d)" ]; then
+    log "Full routine already completed today — catch-up run not needed."
+    return
+  fi
+  warn "No successful full run recorded today — running catch-up."
+  do_full
 }
 
 # ── Schedule / Unschedule cron ───────────────────────────────
@@ -792,8 +914,13 @@ do_schedule() {
   SCRIPT_PATH="$(cd "$(dirname "$0")" && pwd)/paper_trade.sh"
   LOG_PATH="$(cd "$(dirname "$0")" && pwd)/backend/paper_trades/cron.log"
 
-  # Cron: Mon-Fri at 11:00 AM IST
-  CRON_LINE="0 11 * * 1-5 cd $(cd "$(dirname "$0")" && pwd) && ${SCRIPT_PATH} full >> ${LOG_PATH} 2>&1"
+  PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
+  # Cron: Mon-Fri at 11:00 AM IST, with catch-up retries at 12:00 and 14:00
+  # (no-ops when the 11:00 run succeeded) so one failed boot doesn't void the
+  # forward-test day.
+  CRON_LINE="0 11 * * 1-5 cd ${PROJECT_DIR} && ${SCRIPT_PATH} full >> ${LOG_PATH} 2>&1"
+  CATCHUP_1="0 12 * * 1-5 cd ${PROJECT_DIR} && ${SCRIPT_PATH} full-if-needed >> ${LOG_PATH} 2>&1"
+  CATCHUP_2="0 14 * * 1-5 cd ${PROJECT_DIR} && ${SCRIPT_PATH} full-if-needed >> ${LOG_PATH} 2>&1"
 
   # Check if already scheduled
   if crontab -l 2>/dev/null | grep -q "paper_trade.sh"; then
@@ -802,8 +929,8 @@ do_schedule() {
     return
   fi
 
-  (crontab -l 2>/dev/null; echo "$CRON_LINE") | crontab -
-  ok "Cron job installed: Mon-Fri at 11:00 AM"
+  (crontab -l 2>/dev/null; echo "$CRON_LINE"; echo "$CATCHUP_1"; echo "$CATCHUP_2") | crontab -
+  ok "Cron jobs installed: Mon-Fri 11:00 AM + catch-up retries 12:00 / 14:00"
   ok "Logs: ${LOG_PATH}"
   echo ""
   echo "  Current crontab:"
@@ -822,14 +949,17 @@ do_schedule_realtime() {
     return
   fi
 
-  # Daily full routine at 11:00 AM (scan + open trades)
+  # Daily full routine at 11:00 AM (scan + open trades), with catch-up
+  # retries at 12:00 / 14:00 (no-ops if the day already succeeded).
   DAILY_LINE="0 11 * * 1-5 cd ${PROJECT_DIR} && ${SCRIPT_PATH} full >> ${LOG_PATH} 2>&1"
+  CATCHUP_1="0 12 * * 1-5 cd ${PROJECT_DIR} && ${SCRIPT_PATH} full-if-needed >> ${LOG_PATH} 2>&1"
+  CATCHUP_2="0 14 * * 1-5 cd ${PROJECT_DIR} && ${SCRIPT_PATH} full-if-needed >> ${LOG_PATH} 2>&1"
   # Evaluate open positions every 15 minutes during market hours (9:30 - 15:30 IST)
   EVAL_LINE="*/15 9-15 * * 1-5 cd ${PROJECT_DIR} && ${SCRIPT_PATH} evaluate >> ${LOG_PATH} 2>&1"
 
-  (crontab -l 2>/dev/null; echo "$DAILY_LINE"; echo "$EVAL_LINE") | crontab -
+  (crontab -l 2>/dev/null; echo "$DAILY_LINE"; echo "$CATCHUP_1"; echo "$CATCHUP_2"; echo "$EVAL_LINE") | crontab -
   ok "Realtime evaluation cron installed:"
-  ok "  Daily scan: Mon-Fri at 11:00 AM"
+  ok "  Daily scan: Mon-Fri at 11:00 AM (+ catch-up 12:00 / 14:00)"
   ok "  Evaluate: Mon-Fri every 15 min, 9:30 AM - 3:30 PM"
   ok "  Logs: ${LOG_PATH}"
   echo ""
@@ -855,6 +985,7 @@ case "$CMD" in
   evaluate|eval) do_evaluate ;;
   report)        do_report ;;
   full|daily)    do_full ;;
+  full-if-needed) do_full_if_needed ;;
   schedule)      do_schedule ;;
   realtime)      do_schedule_realtime ;;
   unschedule)    do_unschedule ;;

@@ -536,14 +536,21 @@ async function pollSignals(force = false): Promise<void> {
     const newSignals = data.signals || [];
 
     if (newSignals.length > 0) {
-      // Merge with existing stored signals (newest first, cap at MAX_SIGNALS)
+      // Merge with existing stored signals (newest first, cap at MAX_SIGNALS),
+      // then drop anything older than the feed age cutoff so stored signals
+      // self-expire instead of lingering forever (the incremental `since` poll
+      // never removes them otherwise, which resurrected last week's cards).
+      const MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+      const ageCutoff = Date.now() - MAX_AGE_MS;
       const existing = await getStoredSignals();
       const existingIds = new Set(existing.map((s) => s.id));
       const trulyNew = newSignals.filter((s) => !existingIds.has(s.id));
       const merged = [
         ...trulyNew,
         ...existing,
-      ].slice(0, MAX_SIGNALS);
+      ]
+        .filter((s) => new Date(s.created_at).getTime() >= ageCutoff)
+        .slice(0, MAX_SIGNALS);
 
       await setStoredSignals(merged);
       await setLastPollTime(new Date().toISOString());

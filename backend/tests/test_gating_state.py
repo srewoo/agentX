@@ -125,6 +125,69 @@ def test_overlay_returns_none_when_empty():
     assert gs.overlay_is_blocked("x") is None
 
 
+# ── 1.3 — per-signal kill criteria & irreversible demotion ──
+@pytest.mark.asyncio
+async def test_combo_killed_on_weak_live_wilson_lb(db_path):
+    # 20/50 live = 40% observed; Wilson-LB well under the 0.40 floor → KILLED.
+    cand = [Candidate("gap_down|bearish", wins=100, n=200, live_wins=20, live_n=50)]
+    await gs.update_gating_state(cand, db_path=db_path)
+    active = await gs.get_active_gating(db_path=db_path)
+    assert "gap_down|bearish" in active["killed"]
+
+
+@pytest.mark.asyncio
+async def test_killed_is_terminal(db_path):
+    kill = [Candidate("gap_down|bearish", wins=100, n=200, live_wins=15, live_n=50)]
+    await gs.update_gating_state(kill, db_path=db_path)
+    # Even a string of strong backtest rounds cannot revive a killed combo.
+    strong = [Candidate("gap_down|bearish", wins=180, n=200)]
+    for _ in range(gs.PROMOTE_AFTER + 2):
+        await gs.update_gating_state(strong, db_path=db_path)
+    active = await gs.get_active_gating(db_path=db_path)
+    assert "gap_down|bearish" in active["killed"]
+    assert "gap_down|bearish" not in active["promoted"]
+
+
+@pytest.mark.asyncio
+async def test_demotion_irreversible_without_forward_evidence(db_path):
+    key = "macd_divergence|bullish"
+    strong = [Candidate(key, wins=144, n=200)]
+    for _ in range(gs.PROMOTE_AFTER):
+        await gs.update_gating_state(strong, db_path=db_path)
+    assert key in (await gs.get_active_gating(db_path=db_path))["promoted"]
+    # Sustained failure demotes it.
+    weak = [Candidate(key, wins=100, n=200)]
+    for _ in range(gs.DEMOTE_AFTER):
+        await gs.update_gating_state(weak, db_path=db_path)
+    assert key not in (await gs.get_active_gating(db_path=db_path))["promoted"]
+    # Backtest passes alone (no live evidence) can no longer re-promote it.
+    for _ in range(gs.PROMOTE_AFTER + 2):
+        await gs.update_gating_state(strong, db_path=db_path)
+    assert key not in (await gs.get_active_gating(db_path=db_path))["promoted"]
+
+
+@pytest.mark.asyncio
+async def test_demoted_combo_repromotes_with_fresh_forward_evidence(db_path):
+    key = "macd_divergence|bullish"
+    strong = [Candidate(key, wins=144, n=200)]
+    for _ in range(gs.PROMOTE_AFTER):
+        await gs.update_gating_state(strong, db_path=db_path)
+    weak = [Candidate(key, wins=100, n=200)]
+    for _ in range(gs.DEMOTE_AFTER):
+        await gs.update_gating_state(weak, db_path=db_path)
+    # Now backed by a strong FORWARD record (40/50 = 80%, Wilson-LB ≥ 0.50).
+    revive = [Candidate(key, wins=144, n=200, live_wins=40, live_n=50)]
+    for _ in range(gs.PROMOTE_AFTER):
+        await gs.update_gating_state(revive, db_path=db_path)
+    assert key in (await gs.get_active_gating(db_path=db_path))["promoted"]
+
+
+def test_killed_folds_into_muted_overlay():
+    gs.set_overlay({"promoted": set(), "muted": set(), "blocked": set(),
+                    "killed": {"gap_down|bearish"}})
+    assert gs.overlay_is_muted("gap_down", "bearish") is True
+
+
 # ── A5 — human veto on transitions ──
 @pytest.mark.asyncio
 async def test_veto_mode_holds_promotion_as_pending(db_path):

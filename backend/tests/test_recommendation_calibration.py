@@ -99,6 +99,11 @@ async def test_large_scale_calibration_persists_run_and_factor_edges(
     assert "by_sector" in result
     assert "by_regime" in result
     assert result["factor_edges"]
+    # Every factor-edge row now carries a significance p-value and an FDR
+    # verdict (the multiple-comparisons gate).
+    for row in result["factor_edges"]:
+        assert "p_value" in row and 0.0 <= row["p_value"] <= 1.0
+        assert "significant" in row
 
     con = sqlite3.connect(calibration_db)
     runs = con.execute("SELECT total_signals, payload FROM backtest_runs").fetchall()
@@ -106,4 +111,10 @@ async def test_large_scale_calibration_persists_run_and_factor_edges(
     con.close()
 
     assert runs and runs[0][0] == result["summary"]["total"]
-    assert factors
+    # FDR gate: ONLY significant factor edges are persisted to
+    # factor_performance (and thus allowed to move a live weight multiplier).
+    # The persisted count must equal the number of significant edges in the
+    # payload — never the raw ranked list.
+    combined = [*result["factor_edges"], *result.get("contextual_factor_edges", [])]
+    n_significant = sum(1 for r in combined if r.get("significant"))
+    assert len(factors) == n_significant

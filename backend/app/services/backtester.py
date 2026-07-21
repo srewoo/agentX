@@ -42,6 +42,7 @@ def _evaluate_outcome_realistic(
     segment: str = "cash",
     avg_daily_volume: Optional[float] = None,
     apply_slippage: bool = True,
+    extra_slippage_pct: float = 0.0,
 ) -> dict[str, Any]:
     """Net P&L per `execution_costs.apply_costs` (real Indian-market brokerage +
     STT + DP + exchange + GST + slippage).
@@ -74,6 +75,7 @@ def _evaluate_outcome_realistic(
         res = apply_costs(
             entry=entry_fill, exit=future_price, qty=qty, segment=segment,
             avg_daily_volume=avg_daily_volume,
+            extra_slippage_pct=extra_slippage_pct,
         )
         notional = entry_fill * qty
         net_pct = (res["net_pnl"] / notional) * 100.0 if notional else 0.0
@@ -82,6 +84,7 @@ def _evaluate_outcome_realistic(
         res = apply_costs(
             entry=future_price, exit=entry_fill, qty=qty, segment=segment,
             avg_daily_volume=avg_daily_volume,
+            extra_slippage_pct=extra_slippage_pct,
         )
         notional = entry_fill * qty
         net_pct = (res["net_pnl"] / notional) * 100.0 if notional else 0.0
@@ -171,6 +174,12 @@ async def run_backtest(
 
     total_bars = len(df)
     close_values = df["Close"].values
+    # Trailing 20-bar mean volume per bar (point-in-time: bars i-19..i only)
+    # feeds the liquidity-aware slippage/impact model in execution_costs.
+    adv_values = (
+        df["Volume"].rolling(20, min_periods=5).mean().values
+        if "Volume" in df.columns else None
+    )
 
     # Collect all signal outcomes
     # Structure: { signal_type: { direction: [ {window: {pnl_pct, win}, ...} ] } }
@@ -247,7 +256,15 @@ async def run_backtest(
                 if future_idx < total_bars:
                     future_price = safe_float(close_values[future_idx])
                     if future_price:
-                        result = _evaluate_outcome(direction, entry_price, future_price)
+                        # Realistic Indian-market cost model (brokerage + STT +
+                        # exchange + SEBI + DP + GST + liquidity-aware slippage)
+                        # — the same model the walk-forward engine uses, so the
+                        # two backtests no longer disagree on costs.
+                        adv = safe_float(adv_values[i]) if adv_values is not None else None
+                        result = _evaluate_outcome_realistic(
+                            direction, entry_price, future_price,
+                            avg_daily_volume=adv,
+                        )
                         outcome[f"pnl_{w}d"] = result["pnl_pct"]
                         outcome[f"win_{w}d"] = result["win"]
                         outcome[f"neutral_{w}d"] = result["neutral"]
@@ -267,15 +284,20 @@ async def run_backtest(
         "total_signals": total_signals,
         "by_signal_type": by_signal_type,
         "overall": overall,
-        # Methodology disclosure — every per-trade PnL above is already net of this cost.
-        # Walk-forward: at bar i we slice df.iloc[:i+1] and recompute technicals + signals
-        # on that slice only (no center=True rolling, no negative shifts), enter at
-        # close[i], evaluate at close[i+w]. No look-ahead bias.
+        # Methodology disclosure — every per-trade PnL above is net of the FULL
+        # execution_costs model (brokerage + STT + exchange + SEBI + DP + GST +
+        # liquidity-aware slippage), shared with the walk-forward engine. The
+        # old flat TRANSACTION_COST_PCT is retained only as a fallback constant.
+        # At bar i we slice df.iloc[:i+1] and recompute technicals + signals on
+        # that slice only (no center=True rolling, no negative shifts), enter at
+        # close[i], evaluate at close[i+w]. No intra-trade look-ahead — but note
+        # this is a single pass over full history, NOT fold-based OOS validation.
         "methodology": {
-            "transaction_cost_pct": TRANSACTION_COST_PCT,
+            "cost_model": "execution_costs.apply_costs (realistic, liquidity-aware)",
             "walk_forward": True,
-            "entry": "close_of_signal_bar",
+            "entry": "close_of_signal_bar_with_slippage",
             "eval": "close_of_bar_plus_window",
+            "validation": "single_pass_in_sample",
         },
     }
 

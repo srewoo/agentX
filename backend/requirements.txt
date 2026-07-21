@@ -11,13 +11,14 @@ sqlalchemy>=2.0,<2.1
 alembic>=1.13,<1.14
 psycopg[binary]>=3.1,<4
 
-# Market data — Upstox (authenticated primary) → NSE → jugaad-data → yfinance
-# → Twelve Data. Upstox + Twelve Data are plain HTTP (requests), no extra SDK.
-# jugaad-data is a free, account-less NSE EOD source sturdier than NSE's
-# anti-bot live API.
+# Market data — Upstox (authenticated primary, plain HTTP/requests) → NSE →
+# yfinance. NSE + yfinance are retained ONLY as an emergency fallback for when
+# Upstox is down/token-lapsed; they're needed anyway (NSE for delivery %,
+# FII/DII, corporate actions; yfinance for fundamentals). jugaad-data and
+# Twelve Data were removed — they served nothing but price history, which
+# Upstox now covers natively.
 nse[local]>=2.1.3
 yfinance==0.2.38
-jugaad-data>=0.25
 
 # Broker SDKs are *optional* — see requirements-broker.txt. They're loaded
 # lazily inside app/services/broker.py and the adapter fails gracefully

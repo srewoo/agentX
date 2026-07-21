@@ -48,6 +48,17 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 
+# ── Calibration split ──────────────────────────────────────────────────────
+# Platt scaling + operating-point threshold are fit on a held-out chronological
+# slice of the training data so probabilities are not over-confident. Below
+# `_MIN_FOR_HELDOUT_CALIB` samples the split is skipped (would leave too few
+# trades to fit stumps on) and calibration falls back to in-sample, flagged in
+# `train_meta["platt_calibration"]`.
+_MIN_FOR_HELDOUT_CALIB = 60
+_CALIB_FRACTION = 0.2
+_MIN_CALIB_SLICE = 20
+
+
 # ── Feature extraction ─────────────────────────────────────────────────────
 
 
@@ -68,15 +79,24 @@ _NUMERIC_ENRICH_FEATURES = (
 
 
 def _enrich_with_cohort_stats(trades: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Add target-encoded features computed from the same trade list.
+    """Add target-encoded features computed from the training cohort.
 
-    Note: this is leakage-safe when called inside `MetaJudge.train` because
-    train is given ONLY the training fold. The aggregates are statistics
-    of the training population — exactly what production has access to via
-    the cohort dashboard at decision time.
+    LEAVE-ONE-OUT (LOO) encoding: every trade's cohort statistic is computed
+    from the *other* members of its bucket, excluding the trade's own P&L.
+    This closes the label-leakage that plain in-fold target encoding suffers
+    from — without LOO, a thin bucket (e.g. one (symbol, signal_type, dir)
+    trade) hands the model a feature that is a deterministic function of that
+    row's own label, so an AdaBoost stump can memorise the label and inflate
+    in-sample fit. LOO makes the feature genuinely predictive rather than
+    circular.
 
-    For new trades at predict time, the model uses the persisted aggregates
-    captured in `train_meta['cohort_stats']`.
+    Buckets with only one member (nothing left after excluding self) fall
+    back to the global population mean, the least-informative neutral prior.
+
+    At predict time production uses the full-population aggregates (via
+    `_apply_cohort_lookup`) — a new trade is genuinely not part of the
+    training aggregate, so the small train/serve n-vs-(n-1) skew is the
+    standard, accepted behaviour of LOO target encoding.
     """
     from collections import defaultdict
 
@@ -84,8 +104,10 @@ def _enrich_with_cohort_stats(trades: list[dict[str, Any]]) -> list[dict[str, An
     by_symbol: dict[str, list[float]] = defaultdict(list)
     by_regime: dict[str, list[float]] = defaultdict(list)
     by_symcombo: dict[tuple[str, str, str], list[float]] = defaultdict(list)
+    all_pnls: list[float] = []
     for t in trades:
         pnl = float(t.get("pnl", 0.0))
+        all_pnls.append(pnl)
         by_combo[(t.get("signal_type", ""), t.get("direction", ""))].append(pnl)
         by_symbol[t.get("symbol", "")].append(pnl)
         by_regime[t.get("regime", "")].append(pnl)
@@ -93,21 +115,32 @@ def _enrich_with_cohort_stats(trades: list[dict[str, Any]]) -> list[dict[str, An
             t.get("symbol", ""), t.get("signal_type", ""), t.get("direction", "")
         )].append(pnl)
 
-    def _stats(pnls: list[float]) -> tuple[float, float, int]:
-        if not pnls:
-            return 0.0, 0.0, 0
-        wins = sum(1 for p in pnls if p > 0)
-        return (wins / len(pnls) * 100.0, sum(pnls) / len(pnls), len(pnls))
+    # Global fallback used when a bucket has no member other than this trade.
+    if all_pnls:
+        g_wr = sum(1 for p in all_pnls if p > 0) / len(all_pnls) * 100.0
+        g_avg = sum(all_pnls) / len(all_pnls)
+    else:
+        g_wr, g_avg = 0.0, 0.0
+
+    def _loo(pnls: list[float], own: float) -> tuple[float, float, int]:
+        """Bucket WR/avg/n with `own` (this trade's P&L) removed."""
+        n_other = len(pnls) - 1
+        if n_other <= 0:
+            return g_wr, g_avg, 0
+        wins_other = sum(1 for p in pnls if p > 0) - (1 if own > 0 else 0)
+        avg_other = (sum(pnls) - own) / n_other
+        return (wins_other / n_other * 100.0, avg_other, n_other)
 
     enriched: list[dict[str, Any]] = []
     for t in trades:
         new = dict(t)
-        c_wr, c_avg, c_n = _stats(by_combo[(t.get("signal_type", ""), t.get("direction", ""))])
-        s_wr, s_avg, _ = _stats(by_symbol[t.get("symbol", "")])
-        r_wr, r_avg, _ = _stats(by_regime[t.get("regime", "")])
-        sc_wr, sc_avg, sc_n = _stats(by_symcombo[(
+        own = float(t.get("pnl", 0.0))
+        c_wr, c_avg, c_n = _loo(by_combo[(t.get("signal_type", ""), t.get("direction", ""))], own)
+        s_wr, s_avg, _ = _loo(by_symbol[t.get("symbol", "")], own)
+        r_wr, r_avg, _ = _loo(by_regime[t.get("regime", "")], own)
+        sc_wr, sc_avg, sc_n = _loo(by_symcombo[(
             t.get("symbol", ""), t.get("signal_type", ""), t.get("direction", "")
-        )])
+        )], own)
         new["cohort_combo_wr"] = c_wr
         new["cohort_combo_avg"] = c_avg
         new["cohort_combo_n"] = c_n
@@ -398,38 +431,67 @@ class MetaJudge:
         # Feature index = union of all keys seen.
         feature_index = sorted({k for x in x_full for k in x.keys()})
 
-        # AdaBoost loop.
         n = len(x_full)
-        weights = [1.0 / n] * n
+        labels01_full = [1 if y == 1 else 0 for y in y_full]
+        pnls_full = [float(t.get("pnl", 0.0)) for t in trades]
+
+        # ── Held-out calibration split ──────────────────────────────────────
+        # Platt scaling and the operating-point threshold must be fit on scores
+        # the stumps did NOT train on, or the probabilities come out
+        # over-confident (in-sample Platt) and the threshold overfits. Trades
+        # arrive chronologically (ORDER BY entry_time ASC in the trainer), so
+        # reserve the most recent slice as an internal calibration fold. Fall
+        # back to in-sample only when data is too thin for a clean split (both
+        # classes must be present on each side), and record which path ran so
+        # the calibration provenance is never silently misreported.
+        fit_slice = slice(0, n)
+        calib_idx = list(range(n))
+        calibration = "in_sample"
+        if n >= _MIN_FOR_HELDOUT_CALIB:
+            n_calib = min(n - 1, max(_MIN_CALIB_SLICE, int(n * _CALIB_FRACTION)))
+            fit_end = n - n_calib
+            y_fit = y_full[:fit_end]
+            y_cal = y_full[fit_end:]
+            if len(set(y_fit)) == 2 and len(set(y_cal)) == 2:
+                fit_slice = slice(0, fit_end)
+                calib_idx = list(range(fit_end, n))
+                calibration = "held_out"
+
+        x_fit = x_full[fit_slice]
+        y_fit = y_full[fit_slice]
+
+        # AdaBoost loop — trained on the fit slice only.
+        n_fit = len(x_fit)
+        weights = [1.0 / n_fit] * n_fit
         stumps: list[Stump] = []
         for _ in range(n_stumps):
-            stump = _best_stump(x_full, y_full, weights, feature_index)
+            stump = _best_stump(x_fit, y_fit, weights, feature_index)
             stumps.append(stump)
             # Update weights.
-            for i, (x, y) in enumerate(zip(x_full, y_full)):
+            for i, (x, y) in enumerate(zip(x_fit, y_fit)):
                 pred = stump.predict(x)
                 weights[i] *= math.exp(-stump.alpha * y * pred)
             total = sum(weights) or 1.0
             weights = [w / total for w in weights]
 
-        # Compute raw scores for the training set.
-        raw_scores = [
-            sum(s.alpha * s.predict(x) for s in stumps)
-            for x in x_full
+        # Raw scores on the calibration set (held-out when possible).
+        calib_scores = [
+            sum(s.alpha * s.predict(x_full[i]) for s in stumps) for i in calib_idx
         ]
+        calib_labels = [labels01_full[i] for i in calib_idx]
+        calib_pnls = [pnls_full[i] for i in calib_idx]
 
         # Platt scaling — fit sigmoid(a*z + b) → P(label==1) via simple MLE.
-        # Use the SAME label vector we trained the stumps on.
-        labels01 = [1 if y == 1 else 0 for y in y_full]
-        platt_a, platt_b = _fit_platt(raw_scores, labels01, random_state)
+        platt_a, platt_b = _fit_platt(calib_scores, calib_labels, random_state)
 
         # Calibrate operating-point threshold to maximise EXPECTANCY, not win
         # rate. The per-trade P&L is the objective the system actually cares
         # about — a high-WR/low-payoff cutoff loses money (observed empirically:
         # 71% kept-WR at −0.32%/trade while the dropped trades averaged +1.96%).
-        probs = [_sigmoid(platt_a * z + platt_b) for z in raw_scores]
-        pnls = [float(t.get("pnl", 0.0)) for t in trades]
-        threshold = _calibrate_threshold(probs, labels01, target_tpr, pnls=pnls)
+        calib_probs = [_sigmoid(platt_a * z + platt_b) for z in calib_scores]
+        threshold = _calibrate_threshold(
+            calib_probs, calib_labels, target_tpr, pnls=calib_pnls
+        )
 
         meta = MetaJudge(
             stumps=stumps,
@@ -439,7 +501,10 @@ class MetaJudge:
             feature_index=feature_index,
             train_meta={
                 "n_train": n,
-                "wins_train": sum(labels01),
+                "n_fit": n_fit,
+                "n_calibration": len(calib_idx),
+                "platt_calibration": calibration,
+                "wins_train": sum(labels01_full),
                 "target_tpr": target_tpr,
                 "stumps": n_stumps,
                 "operating_threshold": threshold,

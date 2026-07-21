@@ -11,6 +11,12 @@ from app.database import DB_PATH
 from app.services.orchestrator import run_scan_cycle
 from app.services.thinking_analyst import analyze_signal_deep
 
+# The Live feed shows only recent signals. Older undismissed rows persist in
+# the DB for analytics but are NOT surfaced as if they were current — otherwise
+# a quiet scan (0 new signals) leaves last week's stale cards on screen looking
+# like fresh output. Callers can override via ?max_age_days=.
+_FEED_MAX_AGE_DAYS = 7
+
 router = APIRouter(prefix="/api/signals", tags=["signals"])
 logger = logging.getLogger(__name__)
 
@@ -28,8 +34,22 @@ def _row_to_signal(row: aiosqlite.Row) -> dict:
 
 
 @router.get("/latest")
-async def get_latest_signals(since: Optional[str] = None, limit: int = 50):
-    """Get latest signals, optionally filtered by timestamp."""
+async def get_latest_signals(
+    since: Optional[str] = None,
+    limit: int = 50,
+    max_age_days: int = _FEED_MAX_AGE_DAYS,
+):
+    """Get latest signals, optionally filtered by timestamp.
+
+    Signals older than ``max_age_days`` are never surfaced here, so a quiet
+    scan shows an empty feed ("No new signals") instead of last week's stale
+    cards dressed up as current output. The stronger of ``since`` and the
+    age cutoff wins.
+    """
+    from datetime import datetime, timezone, timedelta
+    age_cutoff = (datetime.now(timezone.utc) - timedelta(days=max_age_days)).isoformat()
+    # Use the later (more recent) of an explicit `since` and the age cutoff.
+    cutoff = max(since, age_cutoff) if since else age_cutoff
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         # strength > 0 excludes signals that the edge filter has muted
@@ -37,27 +57,20 @@ async def get_latest_signals(since: Optional[str] = None, limit: int = 50):
         # rsi_extreme). They stay in the DB for analytics, but the Live
         # tab should not present a "SELL HOLD BUY" card the engine has
         # already deemed worthless.
-        if since:
-            async with db.execute(
-                """SELECT * FROM signals
-                   WHERE dismissed = 0 AND strength > 0 AND created_at > ?
-                   ORDER BY created_at DESC LIMIT ?""",
-                (since, limit),
-            ) as cursor:
-                rows = await cursor.fetchall()
-        else:
-            async with db.execute(
-                """SELECT * FROM signals
-                   WHERE dismissed = 0 AND strength > 0
-                   ORDER BY created_at DESC LIMIT ?""",
-                (limit,),
-            ) as cursor:
-                rows = await cursor.fetchall()
+        async with db.execute(
+            """SELECT * FROM signals
+               WHERE dismissed = 0 AND strength > 0 AND created_at > ?
+               ORDER BY created_at DESC LIMIT ?""",
+            (cutoff, limit),
+        ) as cursor:
+            rows = await cursor.fetchall()
 
         signals = [_row_to_signal(r) for r in rows]
 
         async with db.execute(
-            "SELECT COUNT(*) FROM signals WHERE read = 0 AND dismissed = 0 AND strength > 0"
+            "SELECT COUNT(*) FROM signals WHERE read = 0 AND dismissed = 0 "
+            "AND strength > 0 AND created_at > ?",
+            (age_cutoff,),
         ) as cursor:
             count_row = await cursor.fetchone()
             unread_count = count_row[0] if count_row else 0

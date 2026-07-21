@@ -19,7 +19,7 @@ import asyncio
 import logging
 import math
 from statistics import mean, pstdev
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 import pandas as pd
 
@@ -28,6 +28,7 @@ from app.services.backtester import (
     _evaluate_outcome_realistic,
 )
 from app.services.data_fetcher import MAJOR_STOCKS, async_fetch_history
+from app.services import holdout
 from app.services.signal_engine import scan_symbol
 from app.services.technicals import compute_support_resistance, compute_technicals
 from app.utils import safe_float
@@ -84,6 +85,70 @@ def _regime_at_bar(tech: dict[str, Any]) -> str:
     return "trend_up" if price > sma50 else "trend_down"
 
 
+def _simulate_path_exit(
+    direction: str,
+    entry: float,
+    stop: float,
+    target: float,
+    highs: Sequence[float],
+    lows: Sequence[float],
+    closes: Sequence[float],
+    opens: Optional[Sequence[float]] = None,
+) -> tuple[float, str, int]:
+    """Simulate a live-style stop/target/time exit over a forward OHLC path.
+
+    `highs`/`lows`/`closes` are the bars AFTER entry, chronological (i+1, i+2,
+    ...). Returns ``(exit_price, exit_reason, bars_held)`` where exit_reason is
+    "stop" | "target" | "time".
+
+    This replaces the old fixed-horizon mark-to-close, which assumed every
+    trade was held the full window with no stop/target — diverging sharply from
+    the live engine (which exits at an ATR stop, a target, or a time barrier).
+    A 1-3 day edge marked at close[i+w] looked profitable in backtest yet
+    stopped out live; aligning the exit model is what closes that gap.
+
+    **Gap-through slippage (2.5).** A stop is a stop-MARKET order: when a bar
+    GAPS past the stop (opens beyond it), the real fill is at that open, not at
+    the stop price. Modelling the fill exactly at the stop understates losses on
+    gap days — the single biggest optimism left in the backtest exit. When
+    ``opens`` is supplied, a bar whose open has already gapped through the stop
+    fills at the open (worse); intrabar touches still fill at the stop. The
+    favourable case (a bar gapping past the TARGET) is deliberately NOT credited
+    the extra move — the target fills at the target price — so the model can
+    only be pessimistic, never optimistic. With ``opens=None`` the legacy
+    fill-at-stop behaviour is preserved.
+
+    Daily bars hide intrabar order, so when one bar's range spans BOTH stop and
+    target we assume the STOP filled first — the honest, risk-first convention
+    (matches recommendation_calibration). If neither is touched across the whole
+    path, exit at the final close (time-exit).
+    """
+    up = direction == "bullish"
+    n = len(closes)
+    for k in range(n):
+        hi = float(highs[k]); lo = float(lows[k])
+        o = float(opens[k]) if opens is not None and k < len(opens) else None
+        if up:
+            # Gap-down through the stop → fill at the (worse) open.
+            if o is not None and o <= stop:
+                return o, "stop", k + 1
+            if lo <= stop:
+                return stop, "stop", k + 1
+            if hi >= target:
+                return target, "target", k + 1
+        else:  # bearish / short: stop is ABOVE entry, target BELOW
+            # Gap-up through the stop → fill at the (worse) open.
+            if o is not None and o >= stop:
+                return o, "stop", k + 1
+            if hi >= stop:
+                return stop, "stop", k + 1
+            if lo <= target:
+                return target, "target", k + 1
+    if n == 0:
+        return entry, "time", 0
+    return float(closes[-1]), "time", n
+
+
 async def _scan_fold(
     symbol: str,
     df: pd.DataFrame,
@@ -99,14 +164,23 @@ async def _scan_fold(
     """
     out: list[dict[str, Any]] = []
     close_values = df["Close"].values
+    # High/Low needed to simulate intra-window stop/target hits (item 8).
+    high_values = df["High"].values if "High" in df.columns else close_values
+    low_values = df["Low"].values if "Low" in df.columns else close_values
+    # Open needed to model gap-through slippage on exits (2.5) — a bar that
+    # gaps past the stop fills at the open, not at the stop price.
+    open_values = df["Open"].values if "Open" in df.columns else close_values
     total_bars = len(df)
     max_eval = max(eval_windows)
+    # Live-style ATR stop/target bands, so the backtest exit model matches the
+    # engine instead of marking fixed-horizon close-to-close.
+    from app.services.recommendation_factors import entry_sl_targets
 
     # Pre-compute realistic per-bar slippage inputs: 20-day average daily
     # value and realised volatility. Used to feed sqrt-impact in lieu of
     # the flat 20-bp cost. Skipping the high/low fallback for speed —
     # the impact term dominates for small participation anyway.
-    from app.services.execution_costs import round_trip_cost_pct
+    from app.services.execution_costs import round_trip_cost_pct, sqrt_impact_cost_bps
     dollar_vol = (df["Close"] * df.get("Volume", 0)).fillna(0)
     adv_20 = dollar_vol.rolling(20, min_periods=10).mean()
     rets = df["Close"].pct_change()
@@ -132,6 +206,19 @@ async def _scan_fold(
             continue
         if not sigs:
             continue
+        # 3.4 — apply the SAME earnings blackout the live scan uses, using the
+        # point-in-time historical calendar. Removes the live/backtest mismatch
+        # where the backtest traded through earnings the live engine sat out.
+        # Inert (no skip) when no calendar data is present.
+        try:
+            from app.services.earnings_calendar_pit import is_in_blackout_at, has_calendar
+            if has_calendar():
+                bar_date = df.index[i]
+                asof = bar_date.date() if hasattr(bar_date, "date") else bar_date
+                if is_in_blackout_at(symbol, asof):
+                    continue
+        except Exception:
+            pass
         entry = safe_float(close_values[i])
         if not entry:
             continue
@@ -141,10 +228,25 @@ async def _scan_fold(
         # than absolute INR (1% × entry as nominal trade value).
         adv_inr_i = float(adv_20.iloc[i]) if i < len(adv_20) and adv_20.iloc[i] == adv_20.iloc[i] else 0.0
         vol_pct_i = float(vol_20.iloc[i]) * 100 if i < len(vol_20) and vol_20.iloc[i] == vol_20.iloc[i] else 0.0
+        _trade_value_inr = adv_inr_i * 0.005 if adv_inr_i > 0 else entry
+        _adv_value_inr = adv_inr_i if adv_inr_i > 0 else max(entry, 1.0) * 1e6
+        _daily_vol_pct = vol_pct_i if vol_pct_i > 0 else 1.5
         rt_cost = round_trip_cost_pct(
-            trade_value_inr=adv_inr_i * 0.005 if adv_inr_i > 0 else entry,
-            avg_daily_value_inr=adv_inr_i if adv_inr_i > 0 else max(entry, 1.0) * 1e6,
-            daily_vol_pct=vol_pct_i if vol_pct_i > 0 else 1.5,
+            trade_value_inr=_trade_value_inr,
+            avg_daily_value_inr=_adv_value_inr,
+            daily_vol_pct=_daily_vol_pct,
+        )
+        # Size-aware market-impact component of the round-trip cost (round trip
+        # = 2× one-way impact_bps). This is the piece apply_costs' flat
+        # ADV-bucket slippage can't express; we feed it into the P&L below so
+        # the sqrt-impact model actually reduces headline returns instead of
+        # being computed and shelved.
+        _impact_rt_pct = (
+            sqrt_impact_cost_bps(
+                trade_value_inr=_trade_value_inr,
+                avg_daily_value_inr=_adv_value_inr,
+                daily_vol_pct=_daily_vol_pct,
+            )["impact_bps"] * 2 / 100.0
         )
         # Pre-compute engineered features the meta-judge can train on.
         # These are *legitimate-at-decision-time* (the engine sees them too
@@ -162,12 +264,14 @@ async def _scan_fold(
             ret_20d = 0.0
         rsi_now = float(tech.get("rsi") or 50.0) if isinstance(tech, dict) else 50.0
         atr_pct = (vol_pct_i if vol_pct_i > 0 else 1.5)
+        atr_abs = float(tech.get("atr") or 0.0) if isinstance(tech, dict) else 0.0
 
         for sig in sigs:
+            direction = sig.get("direction", "neutral")
             row: dict[str, Any] = {
                 "symbol": symbol, "bar_index": i, "entry_price": entry,
                 "signal_type": sig.get("signal_type", "unknown"),
-                "direction": sig.get("direction", "neutral"),
+                "direction": direction,
                 "regime": regime,
                 "rt_cost_pct": rt_cost,
                 # Engineered features for the meta-judge.
@@ -179,29 +283,51 @@ async def _scan_fold(
                 "rsi": round(rsi_now, 1),
                 "atr_pct": round(atr_pct, 2),
             }
+            # Live-style ATR stop/target for directional signals (item 8). Use
+            # the same swing bands the recommendation engine applies; neutral
+            # signals have no tradable direction so they keep mark-to-close.
+            directional = direction in ("bullish", "bearish")
+            if directional:
+                _, stop_px, tgt_px, _ = entry_sl_targets(
+                    entry, atr_abs or None, "swing", direction == "bullish")
             for w in eval_windows:
                 fut = i + w
                 if fut < total_bars:
-                    fp = safe_float(close_values[fut])
-                    if fp:
+                    if directional:
+                        # Walk bars i+1..i+w; exit at stop/target if breached
+                        # intra-window, else time-exit at close[i+w].
+                        exit_px, exit_reason, bars_held = _simulate_path_exit(
+                            direction, entry, stop_px, tgt_px,
+                            high_values[i + 1: fut + 1],
+                            low_values[i + 1: fut + 1],
+                            close_values[i + 1: fut + 1],
+                            open_values[i + 1: fut + 1],
+                        )
+                    else:
+                        exit_px, exit_reason, bars_held = (
+                            safe_float(close_values[fut]), "time", w)
+                    if exit_px:
                         # Net-of-cost via apply_costs (brokerage + STT + DP +
                         # slippage). Falls back to the legacy flat-cost
                         # evaluator if any input is malformed.
                         try:
                             res = _evaluate_outcome_realistic(
-                                row["direction"], entry, fp,
+                                direction, entry, exit_px,
                                 qty=1,
                                 segment="cash",
                                 avg_daily_volume=adv_inr_i / max(entry, 1.0) if adv_inr_i else None,
+                                extra_slippage_pct=_impact_rt_pct,
                             )
                         except Exception:
                             res = _evaluate_outcome(
-                                row["direction"], entry, fp,
+                                direction, entry, exit_px,
                                 transaction_cost_pct=rt_cost,
                             )
                         row[f"pnl_{w}d"] = res["pnl_pct"]
                         row[f"win_{w}d"] = res["win"]
                         row[f"neutral_{w}d"] = res["neutral"]
+                        row[f"exit_reason_{w}d"] = exit_reason
+                        row[f"bars_held_{w}d"] = bars_held
                         if "gross_pnl_pct" in res:
                             row[f"gross_pnl_{w}d"] = res["gross_pnl_pct"]
                             row[f"costs_pct_{w}d"] = res["costs_pct"]
@@ -249,6 +375,21 @@ def _fold_metrics(trades: list[dict[str, Any]], eval_windows: list[int]) -> dict
         except Exception:
             pass
 
+        # Benchmark attribution — only present when NIFTY data resolved.
+        excesses = [
+            t[f"excess_pnl_{w}d"] for t in trades
+            if f"excess_pnl_{w}d" in t and not t.get(f"neutral_{w}d", False)
+        ]
+        if excesses:
+            benches = [
+                t[f"bench_ret_{w}d"] for t in trades
+                if f"bench_ret_{w}d" in t and not t.get(f"neutral_{w}d", False)
+            ]
+            metrics[f"excess_avg_pnl_{w}d"] = round(mean(excesses), 4)
+            metrics[f"bench_avg_ret_{w}d"] = round(mean(benches), 4) if benches else None
+            metrics[f"excess_positive_{w}d"] = round(
+                sum(1 for e in excesses if e > 0) / len(excesses) * 100, 2)
+
         # Worst peak-to-trough equity drawdown across the chronological
         # sequence. Negative number; -0.25 = 25% drawdown.
         if pnls:
@@ -268,6 +409,69 @@ def _fold_metrics(trades: list[dict[str, Any]], eval_windows: list[int]) -> dict
     return metrics
 
 
+# ── Benchmark attribution (NIFTY) ────────────────────────────
+# A long-biased book in a rising tape looks like alpha unless every trade is
+# compared against simply holding the index over the same bars. Each trade
+# gets `bench_ret_{w}d` (NIFTY return over its actual holding period) and
+# `excess_pnl_{w}d` (direction-aware: a short's alpha is pnl PLUS the index
+# move it was fighting). Fail-open: no benchmark data → no keys attached.
+_BENCH_SYMBOL = "^NSEI"
+_bench_cache: dict[str, tuple[float, Any]] = {}
+_BENCH_TTL = 3600.0
+
+
+async def _get_benchmark_closes(period: str):
+    """NIFTY close series for `period`, memoized so a 40-symbol universe run
+    doesn't fetch the same index history 40 times."""
+    import time as _time
+    hit = _bench_cache.get(period)
+    if hit and (_time.time() - hit[0]) < _BENCH_TTL:
+        return hit[1]
+    try:
+        bdf = await async_fetch_history(_BENCH_SYMBOL, period=period, interval="1d")
+        closes = bdf["Close"] if bdf is not None and not bdf.empty else None
+    except Exception:
+        closes = None
+    _bench_cache[period] = (_time.time(), closes)
+    return closes
+
+
+def _attach_benchmark(
+    trades: list[dict[str, Any]],
+    symbol_index,
+    bench_closes,
+    eval_windows: list[int],
+) -> None:
+    """Stamp per-trade benchmark + excess returns in place."""
+    if bench_closes is None or not trades:
+        return
+    import pandas as pd
+    bench_idx = pd.DatetimeIndex(pd.to_datetime(bench_closes.index)).tz_localize(None)
+    sym_idx = pd.DatetimeIndex(pd.to_datetime(symbol_index)).tz_localize(None)
+    bench_vals = bench_closes.values
+    for t in trades:
+        i = t.get("bar_index")
+        if i is None or i >= len(sym_idx):
+            continue
+        pos = bench_idx.searchsorted(sym_idx[i])
+        if pos >= len(bench_vals):
+            continue
+        entry_b = float(bench_vals[pos])
+        if entry_b <= 0:
+            continue
+        for w in eval_windows:
+            if f"pnl_{w}d" not in t:
+                continue
+            held = int(t.get(f"bars_held_{w}d") or w)
+            exit_pos = min(pos + held, len(bench_vals) - 1)
+            if exit_pos <= pos:
+                continue
+            bench_ret = (float(bench_vals[exit_pos]) - entry_b) / entry_b * 100.0
+            t[f"bench_ret_{w}d"] = round(bench_ret, 4)
+            sign = -1.0 if t.get("direction") == "bearish" else 1.0
+            t[f"excess_pnl_{w}d"] = round(t[f"pnl_{w}d"] - sign * bench_ret, 4)
+
+
 def _wilson_lb(wins: int, n: int, z: float = 1.96) -> Optional[float]:
     if n <= 0:
         return None
@@ -284,16 +488,25 @@ async def run_walk_forward(
     n_folds: int = 4,
     eval_windows: list[int] | None = None,
     exchange: str = "NSE",
+    referee: bool = False,
 ) -> dict[str, Any]:
     """Walk-forward backtest on a single symbol.
 
     Returns per-fold metrics + an OOS-only aggregate that combines all
     test folds (no overlap with the train portion that fed each fold's
     signal stats).
+
+    This is a SELECTION path (it feeds the FDR gating loop), so by default it
+    refuses to read past the pinned holdout boundary (1.2). ``referee=True`` is
+    the deliberate, one-time escape hatch that reads the reserved window for the
+    final out-of-sample verdict.
     """
     eval_windows = eval_windows or [1, 3, 5, 10]
     max_eval = max(eval_windows)
     df = await async_fetch_history(symbol, period=period, interval="1d", exchange=exchange)
+    # 1.2 — quarantine the reserved holdout from selection.
+    boundary = await holdout.resolve_boundary()
+    df = holdout.trim_history(df, boundary, referee=referee)
     if df is None or df.empty or len(df) < MIN_LOOKBACK * 4 + max_eval:
         return {"symbol": symbol, "error": "insufficient_history", "bars": len(df) if df is not None else 0}
 
@@ -301,17 +514,27 @@ async def run_walk_forward(
     if not folds:
         return {"symbol": symbol, "error": "could_not_split_folds", "bars": len(df)}
 
-    fold_reports: list[dict[str, Any]] = []
+    fold_trades: list[tuple[int, int, int, list[dict[str, Any]]]] = []
     all_trades: list[dict[str, Any]] = []
     for k, (_ts, train_end, test_end) in enumerate(folds):
         trades = await _scan_fold(symbol, df, train_end, test_end, eval_windows)
+        fold_trades.append((k, train_end, test_end, trades))
+        all_trades.extend(trades)
+
+    # Benchmark attribution BEFORE metrics so excess-return aggregates land
+    # in both the per-fold and pooled summaries. Skip for the index itself.
+    if symbol != _BENCH_SYMBOL:
+        bench_closes = await _get_benchmark_closes(period)
+        _attach_benchmark(all_trades, df.index, bench_closes, eval_windows)
+
+    fold_reports: list[dict[str, Any]] = []
+    for k, train_end, test_end, trades in fold_trades:
         fold_reports.append({
             "fold": k, "train_end": train_end, "test_end": test_end,
             "metrics": _fold_metrics(trades, eval_windows),
             # Trades kept so the universe runner can pool OOS samples.
             "trades": trades,
         })
-        all_trades.extend(trades)
 
     return {
         "symbol": symbol,
@@ -319,7 +542,11 @@ async def run_walk_forward(
         "period": period,
         "total_bars": len(df),
         "n_folds": len(folds),
-        "transaction_cost_pct": TRANSACTION_COST_PCT,
+        # Trades are evaluated net of the FULL execution_costs model (brokerage
+        # + STT + exchange + SEBI + DP + GST + slippage); the flat constant is
+        # only the legacy fallback used when a cost input is malformed.
+        "cost_model": "execution_costs.apply_costs",
+        "transaction_cost_pct_fallback": TRANSACTION_COST_PCT,
         "folds": fold_reports,
         "oos_summary": _fold_metrics(all_trades, eval_windows),
         "methodology": {
@@ -328,6 +555,10 @@ async def run_walk_forward(
             "entry": "close_of_signal_bar",
             "eval": "close_of_bar_plus_window",
             "win_rate_lb95": "Wilson 95% lower bound — penalises small samples",
+            "benchmark": (
+                f"{_BENCH_SYMBOL} over each trade's actual holding period; "
+                "excess_pnl is direction-aware (short alpha = pnl + index move)"
+            ),
         },
     }
 
@@ -338,6 +569,7 @@ async def run_universe_walk_forward(
     n_folds: int = 4,
     eval_windows: list[int] | None = None,
     parallelism: int = 6,
+    referee: bool = False,
 ) -> dict[str, Any]:
     """Multi-symbol walk-forward; aggregates per-signal-type OOS stats.
 
@@ -355,7 +587,7 @@ async def run_universe_walk_forward(
     async def _one(sym: str) -> dict[str, Any]:
         async with sem:
             try:
-                return await run_walk_forward(sym, period=period, n_folds=n_folds, eval_windows=eval_windows)
+                return await run_walk_forward(sym, period=period, n_folds=n_folds, eval_windows=eval_windows, referee=referee)
             except Exception as e:
                 logger.warning("walk-forward failed for %s: %s", sym, e)
                 return {"symbol": sym, "error": str(e)}

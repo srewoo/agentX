@@ -32,7 +32,9 @@ from typing import Any, Optional
 import aiosqlite
 
 from app.database import DB_PATH
-from app.services.multiple_testing import Candidate, select_significant
+from app.services.multiple_testing import (
+    Candidate, select_significant, wilson_lower_bound,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +42,24 @@ PROMOTE_AFTER = 3   # consecutive significant rounds to reach PROMOTED
 DEMOTE_AFTER = 2    # consecutive failures to leave PROMOTED
 MUTE_WINRATE = 0.45     # win rate below this on a large sample → MUTED
 MUTE_MIN_TRADES = 100   # sample needed before a MUTE is trusted
+
+# ── 1.3 Per-signal pre-registered kill criteria ──────────────
+# A (signal_type, direction) combo dies AUTOMATICALLY — terminal `killed`
+# state, no re-entry — once it has enough LIVE (forward) trades and even the
+# optimistic (Wilson lower-bound) case for its win rate is below the
+# pre-registered floor. Pre-registered here, in code, so it can't be moved
+# after seeing the data. `killed` is terminal; only wiping the row (a fresh
+# forward test) revives the combo.
+KILL_MIN_LIVE_TRADES = 50   # live trades required before a kill can fire
+KILL_WILSON_LB = 0.40       # Wilson-LB win rate below this on ≥50 live → KILLED
+
+# Demotion is irreversible without FRESH forward evidence: once a combo has
+# ever left PROMOTED (or been MUTED), backtest passes alone cannot re-promote
+# it. Re-promotion additionally requires a live record clearing this bar — so a
+# refuted edge can't quietly re-enter on the same in-sample signal that the
+# forward test already contradicted.
+REPROMOTE_MIN_LIVE = 30     # live trades required to overturn a demotion
+REPROMOTE_WILSON_LB = 0.50  # live Wilson-LB must clear break-even to re-promote
 
 CREATE_GATING_STATE_TABLE = """
 CREATE TABLE IF NOT EXISTS gating_state (
@@ -52,7 +72,8 @@ CREATE TABLE IF NOT EXISTS gating_state (
     last_n INTEGER,
     last_p_value REAL,
     updated_at TEXT,
-    history_json TEXT
+    history_json TEXT,
+    demoted_ever INTEGER DEFAULT 0
 );
 """
 
@@ -74,33 +95,69 @@ CREATE TABLE IF NOT EXISTS gating_pending (
 async def _ensure(db: aiosqlite.Connection) -> None:
     await db.execute(CREATE_GATING_STATE_TABLE)
     await db.execute(CREATE_GATING_PENDING_TABLE)
+    # Migration: add demoted_ever to pre-existing tables (idempotent).
+    async with db.execute("PRAGMA table_info(gating_state)") as cur:
+        cols = {r[1] for r in await cur.fetchall()}
+    if "demoted_ever" not in cols:
+        await db.execute(
+            "ALTER TABLE gating_state ADD COLUMN demoted_ever INTEGER DEFAULT 0")
 
 
 def _next_state(
     current: str, *, passed: bool, win_rate: float, n: int,
     consecutive_pass: int, consecutive_fail: int,
-) -> tuple[str, int, int]:
-    """Pure transition function. Returns (state, consecutive_pass, consecutive_fail)."""
+    live_wins: int = 0, live_n: int = 0, demoted_ever: bool = False,
+) -> tuple[str, int, int, bool]:
+    """Pure transition function.
+
+    Returns (state, consecutive_pass, consecutive_fail, demoted_ever).
+
+    Priority of rules:
+      1. ``killed`` is terminal — a killed combo never transitions again.
+      2. Per-signal kill: ≥ KILL_MIN_LIVE_TRADES live trades with a live
+         Wilson-LB below KILL_WILSON_LB ⇒ KILLED (automatic, pre-registered).
+      3. Hysteresis promote/demote as before, BUT a combo that was ever
+         demoted needs fresh forward evidence (live Wilson-LB ≥ REPROMOTE
+         bar on ≥ REPROMOTE_MIN_LIVE trades) to re-promote — backtest passes
+         alone can't revive a forward-refuted edge.
+    """
+    if current == "killed":
+        return "killed", consecutive_pass, consecutive_fail, demoted_ever
+
+    # Rule 2 — automatic kill on a well-sampled, forward-refuted combo.
+    if live_n >= KILL_MIN_LIVE_TRADES and wilson_lower_bound(live_wins, live_n) < KILL_WILSON_LB:
+        return "killed", 0, consecutive_fail + 1, True
+
+    forward_ok = (live_n >= REPROMOTE_MIN_LIVE
+                  and wilson_lower_bound(live_wins, live_n) >= REPROMOTE_WILSON_LB)
+
     if passed:
         consecutive_pass += 1
         consecutive_fail = 0
-        if consecutive_pass >= PROMOTE_AFTER:
-            return "promoted", consecutive_pass, consecutive_fail
+        if consecutive_pass >= PROMOTE_AFTER and current != "promoted":
+            # Irreversibility: a previously-demoted combo may only re-promote
+            # with fresh forward evidence; otherwise it stays a candidate.
+            if demoted_ever and not forward_ok:
+                return "candidate", consecutive_pass, consecutive_fail, demoted_ever
+            return "promoted", consecutive_pass, consecutive_fail, demoted_ever
+        if current == "promoted":
+            return "promoted", consecutive_pass, consecutive_fail, demoted_ever
         # A passing combo that isn't yet promoted is a candidate (clears MUTE).
-        return ("promoted" if current == "promoted" else "candidate",
-                consecutive_pass, consecutive_fail)
+        return "candidate", consecutive_pass, consecutive_fail, demoted_ever
+
     # Did not pass this round.
     consecutive_fail += 1
     consecutive_pass = 0
     if current == "promoted":
         if consecutive_fail >= DEMOTE_AFTER:
-            return "candidate", consecutive_pass, consecutive_fail
-        return "promoted", consecutive_pass, consecutive_fail  # grace period
+            # Demotion — permanently flag so re-promotion needs forward proof.
+            return "candidate", consecutive_pass, consecutive_fail, True
+        return "promoted", consecutive_pass, consecutive_fail, demoted_ever  # grace
     # Mute only on a clear, well-sampled negative — not mere non-significance.
     if n >= MUTE_MIN_TRADES and win_rate < MUTE_WINRATE:
-        return "muted", consecutive_pass, consecutive_fail
+        return "muted", consecutive_pass, consecutive_fail, True
     return ("muted" if current == "muted" else "candidate",
-            consecutive_pass, consecutive_fail)
+            consecutive_pass, consecutive_fail, demoted_ever)
 
 
 async def update_gating_state(
@@ -133,21 +190,24 @@ async def update_gating_state(
             passed = bool(v and v.passed)
             wr = (cand.wins / cand.n) if cand.n > 0 else 0.0
             async with db.execute(
-                "SELECT state, consecutive_pass, consecutive_fail, history_json "
-                "FROM gating_state WHERE key = ?", (cand.key,)
+                "SELECT state, consecutive_pass, consecutive_fail, history_json, "
+                "demoted_ever FROM gating_state WHERE key = ?", (cand.key,)
             ) as cur:
                 row = await cur.fetchone()
             current = row["state"] if row else "candidate"
             cp = row["consecutive_pass"] if row else 0
             cf = row["consecutive_fail"] if row else 0
+            demoted_ever = bool(row["demoted_ever"]) if row else False
             try:
                 history = json.loads(row["history_json"]) if row and row["history_json"] else []
             except Exception:
                 history = []
 
-            new_state, cp, cf = _next_state(
+            new_state, cp, cf, demoted_ever = _next_state(
                 current, passed=passed, win_rate=wr, n=cand.n,
-                consecutive_pass=cp, consecutive_fail=cf)
+                consecutive_pass=cp, consecutive_fail=cf,
+                live_wins=cand.live_wins, live_n=cand.live_n,
+                demoted_ever=demoted_ever)
 
             # A5: in veto mode, a state CHANGE is held as a pending proposal —
             # the live state does not move until a human approves. Counters
@@ -172,16 +232,16 @@ async def update_gating_state(
             await db.execute(
                 "INSERT INTO gating_state (key, kind, state, consecutive_pass, "
                 "consecutive_fail, last_win_rate, last_n, last_p_value, updated_at, "
-                "history_json) VALUES (?,?,?,?,?,?,?,?,?,?) "
+                "history_json, demoted_ever) VALUES (?,?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(key) DO UPDATE SET state=excluded.state, "
                 "consecutive_pass=excluded.consecutive_pass, "
                 "consecutive_fail=excluded.consecutive_fail, "
                 "last_win_rate=excluded.last_win_rate, last_n=excluded.last_n, "
                 "last_p_value=excluded.last_p_value, updated_at=excluded.updated_at, "
-                "history_json=excluded.history_json",
+                "history_json=excluded.history_json, demoted_ever=excluded.demoted_ever",
                 (cand.key, kind, new_state, cp, cf, round(wr, 4), cand.n,
                  round(v.p_value, 6) if v else None, now,
-                 json.dumps(history[-50:])),
+                 json.dumps(history[-50:]), int(demoted_ever)),
             )
         await db.commit()
 
@@ -196,7 +256,8 @@ async def get_active_gating(*, db_path: Optional[str] = None) -> dict[str, Any]:
     hand-curated constants, so this is safe to consult unconditionally.
     """
     path = db_path or DB_PATH
-    out = {"promoted": set(), "muted": set(), "blocked": set(), "candidate": set()}
+    out = {"promoted": set(), "muted": set(), "blocked": set(),
+           "candidate": set(), "killed": set()}
     try:
         async with aiosqlite.connect(path) as db:
             await _ensure(db)
@@ -262,9 +323,13 @@ _overlay: dict[str, set] = {"promoted": set(), "muted": set(), "blocked": set()}
 
 def set_overlay(sets: dict[str, set]) -> None:
     global _overlay
+    # `killed` combos are permanently un-tradeable — fold them into the muted
+    # overlay so the sync hot-path (which already respects mutes) blocks them
+    # without needing a separate predicate.
+    muted = set(sets.get("muted") or ()) | set(sets.get("killed") or ())
     _overlay = {
         "promoted": set(sets.get("promoted") or ()),
-        "muted": set(sets.get("muted") or ()),
+        "muted": muted,
         "blocked": set(sets.get("blocked") or ()),
     }
 
@@ -273,7 +338,7 @@ async def seed_overlay(*, db_path: Optional[str] = None) -> int:
     """Load derived sets into the sync overlay cache. Call at startup."""
     active = await get_active_gating(db_path=db_path)
     set_overlay(active)
-    return sum(len(active.get(k, ())) for k in ("promoted", "muted", "blocked"))
+    return sum(len(active.get(k, ())) for k in ("promoted", "muted", "blocked", "killed"))
 
 
 def overlay_is_promoted(signal_type: str, direction: str) -> Optional[bool]:

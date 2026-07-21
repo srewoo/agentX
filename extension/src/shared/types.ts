@@ -540,3 +540,21 @@ export interface HealthResponse {
   market_open: boolean;
   orchestrator_running: boolean;
 }
+
+export interface Scorecard {
+  forward_trades: number;
+  target_trades: number;
+  progress_pct: number;
+  excess_expectancy_pct: number | null;
+  excess_expectancy_lb95_pct: number | null;
+  raw_expectancy_pct: number | null;
+  win_rate: number | null;
+  win_rate_ci: [number, number] | null;
+  sharpe_per_trade: number | null;
+  max_drawdown_pct: number | null;
+  brier: number | null;
+  benchmark_symbol: string | null;
+  attributed_trades: number | null;
+  verdict: "PROVEN" | "SIGNIFICANT_BUT_UNDER_SAMPLE" | "PROMISING" | "NO_EDGE_YET";
+  ready: boolean;
+}

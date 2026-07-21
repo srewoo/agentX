@@ -63,6 +63,15 @@ _INDEX_KEYS = {
     "FINNIFTY": "NSE_INDEX|Nifty Fin Service",
     "MIDCPNIFTY": "NSE_INDEX|NIFTY MID SELECT",
     "SENSEX": "BSE_INDEX|SENSEX",
+    "INDIA VIX": "NSE_INDEX|India VIX",
+    # Aliases so callers using the market_snapshot display names or the
+    # yfinance-style tickers resolve to the same Upstox instrument keys.
+    "NIFTY 50": "NSE_INDEX|Nifty 50",
+    "NIFTY BANK": "NSE_INDEX|Nifty Bank",
+    "^NSEI": "NSE_INDEX|Nifty 50",
+    "^NSEBANK": "NSE_INDEX|Nifty Bank",
+    "^INDIAVIX": "NSE_INDEX|India VIX",
+    "^BSESN": "BSE_INDEX|SENSEX",
 }
 
 
@@ -192,7 +201,9 @@ def _sync_fetch_history(
     up_interval = _INTERVAL_MAP.get(interval)
     if up_interval is None:
         return None  # intraday — not our job; let yfinance handle it
-    key = _resolve_instrument_key(symbol, exchange)
+    # Indices (^NSEI, NIFTY 50, India VIX, …) resolve from _INDEX_KEYS first;
+    # everything else from the equity instrument master.
+    key = _INDEX_KEYS.get(symbol.upper()) or _resolve_instrument_key(symbol, exchange)
     if not key:
         logger.debug("upstox: no instrument_key for %s on %s", symbol, exchange)
         return None

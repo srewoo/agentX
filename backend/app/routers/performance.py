@@ -220,6 +220,74 @@ async def forward_performance_report(benchmark_return_pct: Optional[float] = Non
     return {"data": await forward_performance(benchmark_return_pct=benchmark_return_pct)}
 
 
+@router.get("/scorecard")
+async def north_star_scorecard():
+    """The north-star scorecard — the ONE view every decision should key off.
+
+    Leads with cost-adjusted, benchmark-EXCESS expectancy per trade and its 95%
+    lower bound (is the edge above zero *with confidence*?), the calibration
+    Brier score (can we trust the stated probabilities?), and forward-trade
+    progress toward the 300-trade proof bar. Win rate is intentionally demoted
+    to a supporting stat — it is not the objective.
+    """
+    from app.services.forward_report import forward_performance, DEFAULT_TARGET_TRADES
+    from app.services.calibration_curve import build_calibration_curve
+
+    perf = await forward_performance()
+    bench = perf.get("benchmark") or {}
+
+    try:
+        calib = await build_calibration_curve()
+        brier = calib.get("brier_calibrated")
+    except Exception as e:
+        logger.debug("scorecard: calibration curve failed: %s", e)
+        brier = None
+
+    n = int(perf.get("trades", 0))
+    target = DEFAULT_TARGET_TRADES
+    # Prefer the benchmark-EXCESS expectancy (alpha) as the headline; fall back
+    # to raw expectancy before benchmark attribution exists.
+    excess_exp = bench.get("excess_expectancy_pct")
+    excess_lb = bench.get("excess_expectancy_lb95_pct")
+    headline_exp = excess_exp if excess_exp is not None else perf.get("expectancy_pct")
+    headline_lb = excess_lb if excess_lb is not None else perf.get("expectancy_lb95_pct")
+
+    # Verdict: the edge is PROVEN only when the sample is large enough AND the
+    # 95% lower bound on excess expectancy is above zero. Otherwise it is
+    # PROMISING (positive point estimate, not yet significant) or NOT_PROVEN.
+    ready = n >= target
+    lb = headline_lb if headline_lb is not None else 0.0
+    point = headline_exp if headline_exp is not None else 0.0
+    if ready and lb > 0:
+        verdict = "PROVEN"
+    elif lb > 0:
+        verdict = "SIGNIFICANT_BUT_UNDER_SAMPLE"
+    elif point > 0:
+        verdict = "PROMISING"
+    else:
+        verdict = "NO_EDGE_YET"
+
+    return {
+        "data": {
+            "forward_trades": n,
+            "target_trades": target,
+            "progress_pct": round(min(100.0, n / target * 100.0), 1) if target else 0.0,
+            "excess_expectancy_pct": headline_exp,
+            "excess_expectancy_lb95_pct": headline_lb,
+            "raw_expectancy_pct": perf.get("expectancy_pct"),
+            "win_rate": perf.get("win_rate"),
+            "win_rate_ci": perf.get("win_rate_ci"),
+            "sharpe_per_trade": perf.get("sharpe_per_trade"),
+            "max_drawdown_pct": perf.get("max_drawdown_pct"),
+            "brier": brier,
+            "benchmark_symbol": bench.get("symbol"),
+            "attributed_trades": bench.get("attributed_trades"),
+            "verdict": verdict,
+            "ready": ready,
+        }
+    }
+
+
 @router.get("/durability")
 async def durability_report(backtest_win_rate: float = 0.50):
     """Durability check (D4): is the forward win rate inside the backtest CI?
@@ -267,6 +335,47 @@ async def train_meta_label(n_splits: int = 5):
     """
     from app.services.ml_meta_label import train_meta_label_model
     return {"data": await train_meta_label_model(n_splits=n_splits)}
+
+
+@router.post("/train-conviction-model")
+async def train_conviction_model_endpoint():
+    """Fit + persist the conviction model (2.4).
+
+    Replaces the hand-tuned multiplicative conviction stack with one logistic
+    model over the same factors — but only DEPLOYS it when it beats that stack
+    on a chronological holdout. Otherwise the multiplicative stack keeps serving.
+    """
+    from app.services.conviction_model import train_conviction_model
+    return {"data": await train_conviction_model()}
+
+
+@router.get("/pipeline-bakeoff")
+async def pipeline_bakeoff():
+    """A-vs-B pipeline bake-off (2.1): survivor by OOS expectancy + Wilson-LB,
+    plus whether a deletion is authorized (only after ≥300 forward trades)."""
+    from app.services.pipeline_bakeoff import run_bakeoff, deletion_authorized
+    return {"data": {
+        "bakeoff": await run_bakeoff(),
+        "deletion_gate": await deletion_authorized(),
+    }}
+
+
+@router.get("/forward/regime-verdict")
+async def forward_regime_verdict():
+    """4.4 — forward verdict split by market regime (trend_up/down/sideways)
+    at each trade's entry, with Wilson bounds. An edge confined to one regime
+    is visible here rather than hidden in a blended win rate."""
+    from app.services.forward_report import regime_stratified_verdict
+    return {"data": await regime_stratified_verdict()}
+
+
+@router.get("/forward/selection-bias")
+async def forward_selection_bias():
+    """4.3 — selection-bias bound: taken-trade win rate vs a random ~5% shadow
+    sample of REJECTED candidates (outcomes simulated). Measures what the funnel
+    discards — the bias the meta-models, trained on taken trades only, can't see."""
+    from app.services.shadow_sample import bias_report
+    return {"data": await bias_report()}
 
 
 @router.get("/summary")

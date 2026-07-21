@@ -194,10 +194,18 @@ def apply_costs(
     holding_days: int = 1,
     avg_daily_volume: Optional[float] = None,
     volatile: bool = False,
+    extra_slippage_pct: float = 0.0,
 ) -> dict[str, float]:
     """Net P&L on a single position after brokerage, STT, DP, slippage, GST.
 
     Returns: {gross_pnl, net_pnl, total_costs_inr, breakdown{...}}.
+
+    `extra_slippage_pct` is an additional **size-aware** round-trip cost as a
+    percentage of buy notional — used to inject the Almgren-Chriss square-root
+    market-impact component (`sqrt_impact_cost_bps`) that the flat ADV-bucket
+    `_slippage_bps` cannot express (it is size-independent). Defaults to 0.0 so
+    existing callers are unaffected; walk-forward passes the impact term here
+    so headline P&L reflects the cost a Kelly-sized order would actually pay.
 
     Indian brokerage assumptions match Zerodha-tier discount broker pricing:
       • Equity delivery: 0% brokerage, STT 0.1% each side, exchange fee
@@ -254,6 +262,12 @@ def apply_costs(
     slip_bps = _slippage_bps(avg_daily_volume=avg_daily_volume, volatile=volatile)
     slippage = (slip_bps / 10_000.0) * (notional_buy + notional_sell)
     breakdown["slippage"] = round(slippage, 2)
+
+    # Size-aware market impact (Almgren-Chriss sqrt model), injected by the
+    # caller as a round-trip % of buy notional. Kept separate from the flat
+    # spread slippage above so both are visible in the breakdown.
+    if extra_slippage_pct and extra_slippage_pct > 0:
+        breakdown["market_impact"] = round((extra_slippage_pct / 100.0) * notional_buy, 2)
 
     total_costs = sum(breakdown.values())
     gross_pnl = (exit - entry) * qty

@@ -34,6 +34,7 @@ from app.services.data_fetcher import MAJOR_STOCKS, async_fetch_history
 from app.services.fundamentals_deep import get_deep_fundamentals
 from app.services.fundamentals_pit import get_pit_history, select_asof, _normalise as _normalise_pit
 from app.services.quality_value_strategy import QV_FILTERS, passes_qv_filters
+from app.services.execution_costs import round_trip_cost_pct
 
 logger = logging.getLogger(__name__)
 
@@ -249,12 +250,31 @@ async def _evaluate_one_symbol(
                 exit_reason = "catastrophe_stop"
                 exit_idx = j
                 break
-        pnl_pct = (exit_price - price) / price * 100.0
+        gross_pnl_pct = (exit_price - price) / price * 100.0
+        # Round-trip transaction cost (statutory + size-aware sqrt impact).
+        # Previously the QV backtester reported RAW close-to-close returns with
+        # zero costs, which overstates a long-only delivery strategy's edge by
+        # ~0.3-0.5pp/trade. Costs are a smaller fraction over a 365-day hold
+        # than for swing trades, but "net of nothing" is not a defensible
+        # base rate.
+        from statistics import pstdev as _pstdev
+        _win = closes[max(0, i - 20):i + 1]
+        _rets = [(_win[k] / _win[k - 1] - 1.0) * 100.0
+                 for k in range(1, len(_win)) if _win[k - 1]]
+        _daily_vol_pct = _pstdev(_rets) if len(_rets) > 1 else 1.5
+        rt_cost_pct = round_trip_cost_pct(
+            trade_value_inr=adv * 0.005 if adv > 0 else price,
+            avg_daily_value_inr=adv if adv > 0 else max(price, 1.0) * 1e6,
+            daily_vol_pct=_daily_vol_pct or 1.5,
+        )
+        pnl_pct = gross_pnl_pct - rt_cost_pct
         trades.append({
             "entry_idx": i, "entry_price": price,
             "exit_idx": exit_idx, "exit_price": exit_price,
             "exit_reason": exit_reason,
             "pnl_pct": round(pnl_pct, 3),
+            "gross_pnl_pct": round(gross_pnl_pct, 3),
+            "cost_pct": round(rt_cost_pct, 3),
             "bars_held": exit_idx - i,
         })
         last_entry_idx = i
@@ -312,7 +332,7 @@ async def run_qv_walk_forward(
     filters: Optional[dict[str, Any]] = None,
     parallelism: int = 5,
     fundamentals_mode: str = "deep",
-    point_in_time: bool = False,
+    point_in_time: bool = True,
 ) -> dict[str, Any]:
     """Run the QV strategy walk-forward across `symbols` over `period`.
 
@@ -426,7 +446,7 @@ async def run_qv_walk_forward(
                 ) if on
             ],
             "win_rate_definitions": {
-                "win_rate_pos": "P&L > 0% net of nothing — base rate",
+                "win_rate_pos": "P&L > 0% net of round-trip costs (statutory + sqrt impact) — base rate",
                 "win_rate_gt_5pct": "P&L > 5% — the 'this beat a savings account' bar",
                 "win_rate_gt_10pct": "P&L > 10% — the 'this beat NIFTY annualised' bar",
                 "win_rate_gt_25pct": "P&L > 25% — the 'this was a real winner' bar",
@@ -460,4 +480,12 @@ async def _build_sector_pe_lookup(symbols: list[str]) -> dict[str, float]:
         pes_sorted = sorted(pes)
         out[sec] = pes_sorted[len(pes_sorted) // 2]
     logger.info("Sector PE lookup built: %d sectors", len(out))
+    # 3.5 — persist a timestamped snapshot so future backtests resolve the
+    # sector-PE median AS-OF the entry date instead of applying today's snapshot
+    # across all history. Fire-and-forget; never blocks the backtest.
+    try:
+        from app.services.sector_pe_pit import save_snapshot
+        await save_snapshot(out)
+    except Exception as e:
+        logger.debug("sector-PE snapshot persist skipped: %s", e)
     return out

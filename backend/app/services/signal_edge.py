@@ -1,20 +1,26 @@
 """
-Per-signal-type historical edge, derived from the 2026-05-21 walk-forward
-out-of-sample run (40-stock NIFTY universe, 2y period, 4 expanding-window
-folds, 5d evaluation window, net of 0.20% transaction cost).
+Per-signal-type historical edge — COLD-START PRIORS, NOT VALIDATED EDGE.
 
-Sample size: **37,403 OOS trades** across 40 stocks — every win-rate below is
-from periods the signal engine never saw during fold-training, so the table
-is honest about what these setups actually deliver. `win_rate_lb95` is the
-Wilson 95% lower bound — the conservative win rate you should plan around.
+The static ``SIGNAL_EDGE`` table below comes from the 2026-05-21 backtest run
+(40-stock NIFTY universe, 2y, 5d evaluation window, 0.20% cost). That run was
+a SINGLE PASS over full history — **in-sample**, not walk-forward OOS (see
+``EDGE_META`` for the full correction; an earlier version of this docstring
+wrongly claimed "37,403 OOS trades"). Treat every number as a rough prior.
 
-Each entry holds {win_rate_pct, avg_pnl_pct, trades, win_rate_lb95, family}
-for a (signal_type, direction) tuple. The 'family' classification is used
-by the confluence detector to enforce diversity in the stack.
+Because these numbers are unvalidated, they are QUARANTINED to conservative
+uses only:
 
-Refresh: rerun `POST /api/backtest/walk-forward?limit=40&n_folds=4&period=2y`
-whenever the signal engine changes materially. This file is the single
-source of truth for the extension's edge UX.
+  - They may BLOCK/MUTE (negative evidence applied cautiously is safe).
+  - They may NOT amplify: signal weights and positive-edge confirmations
+    require LIVE-measured data (``signal_edge_overrides``, min 30 trades, or
+    the signal tracker's outcome cache) — see ``get_edge``'s ``source`` field
+    and ``has_positive_edge(live_only=True)``.
+  - Promotion (1.6×) defers entirely to the autonomous FDR gate
+    (``gating_state``) once it is active — the only forward validation here.
+
+Each entry holds {win_rate_pct, avg_pnl_pct, trades, win_rate_lb95} for a
+(signal_type, direction) tuple. `win_rate_lb95` is the Wilson 95% lower
+bound. The 'family' taxonomy is used by the confluence diversity check.
 """
 from __future__ import annotations
 import logging
@@ -606,16 +612,33 @@ def get_edge(signal_type: str, direction: str) -> Optional[dict]:
     """Look up edge for a (signal_type, direction) pair. Returns None if unknown.
 
     Live overrides take priority over the cold-start `SIGNAL_EDGE` table so
-    the UI reflects the latest autonomous backtest run.
+    the UI reflects the latest autonomous backtest run. The returned dict
+    carries ``source``: "live" (measured, ≥30 trades) or "baseline"
+    (in-sample cold-start prior — never treat as validated edge).
     """
     key = (signal_type, direction)
-    return _edge_overrides.get(key) or SIGNAL_EDGE.get(key)
+    live = _edge_overrides.get(key)
+    if live:
+        return {**live, "source": "live"}
+    baseline = SIGNAL_EDGE.get(key)
+    if baseline:
+        return {**baseline, "source": "baseline"}
+    return None
 
 
-def has_positive_edge(signal_type: str, direction: str, min_trades: int = 50) -> bool:
-    """True when the cold-start backtest says the setup has positive expectancy."""
+def has_positive_edge(
+    signal_type: str, direction: str, min_trades: int = 50, *, live_only: bool = True,
+) -> bool:
+    """True when the setup has measured positive expectancy.
+
+    ``live_only=True`` (default): only LIVE-measured edge counts — the static
+    in-sample table can never certify a setup as positive (quarantine; see
+    module docstring). Pass ``live_only=False`` only for display purposes.
+    """
     edge = get_edge(signal_type, direction)
     if not edge:
+        return False
+    if live_only and edge.get("source") != "live":
         return False
     return edge.get("trades", 0) >= min_trades and edge.get("avg_pnl", 0.0) > 0
 

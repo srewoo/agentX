@@ -45,6 +45,14 @@ async def health_check():
     except Exception:
         pass
 
+    # 3.3 — data-quality ledger summary (suspicious jumps + source disagreements).
+    data_quality = {"status": "unknown"}
+    try:
+        from app.services.data_quality import health_summary
+        data_quality = await health_summary()
+    except Exception:
+        pass
+
     return {
         "status": "ok",
         "db": db_ok,
@@ -53,6 +61,7 @@ async def health_check():
         "market_open": market_open,
         "market_status_message": nse_status_msg,
         "orchestrator_running": orchestrator.is_running(),
+        "data_quality": data_quality,
     }
 
 

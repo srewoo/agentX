@@ -3,7 +3,7 @@ import type {
   Signal, StockQuote, TechnicalsResponse, AIAnalysisResponse, WatchlistItem, AppSettings, HealthResponse,
   NewsItem, CorporateAction, OptionsAnalysis, BlockDeal, BacktestResult, ScreenerParams, FundamentalsResponse,
   SignalEdgeResponse, InsightsResponse, BacktestRun, PerformanceByTypeRow, DeepSignalAnalysis,
-  ScanTriggerResponse, ScanStatus, AutomationStatus,
+  ScanTriggerResponse, ScanStatus, AutomationStatus, Scorecard,
 } from "./types";
 
 const DEFAULT_TIMEOUT_MS = 30_000; // 30 seconds
@@ -47,6 +47,10 @@ async function request<T>(path: string, options: RequestInit = {}, timeoutMs = D
 
 export const api = {
   health: () => request<HealthResponse>("/api/health"),
+
+  // North-star scorecard — cost-adjusted benchmark-excess expectancy + N/300.
+  getScorecard: () =>
+    request<{ data: Scorecard }>("/api/performance/scorecard"),
 
   // Signals
   getSignals: (since?: string, limit = 50) =>

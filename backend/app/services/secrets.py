@@ -83,8 +83,6 @@ SECRET_KEYS: frozenset[str] = frozenset({
     "upstox_access_token",
     "upstox_api_key",
     "upstox_api_secret",
-    # Twelve Data keyed fallback.
-    "twelvedata_api_key",
     # Financial Modeling Prep (fundamentals + earnings calendar) and
     # Finnhub (macro / forex) — both sealed at rest.
     "fmp_api_key",

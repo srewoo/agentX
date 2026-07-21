@@ -119,6 +119,41 @@ async def _fetch_fii_dii() -> tuple[Optional[float], Optional[float]]:
         return None, None
 
 
+async def _upstox_index_snapshot() -> dict[str, dict[str, Optional[float]]]:
+    """NIFTY 50 / NIFTY BANK / INDIA VIX from Upstox (authenticated primary).
+
+    Uses the well-known NSE_INDEX instrument keys via ``upstox_fetch_quote``.
+    Returns ``{name: {"close": float, "pct": float}}``; empty dict when Upstox
+    has no token, is in a health cooldown, or every index quote fails — the
+    caller then falls back to the NSE feed and yfinance.
+    """
+    try:
+        from app.services import upstox_fetcher, source_health
+        from app.services.data_fetcher import _get_data_settings
+        settings = await _get_data_settings()
+        if not upstox_fetcher.has_token(settings) or source_health.is_down("upstox"):
+            return {}
+        token = settings["upstox_access_token"]
+    except Exception as e:
+        logger.debug("market_snapshot upstox indices setup failed: %s", e)
+        return {}
+
+    out: dict[str, dict[str, Optional[float]]] = {}
+    any_ok = False
+    for name in ("NIFTY 50", "NIFTY BANK", "INDIA VIX"):
+        try:
+            q = await upstox_fetcher.upstox_fetch_quote(name, token=token, exchange="NSE")
+        except Exception as e:
+            logger.debug("market_snapshot upstox %s failed: %s", name, e)
+            q = None
+        if q and q.get("lastPrice") is not None:
+            any_ok = True
+            out[name] = {"close": q.get("lastPrice"), "pct": q.get("pChange")}
+    if any_ok:
+        source_health.mark_up("upstox")
+    return out
+
+
 async def _nse_index_snapshot() -> dict[str, dict[str, Optional[float]]]:
     """NIFTY 50 / NIFTY BANK / INDIA VIX from the NSE indices feed.
 
@@ -245,19 +280,21 @@ async def get_market_snapshot(force_refresh: bool = False) -> MarketSnapshot:
         as_of = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M %Z")
         errors: list[str] = []
 
-        # Prefer the NSE indices feed (reliable, same as Dashboard pills) for
-        # NIFTY / BANKNIFTY / VIX; fall back to yfinance only when NSE misses a
-        # row. This keeps the macro block populated even while yfinance is down.
+        # Source priority for NIFTY / BANKNIFTY / VIX: Upstox (authenticated,
+        # no 403 wall) → NSE indices feed → yfinance. Upstox is primary; the
+        # other two are the emergency fallback that keeps the macro block
+        # populated when Upstox is down or its token has lapsed.
+        up_idx = await _upstox_index_snapshot()
         nse_idx = await _nse_index_snapshot()
 
-        async def _index_with_fallback(nse_name: str, yf_sym: str):
-            row = nse_idx.get(nse_name)
+        async def _index_with_fallback(name: str, yf_sym: str):
+            row = up_idx.get(name) or nse_idx.get(name)
             if row and row.get("close") is not None:
                 return row["close"], row.get("pct")
             return await _safe_last_close(yf_sym)
 
         async def _vix_with_fallback() -> Optional[float]:
-            row = nse_idx.get("INDIA VIX")
+            row = up_idx.get("INDIA VIX") or nse_idx.get("INDIA VIX")
             if row and row.get("close") is not None:
                 return row["close"]
             return await _fetch_vix()

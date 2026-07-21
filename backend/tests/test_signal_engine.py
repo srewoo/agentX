@@ -511,7 +511,11 @@ class TestBacktestEdgeFilters:
         assert filtered[0]["strength"] <= 4
         assert filtered[0]["metadata"]["downgraded_by_edge_filter"] is True
 
-    def test_weak_pattern_passes_with_independent_positive_confirmation(self):
+    def test_weak_pattern_passes_with_live_confirmed_positive_confirmation(self):
+        """Confirmation requires LIVE-measured positive edge on the confirmer —
+        the in-sample static baseline is quarantined and no longer certifies."""
+        from app.services import signal_edge
+
         weak = {
             "symbol": "RELIANCE",
             "signal_type": "double_bottom",
@@ -530,7 +534,37 @@ class TestBacktestEdgeFilters:
             "risk": "",
             "metadata": {},
         }
+        signal_edge.set_edge_overrides({
+            ("gap_up", "bullish"): {"win_rate": 58.0, "avg_pnl": 0.9, "trades": 120},
+        })
+        try:
+            filtered = _apply_backtest_edge_filters([weak, confirmer])
+            weak_after = next(s for s in filtered if s["signal_type"] == "double_bottom")
+            assert weak_after["strength"] == 9
+            assert weak_after["metadata"]["edge_confirmed"] is True
+        finally:
+            signal_edge.set_edge_overrides({})
+
+    def test_weak_pattern_blocked_when_confirmer_edge_is_only_in_sample(self):
+        """The static SIGNAL_EDGE table alone must NOT rescue a weak setup:
+        its numbers are unvalidated in-sample priors (quarantine contract)."""
+        weak = {
+            "symbol": "RELIANCE",
+            "signal_type": "double_bottom",
+            "direction": "bullish",
+            "strength": 9,
+            "reason": "pattern",
+            "risk": "",
+            "metadata": {},
+        }
+        confirmer = {
+            "symbol": "RELIANCE",
+            "signal_type": "gap_up",   # positive edge in the STATIC table only
+            "direction": "bullish",
+            "strength": 7,
+            "reason": "gap",
+            "risk": "",
+            "metadata": {},
+        }
         filtered = _apply_backtest_edge_filters([weak, confirmer])
-        weak_after = next(s for s in filtered if s["signal_type"] == "double_bottom")
-        assert weak_after["strength"] == 9
-        assert weak_after["metadata"]["edge_confirmed"] is True
+        assert not any(s["signal_type"] == "double_bottom" for s in filtered)

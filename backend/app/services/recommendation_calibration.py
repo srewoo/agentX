@@ -11,6 +11,7 @@ then writes factor edge into `factor_performance`.
 import asyncio
 import json
 import logging
+import math
 from datetime import datetime, timezone
 from typing import Any, Literal
 
@@ -19,6 +20,7 @@ import pandas as pd
 
 from app.database import DB_PATH
 from app.models.recommendation import Horizon, SignalContribution
+from app.services.multiple_testing import benjamini_hochberg
 from app.services.backtester import TRANSACTION_COST_PCT
 from app.services.data_fetcher import MAJOR_STOCKS, async_fetch_history
 from app.services.recommendation import (
@@ -247,6 +249,38 @@ def _aggregate(records: list[dict[str, Any]], key: str) -> dict[str, Any]:
     return out
 
 
+# FDR gate on factor-edge mining. A factor edge is applied as a live weight
+# multiplier only if it survives Benjamini-Hochberg across the whole family of
+# factor×context tests AND has at least this many aligned samples.
+_FACTOR_EDGE_FDR_ALPHA = 0.10
+_MIN_EDGE_SAMPLES = 20
+
+
+def _edge_pvalue(vals: list[float], overall_avg: float) -> float:
+    """Two-sided p-value that mean(vals) differs from `overall_avg`.
+
+    One-sample t-statistic on d_i = val_i − overall_avg, with a normal
+    approximation to the CDF (no scipy dependency). Returns 1.0 (not
+    significant) when the sample is too small or has zero variance, so a
+    thin or degenerate bucket can never be promoted by the FDR gate.
+    """
+    n = len(vals)
+    if n < _MIN_EDGE_SAMPLES:
+        return 1.0
+    diffs = [v - overall_avg for v in vals]
+    mean_d = sum(diffs) / n
+    var = sum((d - mean_d) ** 2 for d in diffs) / (n - 1)
+    if var <= 0.0:
+        return 1.0
+    se = math.sqrt(var / n)
+    if se <= 0.0:
+        return 1.0
+    t = mean_d / se
+    # Two-sided p from the standard normal (large-n approximation of t).
+    cdf = 0.5 * (1.0 + math.erf(abs(t) / math.sqrt(2.0)))
+    return max(0.0, min(1.0, 2.0 * (1.0 - cdf)))
+
+
 def _factor_edges(
     records: list[dict[str, Any]],
     context: dict[str, str] | None = None,
@@ -276,6 +310,14 @@ def _factor_edges(
                 "aligned_avg_pnl": round(avg, 4),
                 "overall_avg_pnl": round(overall_avg, 4),
                 "edge": round(avg - overall_avg, 4),
+                # Two-sided significance that the aligned subset's mean P&L
+                # differs from the overall mean. Consumed by the FDR gate in
+                # `_persist_run` — a factor edge is NOT applied as a weight
+                # multiplier unless it survives Benjamini-Hochberg across the
+                # whole family of factor×context tests. Ranking dozens of
+                # buckets by raw edge and applying the top ones is a textbook
+                # multiple-comparisons trap; this closes it.
+                "p_value": round(_edge_pvalue(vals, overall_avg), 6),
             }
         )
     rows.sort(key=lambda r: r["edge"], reverse=True)
@@ -337,7 +379,22 @@ async def _persist_run(payload: dict[str, Any], apply: bool) -> None:
             ),
         )
         if apply:
-            for row in [*payload["factor_edges"], *payload.get("contextual_factor_edges", [])]:
+            # FDR gate: only factor edges that survive Benjamini-Hochberg
+            # across the *whole family* of factor×context tests are persisted
+            # and thus allowed to move a live weight multiplier. Without this,
+            # ranking dozens of buckets by raw edge and applying the top ones
+            # is a multiple-comparisons trap — the exact failure the FDR module
+            # was built to prevent. Rows are annotated `significant` in the
+            # payload (for transparency) but only significant ones are written.
+            combined = [*payload["factor_edges"], *payload.get("contextual_factor_edges", [])]
+            pvals = [float(r.get("p_value", 1.0)) for r in combined]
+            keep = benjamini_hochberg(pvals, alpha=_FACTOR_EDGE_FDR_ALPHA)
+            n_kept = 0
+            for row, is_sig in zip(combined, keep):
+                row["significant"] = bool(is_sig)
+                if not is_sig:
+                    continue
+                n_kept += 1
                 await db.execute(
                     """INSERT OR REPLACE INTO factor_performance
                        (factor, total_directional, aligned_count, aligned_avg_pnl,
@@ -348,6 +405,11 @@ async def _persist_run(payload: dict[str, Any], apply: bool) -> None:
                         row["aligned_avg_pnl"], row["overall_avg_pnl"], row["edge"], now,
                     ),
                 )
+            logger.info(
+                "factor-edge FDR gate: %d/%d edges significant at alpha=%.2f (persisted); "
+                "%d suppressed as multiple-comparisons noise",
+                n_kept, len(combined), _FACTOR_EDGE_FDR_ALPHA, len(combined) - n_kept,
+            )
         await db.commit()
     if apply:
         await seed_factor_edge_cache()

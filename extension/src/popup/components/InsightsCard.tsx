@@ -27,8 +27,9 @@ const SEV_ICON: Record<string, string> = {
 export default function InsightsCard() {
   const [insights, setInsights] = useState<Insight[]>([]);
   const [collapsed, setCollapsed] = useState(false);
+  const [expanded, setExpanded] = useState(false);
   const [busyAction, setBusyAction] = useState<string | null>(null);
-  const [appliedKey, setAppliedKey] = useState<string | null>(null);
+  const [appliedKeys, setAppliedKeys] = useState<Set<string>>(new Set());
 
   useEffect(() => {
     api.getInsights()
@@ -36,30 +37,53 @@ export default function InsightsCard() {
       .catch(() => setInsights([]));
   }, []);
 
-  const muteOne = async (signalType: string) => {
-    setBusyAction(`mute:${signalType}`);
+  // Persist a set of signal types as muted, then mark the given applied keys.
+  const persistMutes = async (types: string[], appliedMarks: string[]) => {
     const s = (await getSettings()) as Partial<AppSettings>;
     const set = new Set(s.muted_signal_types ?? []);
-    set.add(signalType);
+    types.forEach((t) => set.add(t));
     await saveSettings({ ...s, muted_signal_types: Array.from(set) });
-    setAppliedKey(`mute:${signalType}`);
+    setAppliedKeys((prev) => {
+      const next = new Set(prev);
+      appliedMarks.forEach((k) => next.add(k));
+      return next;
+    });
+  };
+
+  const muteOne = async (signalType: string) => {
+    setBusyAction(`mute:${signalType}`);
+    await persistMutes([signalType], [`mute:${signalType}`]);
     setBusyAction(null);
   };
 
   const applyAllMutes = async (types: string[]) => {
     setBusyAction("apply_mutes");
-    const s = (await getSettings()) as Partial<AppSettings>;
-    const set = new Set(s.muted_signal_types ?? []);
-    types.forEach((t) => set.add(t));
-    await saveSettings({ ...s, muted_signal_types: Array.from(set) });
-    setAppliedKey("apply_mutes");
+    await persistMutes(types, ["apply_mutes"]);
+    setBusyAction(null);
+  };
+
+  // Mute every live-drift underperformer (the `warn` insights with a per-type
+  // mute action) in one click — the bulk action for what's actually on screen,
+  // distinct from `apply_mutes` which covers the historical-loser set.
+  const muteAllUnderperforming = async (types: string[]) => {
+    setBusyAction("mute_all_drift");
+    await persistMutes(types, ["mute_all_drift", ...types.map((t) => `mute:${t}`)]);
     setBusyAction(null);
   };
 
   if (!insights.length) return null;
 
-  const topThree = insights.slice(0, 3);
+  const visible = expanded ? insights : insights.slice(0, 3);
+  const hiddenCount = insights.length - 3;
   const warnCount = insights.filter((i) => i.severity === "warn").length;
+
+  // Live-drift underperformers that expose a per-type mute and aren't muted yet.
+  const underperformTypes = Array.from(new Set(
+    insights
+      .filter((i) => i.action === "mute" && i.signal_type)
+      .map((i) => i.signal_type as string)
+      .filter((t) => !appliedKeys.has(`mute:${t}`))
+  ));
 
   return (
     <div className="border-b border-border bg-zinc-900/30">
@@ -78,13 +102,29 @@ export default function InsightsCard() {
       </button>
       {!collapsed && (
         <div className="px-3 pb-2 space-y-1.5">
-          {topThree.map((ins, i) => {
+          {underperformTypes.length > 1 && (
+            <button
+              onClick={() => muteAllUnderperforming(underperformTypes)}
+              disabled={busyAction === "mute_all_drift"}
+              className="w-full text-[10px] px-2 py-1 rounded border border-amber-500/40 bg-amber-500/10 text-amber-200 hover:bg-amber-500/20 disabled:opacity-50"
+            >
+              {busyAction === "mute_all_drift"
+                ? "Muting…"
+                : `Mute all ${underperformTypes.length} underperforming`}
+            </button>
+          )}
+          {visible.map((ins, i) => {
             const key = ins.kind === "drift" && ins.signal_type
               ? `drift:${ins.signal_type}:${ins.direction ?? ""}`
               : ins.kind === "recommended_mutes"
                 ? "apply_mutes"
                 : `wow:${i}`;
-            const applied = appliedKey === (ins.action === "mute" ? `mute:${ins.signal_type}` : ins.action === "apply_mutes" ? "apply_mutes" : null);
+            const applied =
+              ins.action === "mute"
+                ? appliedKeys.has(`mute:${ins.signal_type}`)
+                : ins.action === "apply_mutes"
+                  ? appliedKeys.has("apply_mutes")
+                  : false;
             return (
               <div
                 key={key}
@@ -136,10 +176,15 @@ export default function InsightsCard() {
               </div>
             );
           })}
-          {insights.length > 3 && (
-            <div className="text-[10px] text-zinc-500 text-center pt-0.5">
-              +{insights.length - 3} more insight{insights.length - 3 > 1 ? "s" : ""}
-            </div>
+          {hiddenCount > 0 && (
+            <button
+              onClick={() => setExpanded((v) => !v)}
+              className="w-full text-[10px] text-zinc-500 hover:text-zinc-300 text-center pt-0.5"
+            >
+              {expanded
+                ? "Show less"
+                : `+${hiddenCount} more insight${hiddenCount > 1 ? "s" : ""}`}
+            </button>
           )}
         </div>
       )}

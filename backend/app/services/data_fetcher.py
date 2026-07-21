@@ -4,12 +4,20 @@ Market data fetching — resilient multi-source waterfall.
 
 Daily OHLCV priority (first non-empty wins, each guarded by a negative cache):
   1. Upstox     — authenticated REST (no 403 wall); needs ``upstox_access_token``
-  2. NseIndiaApi — direct NSE endpoints, free, but anti-bot 403-prone
-  3. jugaad-data — robust free NSE EOD scraper (bhavcopy-based), no account
-  4. yfinance    — unofficial Yahoo scraper, 15-min delayed, throttle-prone
-  5. Twelve Data — keyed REST fallback (``twelvedata_api_key``)
+  2. NseIndiaApi — direct NSE endpoints, free, but anti-bot 403-prone (safety net)
+  3. yfinance    — unofficial Yahoo scraper, 15-min delayed, throttle-prone (last resort)
 
-Intraday / index data skips Upstox/NSE and goes to yfinance directly.
+Upstox is the sole primary; NSE + yfinance are retained ONLY as an emergency
+fallback for when Upstox is down or its token has lapsed (they're needed
+elsewhere anyway — NSE for delivery %/FII-DII/corporate-actions, yfinance for
+fundamentals). jugaad-data and Twelve Data were removed: they served nothing
+but price history, which Upstox now covers natively.
+
+Intraday / index data skips NSE and goes Upstox → yfinance.
+
+Every daily frame leaving this module is normalized to ONE adjustment policy
+(split/bonus-adjusted, dividends not — see ``price_adjuster``) so the same
+symbol yields the same history regardless of which source won the waterfall.
 
 A source that fails is parked in ``source_health`` for a cooldown window so
 the per-symbol scan loop stops hammering (and log-spamming) a dead endpoint.
@@ -28,7 +36,7 @@ from typing import Any
 import pandas as pd
 import yfinance as yf
 
-from app.services import source_health
+from app.services import price_adjuster, source_health
 from app.services.nse_fetcher import (
     nse_fetch_quote,
     nse_fetch_history,
@@ -162,9 +170,14 @@ def _yfinance_fetch_sync(
 
     for yf_sym in candidates:
         try:
-            hist = yf.Ticker(yf_sym).history(period=period, interval=interval)
+            # auto_adjust=False: fetch RAW prices, then apply the canonical
+            # split-only policy locally (yfinance's default also folds in
+            # dividends, which no other source in the waterfall does).
+            hist = yf.Ticker(yf_sym).history(
+                period=period, interval=interval, auto_adjust=False, actions=True,
+            )
             if not hist.empty:
-                return hist
+                return price_adjuster.adjust_yfinance_frame(hist)
         except Exception as e:
             logger.debug("yfinance attempt for %s: %s", yf_sym, e)
 
@@ -192,95 +205,6 @@ async def _yfinance_fetch(
         return pd.DataFrame()
 
 
-# ── jugaad-data (free NSE EOD, no account) ───────────────────
-
-def _jugaad_fetch_sync(symbol: str, days: int) -> pd.DataFrame:
-    """Fetch NSE EOD history via jugaad-data. Empty DataFrame on failure."""
-    try:
-        from datetime import date as _date, timedelta as _td
-        from jugaad_data.nse import stock_df  # type: ignore
-    except Exception as e:
-        logger.debug("jugaad-data unavailable: %s", e)
-        return pd.DataFrame()
-    try:
-        to_d = _date.today()
-        df = stock_df(
-            symbol=symbol, from_date=to_d - _td(days=days), to_date=to_d, series="EQ",
-        )
-        if df is None or df.empty:
-            return pd.DataFrame()
-        df = df.rename(columns={
-            "DATE": "Date", "OPEN": "Open", "HIGH": "High",
-            "LOW": "Low", "CLOSE": "Close", "VOLUME": "Volume",
-        })
-        keep = ["Date", "Open", "High", "Low", "Close", "Volume"]
-        df = df[[c for c in keep if c in df.columns]]
-        return df.set_index("Date").sort_index()
-    except Exception as e:
-        logger.debug("jugaad-data fetch failed for %s: %s", symbol, e)
-        return pd.DataFrame()
-
-
-async def _jugaad_fetch(symbol: str, days: int) -> pd.DataFrame:
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _jugaad_fetch_sync, symbol, days)
-
-
-# ── Twelve Data (keyed REST fallback) ────────────────────────
-
-def _twelvedata_fetch_sync(symbol: str, days: int, api_key: str, exchange: str) -> pd.DataFrame:
-    """Fetch daily history from Twelve Data. Empty DataFrame on failure.
-
-    On HTTP 429 we wait the server-advertised ``Retry-After`` window (capped)
-    and retry once, rather than retrying immediately into another 429.
-    """
-    import requests
-    import time as _time
-    try:
-        def _do_request() -> requests.Response:
-            return requests.get(
-                "https://api.twelvedata.com/time_series",
-                params={
-                    "symbol": symbol, "interval": "1day",
-                    "outputsize": min(max(days, 30), 5000),
-                    "exchange": exchange.upper(), "apikey": api_key,
-                },
-                timeout=12.0,
-            )
-
-        resp = _do_request()
-        if resp.status_code == 429:
-            backoff = _parse_retry_after(resp.headers.get("Retry-After"))
-            logger.warning(
-                "twelvedata rate-limited (429) for %s; honouring Retry-After, waiting %.0fs",
-                symbol, backoff,
-            )
-            _time.sleep(backoff)
-            resp = _do_request()
-        resp.raise_for_status()
-        data = resp.json()
-        values = data.get("values") if isinstance(data, dict) else None
-        if not values:
-            return pd.DataFrame()
-        records = [{
-            "Date": pd.Timestamp(v["datetime"]),
-            "Open": float(v["open"]), "High": float(v["high"]),
-            "Low": float(v["low"]), "Close": float(v["close"]),
-            "Volume": float(v.get("volume") or 0),
-        } for v in values]
-        return pd.DataFrame(records).set_index("Date").sort_index()
-    except Exception as e:
-        logger.debug("twelvedata fetch failed for %s: %s", symbol, e)
-        return pd.DataFrame()
-
-
-async def _twelvedata_fetch(symbol: str, days: int, api_key: str, exchange: str) -> pd.DataFrame:
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(
-        None, _twelvedata_fetch_sync, symbol, days, api_key, exchange,
-    )
-
-
 # ── Main fetch function: resilient daily-OHLCV waterfall ──────
 
 async def async_fetch_history(
@@ -291,8 +215,8 @@ async def async_fetch_history(
 ) -> pd.DataFrame:
     """Fetch OHLCV history through the resilient source waterfall.
 
-    Daily: Upstox → NSE → jugaad-data → yfinance → Twelve Data.
-    Intraday / index: yfinance directly (the others don't serve it here).
+    Daily: Upstox (primary) → NSE → yfinance (NSE + yfinance are emergency
+    fallback only). Intraday / index: Upstox → yfinance.
     Each source is skipped while it's in a ``source_health`` cooldown.
     """
     clean_symbol = symbol.replace(".NS", "").replace(".BO", "")
@@ -300,10 +224,10 @@ async def async_fetch_history(
     is_intraday = interval not in ("1d", "1wk", "1mo")
     days = _PERIOD_TO_DAYS.get(period, 370)
 
-    # BSE has no coverage from the NSE-only scrapers (NseIndiaApi/jugaad), but
-    # Upstox *does* serve BSE (segment BSE_EQ). So for BSE we still use Upstox
-    # as the authenticated primary and only skip the NSE-specific sources,
-    # falling back to yfinance (.BO preferred) + Twelve Data.
+    # BSE has no coverage from the NSE-only scraper (NseIndiaApi), but Upstox
+    # *does* serve BSE (segment BSE_EQ). So for BSE we use Upstox as the
+    # authenticated primary and skip the NSE-specific source, falling back to
+    # yfinance (.BO preferred) only.
     is_bse = exchange.upper() == "BSE" and not is_index
 
     settings = await _get_data_settings()
@@ -319,13 +243,26 @@ async def async_fetch_history(
                 )
                 if up_intra is not None and not up_intra.empty:
                     source_health.mark_up("upstox")
-                    return up_intra
+                    # Intraday windows are too recent for adjustment to matter.
+                    return price_adjuster.tag(up_intra, "upstox", "none_needed")
             except Exception as e:
                 logger.debug("Upstox intraday failed for %s: %s", clean_symbol, e)
         return await _yfinance_with_cooldown(symbol, period, interval, exchange)
 
-    # Index data — only yfinance serves it here.
+    # Index data — Upstox (via _INDEX_KEYS) primary, yfinance fallback.
     if is_index:
+        if upstox_fetcher.has_token(settings) and not source_health.is_down("upstox"):
+            try:
+                up_idx = await upstox_fetcher.upstox_fetch_history(
+                    symbol, days=days, interval=interval,
+                    token=settings["upstox_access_token"], exchange=exchange,
+                )
+                if up_idx is not None and not up_idx.empty and len(up_idx) >= 5:
+                    source_health.mark_up("upstox")
+                    # Index candles carry no corporate actions — no adjustment.
+                    return price_adjuster.tag(up_idx, "upstox", "none_needed")
+            except Exception as e:
+                logger.debug("Upstox index history failed for %s: %s", symbol, e)
         return await _yfinance_with_cooldown(symbol, period, interval, exchange)
 
     # 1. Upstox (authenticated primary) — daily/weekly/monthly, NSE *and* BSE.
@@ -337,18 +274,23 @@ async def async_fetch_history(
             )
             if up_df is not None and not up_df.empty and len(up_df) >= 5:
                 source_health.mark_up("upstox")
-                return up_df
+                # Upstox historical candles arrive split/bonus-adjusted —
+                # already on the canonical policy.
+                price_adjuster.flag_suspicious_jumps(up_df, clean_symbol)
+                return price_adjuster.tag(up_df, "upstox")
         except Exception as e:
             logger.debug("Upstox historical failed for %s: %s", clean_symbol, e)
 
-    # 2. NSE direct + 3. jugaad — NSE-only sources; skip entirely for BSE.
+    # 2. NSE direct — NSE-only safety net; skip entirely for BSE.
     if not is_bse:
-        # 2. NSE direct.
         if not source_health.is_down("nse"):
             try:
                 nse_df = await nse_fetch_history(clean_symbol, days=days)
                 if nse_df is not None and not nse_df.empty and len(nse_df) >= 5:
                     source_health.mark_up("nse")
+                    # NSE-direct data is raw — bring onto the canonical policy.
+                    nse_df = await price_adjuster.normalize_raw(nse_df, clean_symbol, "nse")
+                    price_adjuster.flag_suspicious_jumps(nse_df, clean_symbol)
                     return nse_df
             except Exception as e:
                 logger.debug("NSE historical failed for %s: %s", clean_symbol, e)
@@ -356,26 +298,10 @@ async def async_fetch_history(
                 # Reached here ⇒ NSE returned empty; likely 403/throttle. Park it.
                 source_health.mark_down("nse")
 
-        # 3. jugaad-data (free EOD, no account).
-        if not source_health.is_down("jugaad"):
-            jd = await _jugaad_fetch(clean_symbol, days)
-            if not jd.empty and len(jd) >= 5:
-                source_health.mark_up("jugaad")
-                return jd
-
-    # 4. yfinance.
+    # 3. yfinance — last-resort safety net.
     yf_df = await _yfinance_with_cooldown(symbol, period, interval, exchange)
     if not yf_df.empty:
         return yf_df
-
-    # 5. Twelve Data (keyed).
-    td_key = settings.get("twelvedata_api_key")
-    if td_key and not source_health.is_down("twelvedata"):
-        td = await _twelvedata_fetch(clean_symbol, days, td_key, exchange)
-        if not td.empty and len(td) >= 5:
-            source_health.mark_up("twelvedata")
-            return td
-        source_health.mark_down("twelvedata")
 
     return pd.DataFrame()
 

@@ -17,27 +17,32 @@ export function useSignals() {
       setSignals(stored.filter((s) => !s.dismissed));
       setLoading(false);
 
-      // 2. Fetch fresh signals from backend API and merge
+      // 2. Fetch fresh signals from backend API. The backend is authoritative
+      //    for what is CURRENT — it already applies the age cutoff and dedup —
+      //    so a successful response REPLACES the feed, even when it's empty.
+      //    (Previously we only merged when fresh.length > 0 and never removed
+      //    anything, so aged-out signals lingered in local storage forever and
+      //    a quiet scan kept showing last week's cards.) We carry over only the
+      //    local read/dismissed flags by id so marking-read isn't lost.
       try {
         const res = await api.getSignals(undefined, 50);
         const fresh = res.signals || [];
+        const flagsById = new Map(stored.map((s) => [s.id, s]));
+        const reconciled = fresh
+          .map((s) => {
+            const prev = flagsById.get(s.id);
+            return prev
+              ? { ...s, read: s.read || prev.read, dismissed: s.dismissed || prev.dismissed }
+              : s;
+          })
+          .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
+          .slice(0, MAX_SIGNALS);
 
-        if (fresh.length > 0) {
-          // Merge: fresh signals take priority, dedup by ID
-          const existingById = new Map(stored.map((s) => [s.id, s]));
-          for (const s of fresh) {
-            existingById.set(s.id, s);
-          }
-          const merged = Array.from(existingById.values())
-            .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
-            .slice(0, MAX_SIGNALS);
-
-          await setStoredSignals(merged);
-          setSignals(merged.filter((s) => !s.dismissed));
-        }
+        await setStoredSignals(reconciled);
+        setSignals(reconciled.filter((s) => !s.dismissed));
         setError(null);
       } catch (fetchErr) {
-        // Backend unreachable — stale storage is fine, just show warning
+        // Backend unreachable — stale storage is a reasonable offline fallback.
         setError("Could not reach backend. Showing cached signals.");
       }
     } catch (e) {

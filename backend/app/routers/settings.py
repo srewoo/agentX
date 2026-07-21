@@ -34,9 +34,8 @@ ALLOWED_KEYS = {
     "broker",
     "angelone_api_key", "angelone_client_code", "angelone_mpin", "angelone_totp_secret",
     "kite_api_key", "kite_api_secret", "kite_access_token",
-    # Upstox data source (daily OAuth token + app creds) + Twelve Data fallback.
+    # Upstox data source (daily OAuth token + app creds).
     "upstox_access_token", "upstox_api_key", "upstox_api_secret",
-    "twelvedata_api_key",
     # Financial Modeling Prep (fundamentals + earnings calendar) + Finnhub (macro).
     "fmp_api_key", "finnhub_api_key",
 }
@@ -56,7 +55,6 @@ _SECRET_KEYS = frozenset(SECRET_KEYS & ALLOWED_KEYS) if False else frozenset({
     "angelone_api_key", "angelone_client_code", "angelone_mpin", "angelone_totp_secret",
     "kite_api_key", "kite_api_secret", "kite_access_token",
     "upstox_access_token", "upstox_api_key", "upstox_api_secret",
-    "twelvedata_api_key",
     "fmp_api_key", "finnhub_api_key",
 })
 
