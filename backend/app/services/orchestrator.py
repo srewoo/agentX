@@ -72,6 +72,10 @@ class _ScanState:
 
     last_scan_time: Optional[str] = None
     last_scan_signal_count: int = 0
+    # Timestamp of the last scan that produced ≥1 signal — the scan_watchdog
+    # uses this to distinguish a live-but-starved funnel from a healthy quiet
+    # market (0 signals for hours while open = funnel likely broken).
+    last_nonzero_scan_time: Optional[str] = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     # ── Manual-trigger job tracking ────────────────────────────────────
@@ -91,6 +95,7 @@ class _ScanState:
 _scan_state = _ScanState()
 last_scan_time: Optional[str] = None
 last_scan_signal_count: int = 0
+last_nonzero_scan_time: Optional[str] = None
 
 # Module A runs at most once per IST trading day; this latch prevents
 # the scan loop (which fires every N minutes) from triggering 30+
@@ -380,7 +385,7 @@ async def run_scan_cycle() -> list[dict]:
     Execute one full scan cycle.
     Returns list of signals generated.
     """
-    global last_scan_time, last_scan_signal_count
+    global last_scan_time, last_scan_signal_count, last_nonzero_scan_time
 
     start_time = datetime.now(timezone.utc)
     logger.info("Starting scan cycle...")
@@ -1159,9 +1164,31 @@ async def run_scan_cycle() -> list[dict]:
     async with _scan_state.lock:
         _scan_state.last_scan_time = scan_ts
         _scan_state.last_scan_signal_count = signal_count
+        if signal_count > 0:
+            _scan_state.last_nonzero_scan_time = scan_ts
+            last_nonzero_scan_time = scan_ts
         # Mirror to module globals so existing importers keep working.
         last_scan_time = scan_ts
         last_scan_signal_count = signal_count
+
+    # Watchdog (§5.5): loudly flag a live-but-starved funnel so a repeat of the
+    # "0 signals for 11 days, unnoticed" incident pages within one session.
+    try:
+        from app.services import scan_watchdog
+        wd = scan_watchdog.evaluate(
+            now=datetime.now(timezone.utc),
+            last_scan_time=datetime.fromisoformat(scan_ts),
+            last_nonzero_scan_time=(
+                datetime.fromisoformat(_scan_state.last_nonzero_scan_time)
+                if _scan_state.last_nonzero_scan_time else None
+            ),
+            cadence_minutes=float(db_settings.get("alert_interval_minutes", 15) or 15),
+            market_open=is_market_open(),
+        )
+        if wd.get("status") == "starved":
+            logger.warning("SCAN WATCHDOG: %s", wd.get("reason"))
+    except Exception as _e:
+        logger.debug("scan_watchdog eval skipped: %s", _e)
 
     # Trim bad symbol cache to prevent unbounded growth
     if len(_bad_symbol_strikes) > _BAD_SYMBOL_MAX_CACHE:

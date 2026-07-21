@@ -53,8 +53,23 @@ async def health_check():
     except Exception:
         pass
 
+    # 5.5 — scan watchdog: is the scan loop alive AND producing signals?
+    scan_watchdog_status = {"status": "unknown", "severity": "ok"}
+    try:
+        from app.services import scan_watchdog
+        scan_watchdog_status = await scan_watchdog.status()
+    except Exception:
+        pass
+
+    # A stalled scan loop (dead) degrades overall health so an uptime/cron
+    # check reading /api/health pages on it. A starved funnel is a warning,
+    # surfaced but not marked down (the loop is alive).
+    overall = "ok"
+    if scan_watchdog_status.get("severity") == "critical":
+        overall = "degraded"
+
     return {
-        "status": "ok",
+        "status": overall,
         "db": db_ok,
         "cache": "ok" if cache_manager.enabled else "disabled",
         "last_scan": last_scan_time,
@@ -62,6 +77,7 @@ async def health_check():
         "market_status_message": nse_status_msg,
         "orchestrator_running": orchestrator.is_running(),
         "data_quality": data_quality,
+        "scan_watchdog": scan_watchdog_status,
     }
 
 
